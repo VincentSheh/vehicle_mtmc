@@ -159,6 +159,9 @@ C.EXPRESS.CAMERAS = []
 # Save videos with final MTMC-matched ids for each camera
 C.EXPRESS.FINAL_VIDEO_OUTPUT = False
 
+C.MOT.BASE_RESOLUTION = [1280, 864]
+C.MOT.REID_OBJECT_SIZE = [64,64]
+
 ################################################################################
 # Evaluation config
 ################################################################################

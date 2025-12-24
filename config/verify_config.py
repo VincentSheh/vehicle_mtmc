@@ -13,7 +13,7 @@ def _is(_type):
 system_checks = {
     "CFG_DIR": os.path.isdir,
     "ROOT_DIR": os.path.isdir,
-    "GPU_IDS": lambda x: len(x) > 0,
+    "GPU_IDS": lambda x: len(x) >= 0,
 }
 
 global_checks = {
@@ -28,7 +28,7 @@ common_mot_checks = {
     "REID_MODEL_CKPT": os.path.isfile,
     "REID_FP16": _is(bool),
     "REID_BATCHSIZE": lambda x: _is(int)(x) and x >= 1,
-    "DETECTOR": lambda x: x.startswith("yolov5"),
+    "DETECTOR": lambda x: x.startswith("yolo"),
     "TRACKER": lambda x: x in ["deepsort", "bytetrack_iou"],
     "SHOW": _is(bool),
     "ONLINE_VIDEO_OUTPUT": _is(bool),
@@ -38,6 +38,13 @@ common_mot_checks = {
     "DYNAMIC_ATTRIBUTES": lambda x: _is(list)(x) and all(os.path.exists(y) for z in x for y in z.values()),
     "ATTRIBUTE_INFER_BATCHSIZE": lambda x: _is(int)(x) and x >= 1,
     "REFINE": _is(bool),
+    "BASE_RESOLUTION": lambda x: (
+        x is None or
+        (_is(list)(x) and len(x) == 2 and all(_is(int)(v) and v > 0 for v in x))
+    ),
+    "REID_OBJECT_SIZE": lambda x: (
+        _is(list)(x) 
+    ),    
 }
 
 isolated_mot_checks = {

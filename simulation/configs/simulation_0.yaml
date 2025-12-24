@@ -1,0 +1,177 @@
+run:
+  t_max: 2000
+  seed: 42
+
+globals:
+  ids_processing_speed: 5000.0
+
+  video_pipeline:
+    reid_latency: 15 #! Should consider batch processing
+    configs:
+      # ---------- YOLO11X ----------
+      - detector: yolo11x
+        base_resolution_h: 736
+        latency_ms:
+          detection: 370.17156
+        cycles:
+          detection: 11253
+
+      - detector: yolo11x
+        base_resolution_h: 544
+        latency_ms:
+          detection: 229.88583
+        cycles:
+          detection: 6988.5
+
+      - detector: yolo11x
+        base_resolution_h: 384
+        latency_ms:
+          detection: 111.49907
+        cycles:
+          detection: 3389.57
+
+      # ---------- YOLO11L ----------
+      - detector: yolo11l
+        base_resolution_h: 736
+        latency_ms:
+          detection: 213.00522
+        cycles:
+          detection: 6475.2
+
+      - detector: yolo11l
+        base_resolution_h: 544
+        latency_ms:
+          detection: 136.18434
+        cycles:
+          detection: 0
+
+      - detector: yolo11l
+        base_resolution_h: 384
+        latency_ms:
+          detection: 68.81122
+        cycles:
+          detection: 0
+
+      - detector: yolo11l
+        base_resolution_h: 736
+        latency_ms:
+          detection: 207.82990
+        cycles:
+          detection: 0
+
+      - detector: yolo11l
+        base_resolution_h: 544
+        latency_ms:
+          detection: 135.67060
+        cycles:
+          detection: 0
+
+      - detector: yolo11l
+        base_resolution_h: 384
+        latency_ms:
+          detection: 69.14341
+        cycles:
+          detection: 0
+
+      # ---------- YOLO11M ----------
+      - detector: yolo11m
+        base_resolution_h: 736
+        latency_ms:
+          detection: 173.53692
+        cycles:
+          detection: 0
+
+      - detector: yolo11m
+        base_resolution_h: 544
+        latency_ms:
+          detection: 100.13525
+        cycles:
+          detection: 0
+
+      - detector: yolo11m
+        base_resolution_h: 384
+        latency_ms:
+          detection: 47.44823
+        cycles:
+          detection: 0
+
+      # ---------- YOLO11S ----------
+      - detector: yolo11s
+        base_resolution_h: 736
+        latency_ms:
+          detection: 89.95332
+        cycles:
+          detection: 0
+
+      - detector: yolo11s
+        base_resolution_h: 544
+        latency_ms:
+          detection: 55.19455
+        cycles:
+          detection: 0
+
+      - detector: yolo11s
+        base_resolution_h: 384
+        latency_ms:
+          detection: 24.90750
+        cycles:
+          detection:   0        
+
+      # ---------- YOLO11N ----------
+      - detector: yolo11n
+        base_resolution_h: 736
+        latency_ms:
+          detection: 31.38791
+        cycles:
+          detection: 954.20          
+
+      - detector: yolo11n
+        base_resolution_h: 544
+        latency_ms:
+          detection: 20.79534
+        cycles:
+          detection: 632.17         
+
+      - detector: yolo11n
+        base_resolution_h: 384
+        latency_ms:
+          detection: 15.06442
+        cycles:
+          detection: 458.0
+
+edge_areas:
+  - area_id: "E1"
+    cpu_cycle_per_ms: 3.8 #3.8GHz #3.8E6 / ms
+    budget: { cpu: 8.0, mem: 8.0, uplink: 80.0 }
+    constraints:
+      D_min: 250.0
+      MOTA_min: 0.20    
+
+    ids_config:
+      accuracy_by_type:
+        syn_flood: [0.01, 0.05]   # FPR, FNR
+        http_flood: [0.01, 0.02]
+
+    users:
+      - user_id: "cam_001"
+        obj_pred_ts: "data/users/cam_001_obj_pred.csv"
+        mota_table: "data/mota_table/bellevue_150th_eastgate.csv"
+      - user_id: "cam_002"
+        obj_pred_ts: "data/users/cam_002_obj_pred.csv"
+        mota_table: "data/mota_table/bellevue_150th_eastgate.csv"
+
+    attackers:
+      - attacker_id: "atk_01"
+        ts: "data/attacks/atk_01.csv"
+
+  - area_id: "E2"
+    budget: { cpu: 8.0, mem: 8.0, uplink: 80.0 }
+    constraints:
+      D_min: 250.0
+      MOTA_min: 0.40    
+    policy:
+      cpu_to_ids_ratio: 0.2
+    ids_config:
+      accuracy_by_type: {}
+    users: []
+    attackers: []

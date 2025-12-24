@@ -1,3 +1,10 @@
+ffmpeg -i Bellevue_150th_Eastgate__2017-09-11_07-08-31.mp4 \
+-t 600 \
+-vf fps=10 \
+-c:v libx264 -preset fast -crf 23 \
+-an \
+2017-09-11_07-08-31_10min_10fps.mp4
+
 <h1 align="center"> Vehicle MTMC Tracking</h1>
 <h3>Baseline code for multi-target (single/multi)-camera object tracking.</h3>
  

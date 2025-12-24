@@ -6,6 +6,9 @@ import torch
 import numpy as np
 from PIL import Image
 from yacs.config import CfgNode
+import time
+from tqdm import tqdm
+from typing import Dict
 
 from mot.deep_sort import preprocessing
 from mot.tracklet_processing import save_tracklets, save_tracklets_csv, refine_tracklets, save_tracklets_txt
@@ -30,6 +33,18 @@ from config.config_tools import expand_relative_paths
 from config.verify_config import check_mot_config, global_checks
 
 MOT_OUTPUT_NAME = "mot"
+
+def _empty_metrics():
+    return {
+        "IDF1": None,
+        "MOTA": None,
+        "latency_ms": {
+            "detection_filter": None,
+            "reid": None,
+        }
+    }
+
+
 
 def filter_boxes(boxes, scores, classes, good_classes, min_confid=0.5, mask=None):
     """Filter the detected boxes by confidence scores, classes and location.
@@ -81,15 +96,16 @@ def box_change_skewed(box, prev_box, skew_ratio=0.1, eps=1e-5):
     return min(lr, ud) <= skew_ratio or max(lr, ud) >= 1 / skew_ratio
 
 
-def run_mot(cfg: CfgNode):
+def run_mot(cfg: CfgNode, write_outputs: bool = True):
     """Run Multi-object tracking, defined by a config."""
 
     # check and verify config (has to be done after logging init to see errors)
     if not check_mot_config(cfg):
         return None
 
-    if not os.path.exists(cfg.OUTPUT_DIR):
-        os.makedirs(cfg.OUTPUT_DIR)
+    if write_outputs:
+        if not os.path.exists(cfg.OUTPUT_DIR):
+            os.makedirs(cfg.OUTPUT_DIR)
 
     # free resources
     gc.collect()
@@ -125,17 +141,28 @@ def run_mot(cfg: CfgNode):
         reid_model.half()
     reid_model.to(device)
     reid_model.eval()
-    extractor = create_extractor(FeatureExtractor, batch_size=cfg.MOT.REID_BATCHSIZE,
+    if len(cfg.MOT.REID_OBJECT_SIZE) != 0:
+        extractor = create_extractor(FeatureExtractor, batch_size=cfg.MOT.REID_BATCHSIZE, image_shape=cfg.MOT.REID_OBJECT_SIZE,
+                                 model=reid_model)        
+    else:
+        extractor = create_extractor(FeatureExtractor, batch_size=cfg.MOT.REID_BATCHSIZE,
                                  model=reid_model)
 
     # load input video
     video_in = imageio.get_reader(cfg.MOT.VIDEO)
     video_meta = video_in.get_meta_data()
-    video_w, video_h = video_meta["size"]
+    # video_w, video_h = video_meta["size"]
+    video_w, video_h = 1280, 736
+    # video_w, video_h = 864, 480
+    # video_w, video_h = 640, 384
+    if cfg.MOT.BASE_RESOLUTION:
+        video_w, video_h = tuple(cfg.MOT.BASE_RESOLUTION)    
     video_frames = video_in.count_frames()
     video_fps = video_meta["fps"]
     VIDEO_EXT = cfg.MOT.VIDEO.split(".")[-1]
-
+    log.info(
+    f"[Video Frame Size {video_w}, {video_h}] || "
+    )   
     # initialize zone matching
     if cfg.MOT.ZONE_MASK_DIR and cfg.MOT.VALID_ZONEPATHS:
         zone_matcher = ZoneMatcher(
@@ -153,7 +180,7 @@ def run_mot(cfg: CfgNode):
 
     # initialize tracker
     if cfg.MOT.TRACKER == "deepsort":
-        tracker = DeepsortTracker(metric, max_cosine_distance, nn_budget, n_init=3,
+        tracker = DeepsortTracker(metric, max_cosine_distance, nn_budget, n_init=3, max_age=10,
                                   zone_matcher=zone_matcher)
         MIN_CONFID = 0.5
     elif cfg.MOT.TRACKER == "bytetrack_iou":
@@ -198,13 +225,15 @@ def run_mot(cfg: CfgNode):
         det_mask = None
 
     # initialize output video
-    if cfg.MOT.ONLINE_VIDEO_OUTPUT:
+    if write_outputs and cfg.MOT.ONLINE_VIDEO_OUTPUT:
         video_out = FileVideo(cfg.FONT,
                               os.path.join(cfg.OUTPUT_DIR,
                                            f"{MOT_OUTPUT_NAME}_online.{VIDEO_EXT}"),
                               format='FFMPEG', mode='I', fps=video_meta["fps"],
                               codec=video_meta["codec"],
                               fontsize=cfg.FONTSIZE)
+    else: 
+        video_out = None;    
 
     # initialize display
     if cfg.MOT.SHOW:
@@ -218,28 +247,45 @@ def run_mot(cfg: CfgNode):
     benchmark = Benchmark()
     timer = Timer()
 
-    for frame_num, frame in enumerate(video_in):
-        if cfg.DEBUG_RUN and frame_num >= 100:
-            break
+    det_filter_times = []
+    reid_times = []
+    frame_stats = []
+    for frame_num, frame in tqdm(enumerate(video_in), total=video_frames):
+
+        # if frame_num >= 1000:
+        #     break
 
         benchmark.restart_timer()
+        # frame = Image.fromarray(frame).resize((video_w, video_h), Image.BILINEAR)
+        # frame = np.array(frame)        
+        # benchmark.register_call("Frame Resize")
+        t0 = time.time()
+        results = detector(frame, conf=0.25, verbose=False, imgsz=(video_w, video_h))[0]  # get first Results object
+        boxes = results.boxes.xywh.cpu().numpy()      # (x, y, w, h)
+        scores = results.boxes.conf.cpu().numpy()     # confidence scores
+        classes = results.boxes.cls.cpu().numpy()     # class indices
 
-        res = detector(frame).xywh[0].cpu().numpy()
-        benchmark.register_call("detector")
-
-        # detected boxes in cx,cy,w,h format
-        boxes = [t[:4] for t in res]
-        scores = [t[4] for t in res]
-        classes = [t[5] for t in res]
-
-        boxes = filter_boxes(boxes, scores, classes,
-                             cfg.MOT.TRACKED_CLASSES, MIN_CONFID, det_mask)
+        
+        boxes = filter_boxes(
+            boxes, scores, classes,
+            cfg.MOT.TRACKED_CLASSES, MIN_CONFID, det_mask
+        )
+        # Remove small boxes
+        MIN_AREA = 0.0003 * video_w * video_h
+        boxes = [(x, y, w, h) for (x, y, w, h) in boxes if w * h >= MIN_AREA]
 
         boxes_tlwh = [[int(x - w / 2), int(y - h / 2), w, h]
                       for x, y, w, h in boxes]
+        det_latency = (time.time() - t0) * 1000
+        det_filter_times.append(det_latency)
         benchmark.register_call("detection filter")
-
+        # --- Feature extraction (ReID) ---
+        
+        start_reid = time.time()  # record start time
         features = extractor(frame, boxes_tlwh)
+        reid_latency = (time.time() - start_reid)*1000
+        reid_times.append(reid_latency)
+        
         detections = [Detection(bbox, score, clname, feature)
                       for bbox, score, clname, feature in zip(boxes_tlwh, scores, classes, features)]
         features = torch.tensor(features)
@@ -309,8 +355,15 @@ def run_mot(cfg: CfgNode):
 
         log.debug(
             f"Frame {frame_num}: active_track_ids: {active_track_ids}, frame type: {type(frame)}, {frame.dtype}, {frame.shape} .")
+        
+        frame_stats.append({
+            "frame": frame_num,
+            "num_objects": len(boxes_tlwh),
+            "detector_latency_ms": det_latency,
+            "reid_latency_ms": reid_latency,
+        })        
 
-        if cfg.MOT.ONLINE_VIDEO_OUTPUT:
+        if write_outputs and cfg.MOT.ONLINE_VIDEO_OUTPUT:
             video_out.update(frame, active_track_ids,
                              active_track_bboxes_tlwh, all_attribs_list)
 
@@ -321,6 +374,14 @@ def run_mot(cfg: CfgNode):
         benchmark.register_call("displays")
 
         fps_counter.step()
+        log.debug(
+            f"[Frame {frame_num}] || "
+            f"ReID latency: {reid_latency*1000:.2f} ms || "
+            f"YOLO detections: {len(results.boxes)} || "
+            f"After filter_boxes: {len(boxes)} || "
+            f"After NMS: {len(indices)} || "
+            f"Active tracks: {len(tracker.active_tracks)}"
+        )     
         print("\rFrame: {}/{}, fps: {:.3f}".format(
             frame_num, video_frames, fps_counter.value()), end="")
 
@@ -337,7 +398,7 @@ def run_mot(cfg: CfgNode):
     if cfg.MOT.SHOW:
         display.close()
 
-    if cfg.MOT.ONLINE_VIDEO_OUTPUT:
+    if write_outputs and cfg.MOT.ONLINE_VIDEO_OUTPUT and video_out is not None:
         video_out.close()
 
     # filter unconfirmed tracklets
@@ -361,48 +422,101 @@ def run_mot(cfg: CfgNode):
         track.compute_mean_feature()
         track.features = []
 
-    if cfg.MOT.VIDEO_OUTPUT:
+    if write_outputs and cfg.MOT.VIDEO_OUTPUT:
         annotate_video_with_tracklets(cfg.MOT.VIDEO,
                                       os.path.join(cfg.OUTPUT_DIR,
                                                    f"{MOT_OUTPUT_NAME}.{VIDEO_EXT}"),
                                       final_tracks,
                                       cfg.FONT, cfg.FONTSIZE)
 
+    txt_save_path = os.path.join(cfg.OUTPUT_DIR, f"{MOT_OUTPUT_NAME}.txt")
+    save_tracklets_txt(final_tracks, txt_save_path)
+    
     csv_save_path = os.path.join(cfg.OUTPUT_DIR, f"{MOT_OUTPUT_NAME}.csv")
     save_tracklets_csv(final_tracks, csv_save_path)
 
-    txt_save_path = os.path.join(cfg.OUTPUT_DIR, f"{MOT_OUTPUT_NAME}.txt")
-    save_tracklets_txt(final_tracks, txt_save_path)
-
     pkl_save_path = os.path.join(cfg.OUTPUT_DIR, f"{MOT_OUTPUT_NAME}.pkl")
     save_tracklets(final_tracks, pkl_save_path)
+
+    eval_summary = None
 
     if len(cfg.EVAL.GROUND_TRUTHS) == 1:
         cfg.defrost()
         cfg.EVAL.PREDICTIONS = [txt_save_path]
         cfg.freeze()
-        run_evaluation(cfg)
 
-    return final_tracks
+        eval_summary = run_evaluation(cfg, return_summary = True)
 
+    metrics = _empty_metrics()
 
-if __name__ == "__main__":
+    if eval_summary is not None:
+        metrics["IDF1"] = float(eval_summary.loc["MTMC", "idf1"])
+        metrics["MOTA"] = float(eval_summary.loc["MTMC", "mota"])
+
+    if det_filter_times:
+        metrics["latency_ms"]["detection_filter"] = float(np.mean(det_filter_times))
+
+    if reid_times:
+        metrics["latency_ms"]["reid"] = float(np.mean(reid_times))
+        
+    if len(frame_stats):
+        metrics["frame_stats"] = frame_stats
+    if write_outputs:
+        return final_tracks
+    else:
+        return metrics
+
+def run_single_experiment(cfg: CfgNode):
+    """
+    Run a single experiment programmatically.
+    No files are written.
+    """
+    return run_mot(cfg, write_outputs=False)
+
+def build_single_cfg(config_path: str = None, overrides: dict = None) -> CfgNode:
+    cfg = get_cfg_defaults()
+
+    if config_path:
+        cfg.merge_from_file(config_path)
+
+    cfg.defrost()
+    if overrides:
+        for k, v in overrides.items():
+            node = cfg
+            keys = k.split(".")
+            for sub in keys[:-1]:
+                node = getattr(node, sub)
+            setattr(node, keys[-1], v)
+    cfg.freeze()
+
+    cfg = expand_relative_paths(cfg)
+    return cfg
+
+def test():
     args = parse_args("Run Multi-object tracker on a video.")
+
     cfg = get_cfg_defaults()
     if args.config:
         cfg.merge_from_file(os.path.join(cfg.SYSTEM.CFG_DIR, args.config))
+
     cfg = expand_relative_paths(cfg)
     cfg.freeze()
 
-    # initialize output directory and logging
     if not global_checks["OUTPUT_DIR"](cfg.OUTPUT_DIR):
         log.error(
             "Invalid param value in: OUTPUT_DIR. Provide an absolute path to a directory, whose parent exists.")
         sys.exit(2)
+
     if not os.path.exists(cfg.OUTPUT_DIR):
         os.makedirs(cfg.OUTPUT_DIR)
 
-    log.log_init(os.path.join(cfg.OUTPUT_DIR, args.log_filename),
-                 args.log_level, not args.no_log_stdout)
+    log.log_init(
+        os.path.join(cfg.OUTPUT_DIR, args.log_filename),
+        args.log_level,
+        not args.no_log_stdout
+    )
 
-    run_mot(cfg)
+    run_mot(cfg, write_outputs=True)
+
+if __name__ == "__main__":
+    test()

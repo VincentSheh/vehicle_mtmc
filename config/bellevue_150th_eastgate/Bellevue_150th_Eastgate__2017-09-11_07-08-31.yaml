@@ -1,0 +1,30 @@
+OUTPUT_DIR: "output/bellevue_150th_eastgate"
+FONTSIZE: 11
+DEBUG_RUN: false
+SYSTEM:
+  GPU_IDS: []
+MOT:
+  VIDEO: "datasets/bellevue_150th_eastgate/2017-09-11_07-08-31_10min_10fps.mp4"
+  REID_MODEL_OPTS: "models/resnet50_mixstyle/opts.yaml"
+  REID_MODEL_CKPT: "models/resnet50_mixstyle/net_19.pth"
+  # CALIBRATION: "config/examples/highway_calibration.txt"
+  REID_FP16: false
+  REID_BATCHSIZE: 16
+  DETECTOR: "yolo11n"
+  TRACKER: "deepsort" #bytetrack_iou
+  DETECTION_MASK: "assets/bellevue_150th_eastgate/Bellevue_150th_Eastgate__2017-09-11_07-08-31.png"
+  SHOW: false
+  VIDEO_OUTPUT: false
+  STATIC_ATTRIBUTES:
+    - color: "models/color_svm.pkl"
+    - type: "models/type_svm.pkl"
+  ATTRIBUTE_INFER_BATCHSIZE: 1
+  REFINE: false
+
+  BASE_RESOLUTION: [1280, 864]
+  REID_OBJECT_SIZE: [18,18]  
+
+EVAL:
+  GROUND_TRUTHS: ["output/bellevue_150th_eastgate/gt.txt"]
+  PREDICTIONS: ["output/bellevue_150th_eastgate/mot.txt"]
+# 163

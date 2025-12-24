@@ -13,7 +13,7 @@ from tools import log
 from evaluate import evaluation
 
 
-def run_evaluation(cfg: CfgNode):
+def run_evaluation(cfg: CfgNode, return_summary: bool = False):
     """Evaluate mot or mtmc results defined by a config."""
 
     if not check_eval_config(cfg):
@@ -29,16 +29,27 @@ def run_evaluation(cfg: CfgNode):
     pred_df = evaluation.load_annots(cfg.EVAL.PREDICTIONS)
     if cfg.EVAL.DROP_SINGLE_CAM and len(cfg.EVAL.PREDICTIONS) > 1:
         pred_df = evaluation.remove_single_cam_tracks(pred_df)
+
     test_df = evaluation.load_annots(cfg.EVAL.GROUND_TRUTHS)
+
     summary = evaluation.evaluate_dfs(
-        test_df, pred_df, min_iou=cfg.EVAL.MIN_IOU, ignore_fp=cfg.EVAL.IGNORE_FP)
+        test_df,
+        pred_df,
+        min_iou=cfg.EVAL.MIN_IOU,
+        ignore_fp=cfg.EVAL.IGNORE_FP,
+    )
+
     strsummary = evaluation.formatted_summary(summary)
 
-    # output summary
+    # output summary (unchanged behavior)
     log.info("Evaluation results:\n" + strsummary + "\n")
     with open(os.path.join(cfg.OUTPUT_DIR, "evaluation.txt"), "w") as f:
         f.write(strsummary)
         f.write("\n")
+
+    if return_summary:
+        return summary
+
     return strsummary
 
 

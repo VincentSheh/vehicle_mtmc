@@ -18,7 +18,6 @@ def expand_relative_paths(root_cfg: CN):
     c.MOT.REID_MODEL_OPTS = get_abspath(c.MOT.REID_MODEL_OPTS, root)
     c.MOT.DETECTION_MASK = get_abspath(c.MOT.DETECTION_MASK, root)
     c.MOT.CALIBRATION = get_abspath(c.MOT.CALIBRATION, root)
-
     # expand paths in attribute dicts
     for x in c.MOT.STATIC_ATTRIBUTES:
         for k, v in x.items():

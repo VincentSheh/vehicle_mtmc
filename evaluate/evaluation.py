@@ -1,5 +1,7 @@
 from typing import List
 import numpy as np
+if not hasattr(np, "asfarray"):
+    np.asfarray = lambda a, dtype=float: np.asarray(a, dtype=dtype)
 import pandas as pd
 import motmetrics as mm
 
