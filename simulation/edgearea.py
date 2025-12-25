@@ -4,36 +4,16 @@ import pandas as pd
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Any
 
-from simulation.service import IDS, VideoPipeline
-from simulation.request import UserCamera, Attacker
-from simulation.environment import StepMetrics
 
-@dataclass
-class OffloadState:
-    """Per-edge snapshot used by the offloader for one timestep."""
-    area_id: str
+from service import IDS, VideoPipeline
 
-    # Tracking queue in number of objects
-    q_obj: int
+from request import UserCamera, Attacker
 
-    # Available tracking compute in cycles/ms after IDS and after OD reservation
-    track_cycles_per_ms: float
+from offload import (
+    OffloadState,
+    OffloadDecision,
+)
 
-    # Cost per tracking object in cycles (computed under receiver CPU model)
-    track_cycles_per_obj: float
-
-    # Detection safety: latest time OT is allowed to finish (ms from 'now')
-    latest_track_finish_ms: float
-
-    # Inter-edge delay lookup key
-    idx: int
-
-
-@dataclass
-class OffloadDecision:
-    src_idx: int
-    dst_idx: int
-    num_obj: int
 @dataclass
 class ResourceBudget:
     cpu: float
@@ -72,7 +52,7 @@ def cooperative_offload_ot(
         if st.q_obj <= 0:
             return 0.0
         cycles = st.q_obj * st.track_cycles_per_obj
-        return cycles / max(1e-9, st.track_cycles_per_ms)
+        return cycles / max(1e-9, st.avail_cycles_per_ms)
 
     # Build TOP by expected finish time (fastest first)
     TOP = list(range(n))
@@ -104,10 +84,11 @@ def cooperative_offload_ot(
                     if dst == src:
                         continue
                     dst_st = states[dst]
-
+                    if dst_st.avail_cycles_per_ms <= 0:
+                        continue
                     # remote completion time if one object is added to dst
                     remote_cycles = (dst_st.q_obj + 1) * dst_st.track_cycles_per_obj
-                    remote_C = remote_cycles / max(1e-9, dst_st.track_cycles_per_ms)
+                    remote_C = remote_cycles / max(1e-9, dst_st.avail_cycles_per_ms)
                     remote_C += float(delay_ms[src, dst])
 
                     # detection-safe constraint at receiver
@@ -155,21 +136,23 @@ class EdgeArea:
         self,
         area_id: str,
         cpu_cycle_per_ms: float,
+        slot_ms: float,
         budget: ResourceBudget,
         constraints: Dict[str, float],
         ids: IDS,
         users: List[UserCamera],
         attackers: List[Attacker],
         pipeline: VideoPipeline,
-        policy: Optional[Dict[str, Any]] = None,
     ):
         self.area_id = str(area_id)
         self.cpu_cycle_per_ms = float(cpu_cycle_per_ms)
         self.budget = budget
+        self.slot_ms = slot_ms
 
         self.constraints = {
-            "D_min": float(constraints.get("D_min", 1e9)),
+            "D_Max": float(constraints.get("D_Max", 1e9)),
             "MOTA_min": float(constraints.get("MOTA_min", 0.0)),
+            "Gamma": float(constraints.get("Gamma", 0.0)),
         }
 
         self.ids = ids
@@ -177,8 +160,7 @@ class EdgeArea:
         self.attackers = list(attackers)
         self.pipeline = pipeline
 
-        self.policy = policy or {}
-        self.cpu_to_ids_ratio = float(self.policy.get("cpu_to_ids_ratio", 0.2))
+        self.cpu_to_ids_ratio = 0.0 #! TODO
 
         self._last_action: Optional[Tuple[str, int]] = None
 
@@ -199,7 +181,7 @@ class EdgeArea:
         # total parallel cycles per ms
         return float(self.cpu_cycle_per_ms * self.budget.cpu)
 
-    def va_cycles_per_ms(self) -> float:
+    def avail_cycles_per_ms(self) -> float:
         # remaining cycles for VA after reserving IDS CPU share
         return float(self.total_cycles_per_ms() * (1.0 - self.cpu_to_ids_ratio))
 
@@ -229,123 +211,19 @@ class EdgeArea:
             cpu_ratio_to_ids=self.cpu_to_ids_ratio,
         )
 
-    # --------------------------
-    # VA compute cost and feasibility
-    # --------------------------
-
-    def compute_required_cycles_per_ms(
-        self,
-        t: int,
-        detector: str,
-        base_resolution_h: int,
-    ) -> float:
-        """
-        Required VA cycles per ms for this area under a given config.
-
-        cost_cycles = (sum_user_latency_ms) * cpu_cycle_per_ms * budget.cpu
-
-        Where sum_user_latency_ms includes:
-          - detection latency per frame (per user)
-          - reid latency per object (per user)
-        """
-        total_latency_ms = 0.0
-
-        for u in self.users:
-            nobj = u.get_num_objects(t, detector, base_resolution_h)
-            total_latency_ms += self.pipeline.total_latency_ms(detector, base_resolution_h, nobj)
-
-        return float(total_latency_ms * self.cpu_cycle_per_ms * self.budget.cpu)
-
-    def is_action_feasible(self, t: int, detector: str, base_resolution_h: int) -> bool:
-        required = self.compute_required_cycles_per_ms(t, detector, base_resolution_h)
-        available = self.va_cycles_per_ms()
-        return required <= available
-
-    # --------------------------
-    # Performance / objective
-    # --------------------------
-
-    def compute_performance(
-        self,
-        t: int,
-        detector: str,
-        base_resolution_h: int,
-        gamma: float = 0.01,
-    ) -> float:
-        """
-        Mean performance across users based on:
-
-        q_u^{y,r,i} =
-          (MOTA^{y,r,i} - MOTA_min_e) * exp( -gamma * (D_u^i - D_min_e) )
-        """
-        D_min = self.constraints["D_min"]
-        MOTA_min = self.constraints["MOTA_min"]
-
-        if not self.users:
-            return 0.0
-
-        q_vals: List[float] = []
-        for u in self.users:
-            nobj = u.get_num_objects(t-1, detector, base_resolution_h)
-            D_u = self.pipeline.total_latency_ms(detector, base_resolution_h, nobj)
-            mota = u.get_mota(detector, base_resolution_h)
-
-            q_u = (mota - MOTA_min) * np.exp(-gamma * (D_u - D_min))
-            q_vals.append(float(q_u))
-
-        return float(np.mean(q_vals)) if q_vals else 0.0
-
-    # --------------------------
-    # Action selection
-    # --------------------------
-
-    def choose_action(self, t: int) -> Tuple[str, int]:
-        """
-        Choose feasible (detector, resolution_h) maximizing performance.
-        Fallback: fastest detection config (ignoring feasibility) if none feasible.
-        """
-        best_perf = -np.inf
-        best_action: Optional[Tuple[str, int]] = None
-
-        for det, h in self.pipeline.all_actions():
-            if not self.is_action_feasible(t, det, h):
-                continue
-
-            perf = self.compute_performance(t, det, h)
-            if perf > best_perf:
-                best_perf = perf
-                best_action = (det, h)
-
-        if best_action is None:
-            # fallback: fastest detector latency, this guarantees a choice
-            best_action = min(
-                self.pipeline.all_actions(),
-                key=lambda a: self.pipeline.detection_ms(a[0], a[1]),
-            )
-
-        self._last_action = best_action
-        return best_action
-
-
     def estimate_detection_cycles_this_frame(
         self,
         detector: str,
         proc_h: int,
         num_cameras: int,
     ) -> float:
-        """
-        OD runs once per camera each frame.
-        Convert OD latency to cycles using your existing convention.
-        """
-        det_ms = self.pipeline.detection_ms(detector, proc_h)
-        return float(num_cameras * det_ms * self.total_cycles_per_ms())
+        return (
+            self.pipeline.detection_cycles(detector, proc_h)
+            * int(num_cameras)
+        )
 
     def tracking_cycles_per_object(self) -> float:
-        """
-        OT cost per object in cycles.
-        Uses reid_latency(ms) and this edge's total cycles/ms.
-        """
-        return float(self.pipeline.reid_latency * self.total_cycles_per_ms())
+        return self.pipeline.tracking_cycles_per_object()
 
     def detection_safe_latest_track_finish_ms(self) -> float:
         """
@@ -356,16 +234,14 @@ class EdgeArea:
         You can set slot_ms in policy, default 1000ms.
         You can also reserve a margin.
         """
-        slot_ms = float(self.policy.get("slot_ms", 1000.0))
-        guard_ms = float(self.policy.get("od_guard_ms", 0.0))
-        return max(0.0, slot_ms - guard_ms)
+        return max(0.0, self.slot_ms)
 
     def build_offload_state(
         self,
         t: int,
         proc_action: Tuple[str, int],
         q_obj: int,
-        va_cycles_per_ms: float,
+        avail_cycles_per_ms: float,
     ) -> OffloadState:
         """
         Build offloading state for the CURRENT frame after:
@@ -386,7 +262,7 @@ class EdgeArea:
         )
 
         # OD execution time in ms
-        od_time_ms = od_cycles / max(1e-9, va_cycles_per_ms)
+        od_time_ms = od_cycles / max(1e-9, avail_cycles_per_ms)
 
         # Detection-safe deadline for OT
         latest_track_finish_ms = self.detection_safe_latest_track_finish_ms()
@@ -396,30 +272,27 @@ class EdgeArea:
 
         return OffloadState(
             area_id=self.area_id,
-            q_obj=int(q_obj),
-            track_cycles_per_ms=float(va_cycles_per_ms),
+            local_q_obj=int(q_obj),   # all local initially
+            recv_q_obj=0,             # nothing received yet
+            avail_cycles_per_ms=float(avail_cycles_per_ms),
             track_cycles_per_obj=self.tracking_cycles_per_object(),
             latest_track_finish_ms=remaining_time_ms,
-            idx=-1,  # filled by offloader
+            idx=-1,
         )
-    
-        
-    def step(
+                
+    def step_local(
         self,
         t: int,
-        all_edge_areas: List["EdgeArea"],
-        delay_ms: np.ndarray,
-    ) -> StepMetrics:
+    ) -> Tuple[OffloadState, Dict[str, float]]:
         """
-        One synchronized timestep with cooperative OT offloading.
-
-        all_edge_areas: list of EdgeArea (including self)
-        delay_ms[i, j]: inter-edge propagation delay in ms
+        Local decision step.
+        No knowledge of other edges.
+        Returns:
+        - OffloadState (pre-offloading)
+        - cache dict for QoE finalization
         """
 
-        # ============================================================
-        # 1) IDS filtering (network-level, before uplink & CPU use)
-        # ============================================================
+        # 1) IDS filtering
         ids_out = self.aggregate_load_after_ids(t)
 
         total_users = float(len(self.users))
@@ -428,11 +301,8 @@ class EdgeArea:
             user_pass_rate / max(1e-6, total_users) if total_users > 0 else 0.0
         )
 
-        # ============================================================
-        # 2) Effective uplink after surviving attacks
-        # ============================================================
+        # 2) uplink after attacks
         attack_df = self._attack_df_at(t)
-
         atk_in = float(ids_out.get("attack_in_rate", 0.0))
         atk_pass = float(ids_out.get("attack_pass_rate", 0.0))
         atk_pass_frac = atk_pass / atk_in if atk_in > 0 else 0.0
@@ -440,60 +310,53 @@ class EdgeArea:
         if "uplink_mbps" in attack_df.columns and not attack_df.empty:
             attack_uplink_in = float(attack_df["uplink_mbps"].sum())
         else:
-            attack_mbps_per_req = float(self.policy.get("attack_mbps_per_req", 0.0))
+            attack_mbps_per_req = 0.0 #! TODO
             attack_uplink_in = (
                 float(attack_df["lambda_req"].sum()) * attack_mbps_per_req
                 if "lambda_req" in attack_df.columns
                 else 0.0
             )
 
-        attack_uplink_pass = attack_uplink_in * atk_pass_frac
-        uplink_available = max(0.0, self.budget.uplink - attack_uplink_pass)
+        uplink_available = max(
+            0.0, self.budget.uplink / (1000.0/self.slot_ms) - attack_uplink_in * atk_pass_frac
+        )
 
-        # ============================================================
-        # 3) Decide upload resolution under uplink constraint
-        # ============================================================
+        # 3) choose upload resolution
         upload_candidates = sorted({h for (_, h) in self.pipeline.all_actions()})
 
-        uplink_table = self.policy.get("uplink_mbps_by_h", None)
-
         def uplink_mbps_for_h(h: int) -> float:
-            if isinstance(uplink_table, dict) and h in uplink_table:
-                return float(uplink_table[h])
-            base = float(self.policy.get("uplink_mbps_at_736", 6.0))
-            return base * (h / 736.0) ** 2
+            ASPECT_W = 16
+            ASPECT_H = 9
+            w = h * 16 / 9
+            size_kb = 0.5*(w * h * 3) / 1024.0
+            return size_kb / 1024.0
 
-        feasible_uploads = []
-        for h in upload_candidates:
-            per_user = uplink_mbps_for_h(h)
-            if user_pass_frac * total_users * per_user <= uplink_available + 1e-9:
-                feasible_uploads.append(h)
-
+        feasible_uploads = [
+            h
+            for h in upload_candidates
+            if user_pass_frac * total_users * uplink_mbps_for_h(h)
+            <= uplink_available + 1e-9
+        ]
         upload_h = max(feasible_uploads) if feasible_uploads else min(upload_candidates)
-
-        # ============================================================
-        # 4) VA compute supply after IDS and surviving attack CPU load
-        # ============================================================
+        # 4) VA compute supply
         total_cycles_per_ms = self.cpu_cycle_per_ms * self.budget.cpu
-        va_cycles_per_ms = total_cycles_per_ms * (1.0 - self.cpu_to_ids_ratio)
+        avail_cycles_per_ms = total_cycles_per_ms * (1.0 - self.cpu_to_ids_ratio)
 
-        attack_pass_rate = float(ids_out.get("attack_pass_rate", 0.0))
         attack_cycles_per_ms = (
-            attack_pass_rate * self.ids.cycles_per_request / 1000.0
+            float(ids_out.get("attack_pass_rate", 0.0))
+            * self.ids.cycles_per_packet
         )
-        va_cycles_per_ms = max(0.0, va_cycles_per_ms - attack_cycles_per_ms)
+        avail_cycles_per_ms = max(0.0, avail_cycles_per_ms - attack_cycles_per_ms)
 
-        # ============================================================
-        # 5) Choose local VA configuration (detector, proc_h)
-        # ============================================================
-        D_min = self.constraints["D_min"]
+        # 5) choose VA configuration locally
+        D_Max = self.constraints["D_Max"]
         MOTA_min = self.constraints["MOTA_min"]
-        gamma = float(self.policy.get("gamma", 0.01))
+        gamma = self.constraints["Gamma"]
 
         best_q = -np.inf
         best_action = None
-        best_mean_latency = 0.0
         best_mean_mota = 0.0
+        best_od_cycles = 0.0
 
         for det, proc_h in self.pipeline.all_actions():
             if proc_h > upload_h:
@@ -502,85 +365,62 @@ class EdgeArea:
             demand_cycles = 0.0
             motas = []
 
-            det_ms = self.pipeline.detection_ms(det, proc_h)
-
             for u in self.users:
                 nobj = u.get_num_objects(t - 1, det, proc_h)
-                per_user_ms = det_ms + nobj * self.pipeline.reid_latency
-                demand_cycles += per_user_ms * total_cycles_per_ms
+
+                # total VA cost for this user in cycles
+                user_cycles = self.pipeline.total_cycles(
+                    detector=det,
+                    base_resolution_h=proc_h,
+                    num_objects=nobj,
+                )
+
+                demand_cycles += user_cycles
                 motas.append(u.get_mota(det, proc_h))
 
             demand_cycles *= user_pass_frac
             mean_latency = (
-                demand_cycles / max(1e-9, va_cycles_per_ms)
-                if va_cycles_per_ms > 0
+                demand_cycles / max(1e-9, avail_cycles_per_ms)
+                if avail_cycles_per_ms > 0
                 else float("inf")
             )
             mean_mota = float(np.mean(motas)) if motas else 0.0
 
-            q = (mean_mota - MOTA_min) * np.exp(-gamma * (mean_latency - D_min))
-
+            # q = (mean_mota - MOTA_min) * np.exp(-gamma * (mean_latency - D_Max))
+            q = mean_mota if mean_latency <= D_Max else 0
             if q > best_q:
                 best_q = q
                 best_action = (det, proc_h)
-                best_mean_latency = mean_latency
+                od_cycles = self.pipeline.detection_cycles(det, proc_h) * len(self.users)
+                best_od_cycles = od_cycles
                 best_mean_mota = mean_mota
 
         if best_action is None:
-            candidates = [(d, h) for (d, h) in self.pipeline.all_actions() if h <= upload_h]
-            best_action = (
-                min(candidates, key=lambda a: self.pipeline.detection_ms(a[0], a[1]))
-                if candidates
-                else min(
-                    self.pipeline.all_actions(),
-                    key=lambda a: self.pipeline.detection_ms(a[0], a[1]),
-                )
+            best_action = min(
+                self.pipeline.all_actions(),
+                key=lambda a: self.pipeline.detection_cycles(a[0], a[1]),
             )
 
         self._last_action = best_action
 
-        # ============================================================
-        # 6) Build offloading states for all edges
-        # ============================================================
-        states = []
-        for e in all_edge_areas:
-            e_ids_out = e.aggregate_load_after_ids(t)
-            states.append(
-                e.build_offload_state(
-                    t=t,
-                    proc_action=e._last_action,
-                    ids_out=e_ids_out,
-                    upload_h=upload_h,
-                    va_cycles_per_ms=va_cycles_per_ms,
-                )
-            )
-
-        # ============================================================
-        # 7) Cooperative OT offloading
-        # ============================================================
-
-        states, _ = cooperative_offload_ot(states, delay_ms)
-
-        # ============================================================
-        # 8) Final QoE computation using post-offloading queues
-        # ============================================================
-        my_state = next(s for s in states if s.area_id == self.area_id)
-
-        ot_cycles = my_state.q_obj * my_state.track_cycles_per_obj
-        ot_latency = ot_cycles / max(1e-9, my_state.track_cycles_per_ms)
-
-        final_latency = best_mean_latency + ot_latency
-        final_q = (best_mean_mota - MOTA_min) * np.exp(-gamma * (final_latency - D_min))
-
-        return StepMetrics(
-            t=t,
-            area_id=self.area_id,
-            qoe_mean=float(final_q),
-            qoe_min=float(final_q),
-            mean_latency_ms=float(final_latency),
-            mean_mota=float(best_mean_mota),
-            ids_coverage=float(ids_out.get("coverage", 0.0)),
-            attack_in_rate=float(ids_out.get("attack_in_rate", 0.0)),
-            attack_drop_rate=float(ids_out.get("attack_drop_rate", 0.0)),
-            user_drop_rate=float(ids_out.get("user_drop_rate", 0.0)),
+        # 6) object queue for OT
+        q_obj = sum(
+            int(u.get_num_objects(t - 1, best_action[0], best_action[1]))
+            for u in self.users
         )
+        q_obj = int(np.floor(q_obj * user_pass_frac))
+
+        state = self.build_offload_state(
+            t=t,
+            proc_action=best_action,
+            q_obj=q_obj,
+            avail_cycles_per_ms=avail_cycles_per_ms,
+        )
+
+        cache = {
+            "best_od_cycles": best_od_cycles,
+            "best_mean_mota": best_mean_mota,
+            "ids_out": ids_out,
+        }
+
+        return state, cache

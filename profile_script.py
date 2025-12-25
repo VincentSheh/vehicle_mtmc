@@ -5,7 +5,7 @@ import os
 import json
 import csv
 
-OUT_DIR = "output/bellevue_150th_eastgate/"
+OUT_DIR = "output/bellevue_150th_eastgate_nomask/"
 FRAME_STATS_DIR = OUT_DIR + "2017-09-11_07-08-31"
 CSV_PATH = os.path.join(OUT_DIR, "results.csv")
 os.makedirs(FRAME_STATS_DIR, exist_ok=True)
@@ -110,17 +110,17 @@ experiments = [
     {
         "MOT.DETECTOR": "yolo11l",
         "MOT.BASE_RESOLUTION": [1280, 736],
-        "MOT.REID_OBJECT_SIZE": [64,64],
+        "MOT.REID_OBJECT_SIZE": [18,18],
     },
     {
         "MOT.DETECTOR": "yolo11l",
         "MOT.BASE_RESOLUTION": [960, 544],
-        "MOT.REID_OBJECT_SIZE": [64,64],
+        "MOT.REID_OBJECT_SIZE": [18,18],
     },
     {
         "MOT.DETECTOR": "yolo11l",
         "MOT.BASE_RESOLUTION": [640, 384],
-        "MOT.REID_OBJECT_SIZE": [64,64],
+        "MOT.REID_OBJECT_SIZE": [18,18],
     },
     {
         "MOT.DETECTOR": "yolo11l",

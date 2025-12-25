@@ -1,8 +1,8 @@
-OUTPUT_DIR: "output/bellevue_150th_eastgate"
+OUTPUT_DIR: "output/bellevue_150th_eastgate_nomask"
 FONTSIZE: 11
 DEBUG_RUN: false
 SYSTEM:
-  GPU_IDS: []
+  GPU_IDS: [0,1]
 MOT:
   VIDEO: "datasets/bellevue_150th_eastgate/2017-09-11_07-08-31_10min_10fps.mp4"
   REID_MODEL_OPTS: "models/resnet50_mixstyle/opts.yaml"
@@ -10,9 +10,9 @@ MOT:
   # CALIBRATION: "config/examples/highway_calibration.txt"
   REID_FP16: false
   REID_BATCHSIZE: 16
-  DETECTOR: "yolo11n"
+  DETECTOR: "yolo11x"
   TRACKER: "deepsort" #bytetrack_iou
-  DETECTION_MASK: "assets/bellevue_150th_eastgate/Bellevue_150th_Eastgate__2017-09-11_07-08-31.png"
+  # DETECTION_MASK: "assets/bellevue_150th_eastgate/Bellevue_150th_Eastgate__2017-09-11_07-08-31.png"
   SHOW: false
   VIDEO_OUTPUT: false
   STATIC_ATTRIBUTES:
@@ -22,9 +22,9 @@ MOT:
   REFINE: false
 
   BASE_RESOLUTION: [1280, 864]
-  REID_OBJECT_SIZE: [18,18]  
+  REID_OBJECT_SIZE: []  
 
 EVAL:
-  GROUND_TRUTHS: ["output/bellevue_150th_eastgate/gt.txt"]
-  PREDICTIONS: ["output/bellevue_150th_eastgate/mot.txt"]
+  GROUND_TRUTHS: ["output/bellevue_150th_eastgate_nomask/gt.txt"]
+  PREDICTIONS: ["output/bellevue_150th_eastgate_nomask/mot.txt"]
 # 163

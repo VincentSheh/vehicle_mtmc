@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>QoE Tradeoff Explorer</title>
+  <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 18px; }
+    .row { display: flex; gap: 18px; flex-wrap: wrap; align-items: flex-start; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 12px 14px; }
+    .controls { min-width: 320px; max-width: 420px; }
+    .plot { flex: 1; min-width: 520px; }
+    .slider { width: 100%; }
+    .label { display: flex; justify-content: space-between; margin: 10px 0 6px; font-size: 14px; }
+    .note { color: #555; font-size: 13px; line-height: 1.35; margin-top: 10px; }
+    code { background: #f6f6f6; padding: 2px 6px; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <h2>Latency–QoE tradeoff by detector and resolution</h2>
+
+  <div class="row">
+    <div class="card controls">
+      <div class="label">
+        <div><b>MOTA_min</b></div>
+        <div id="motaMinVal">0.30</div>
+      </div>
+      <input id="motaMin" class="slider" type="range" min="0" max="0.9" step="0.01" value="0.30" />
+
+      <div class="label">
+        <div><b>D_Max (ms)</b></div>
+        <div id="dMaxVal">50</div>
+      </div>
+      <input id="dMax" class="slider" type="range" min="0" max="1000" step="1" value="50" />
+
+      <div class="label">
+        <div><b>gamma</b></div>
+        <div id="gammaVal">0.0010</div>
+      </div>
+      <input id="gamma" class="slider" type="range" min="0" max="0.05" step="0.0001" value="0.010" />
+
+      <div class="label" style="margin-top: 14px;">
+        <div><b>Y axis</b></div>
+      </div>
+      <select id="yMode" style="width: 100%; padding: 6px 8px; border-radius: 8px;">
+        <option value="qoe" selected>QoE</option>
+        <option value="mota">MOTA</option>
+      </select>
+
+      <div class="note">
+        QoE is computed as
+        <br />
+        <code>(MOTA - MOTA_min) * exp(-gamma * (latency_ms - D_Max))</code>
+        <br />
+        then clamped to 0 if it goes negative.
+      </div>
+    </div>
+
+    <div class="card plot">
+      <div id="chart" style="width: 100%; height: 560px;"></div>
+    </div>
+  </div>
+
+  <script>
+    // --------
+    // Data (your CSV as rows)
+    // --------
+    const rows = [
+      {experiment_id:0, detector:"yolo11x", base_resolution_w:1280, base_resolution_h:736, reid_object_w:18, reid_object_h:18, IDF1:0.79928, MOTA:0.76998, latency_detection_filter_ms:370.17156, latency_reid_ms:34.76799},
+      {experiment_id:1, detector:"yolo11x", base_resolution_w:960,  base_resolution_h:544, reid_object_w:18, reid_object_h:18, IDF1:0.61960, MOTA:0.56040, latency_detection_filter_ms:229.88583, latency_reid_ms:33.31140},
+      {experiment_id:2, detector:"yolo11x", base_resolution_w:640,  base_resolution_h:384, reid_object_w:18, reid_object_h:18, IDF1:0.30917, MOTA:0.23515, latency_detection_filter_ms:111.49907, latency_reid_ms:24.83227},
+
+      {experiment_id:4, detector:"yolo11l", base_resolution_w:1280, base_resolution_h:736, reid_object_w:18, reid_object_h:18, IDF1:0.72672, MOTA:0.67474, latency_detection_filter_ms:207.82990, latency_reid_ms:36.83685},
+      {experiment_id:5, detector:"yolo11l", base_resolution_w:960,  base_resolution_h:544, reid_object_w:18, reid_object_h:18, IDF1:0.55070, MOTA:0.48727, latency_detection_filter_ms:135.67060, latency_reid_ms:33.05091},
+      {experiment_id:6, detector:"yolo11l", base_resolution_w:640,  base_resolution_h:384, reid_object_w:18, reid_object_h:18, IDF1:0.35639, MOTA:0.26226, latency_detection_filter_ms:69.14341,  latency_reid_ms:28.70387},
+
+      {experiment_id:7, detector:"yolo11m", base_resolution_w:1280, base_resolution_h:736, reid_object_w:18, reid_object_h:18, IDF1:0.70032, MOTA:0.64383, latency_detection_filter_ms:173.53692, latency_reid_ms:36.62904},
+      {experiment_id:8, detector:"yolo11m", base_resolution_w:960,  base_resolution_h:544, reid_object_w:18, reid_object_h:18, IDF1:0.44614, MOTA:0.37993, latency_detection_filter_ms:100.13525, latency_reid_ms:32.27148},
+      {experiment_id:9, detector:"yolo11m", base_resolution_w:640,  base_resolution_h:384, reid_object_w:18, reid_object_h:18, IDF1:0.16839, MOTA:0.10429, latency_detection_filter_ms:47.44823,  latency_reid_ms:17.47079},
+
+      {experiment_id:10, detector:"yolo11s", base_resolution_w:1280, base_resolution_h:736, reid_object_w:18, reid_object_h:18, IDF1:0.58494, MOTA:0.53018, latency_detection_filter_ms:89.95332,  latency_reid_ms:36.55098},
+      {experiment_id:11, detector:"yolo11s", base_resolution_w:960,  base_resolution_h:544, reid_object_w:18, reid_object_h:18, IDF1:0.40647, MOTA:0.31504, latency_detection_filter_ms:55.19455,  latency_reid_ms:31.14198},
+      {experiment_id:12, detector:"yolo11s", base_resolution_w:640,  base_resolution_h:384, reid_object_w:18, reid_object_h:18, IDF1:0.17036, MOTA:0.10423, latency_detection_filter_ms:24.90750,  latency_reid_ms:17.00477},
+
+      {experiment_id:13, detector:"yolo11n", base_resolution_w:1280, base_resolution_h:736, reid_object_w:18, reid_object_h:18, IDF1:0.28834, MOTA:0.20582, latency_detection_filter_ms:31.38791,  latency_reid_ms:26.24789},
+      {experiment_id:14, detector:"yolo11n", base_resolution_w:960,  base_resolution_h:544, reid_object_w:18, reid_object_h:18, IDF1:0.16606, MOTA:0.10257, latency_detection_filter_ms:20.79534,  latency_reid_ms:18.08481},
+      {experiment_id:15, detector:"yolo11n", base_resolution_w:640,  base_resolution_h:384, reid_object_w:18, reid_object_h:18, IDF1:0.02322, MOTA:0.01167, latency_detection_filter_ms:15.06442,  latency_reid_ms:3.25362},
+    ];
+
+    // Add total latency
+    for (const r of rows) r.total_latency_ms = r.latency_detection_filter_ms + r.latency_reid_ms;
+
+    // Detector order
+    const orderMap = { yolo11n: 0, yolo11s: 1, yolo11m: 2, yolo11l: 3, yolo11x: 4 };
+    const detectors = Array.from(new Set(rows.map(r => r.detector)))
+      .sort((a,b) => (orderMap[a] ?? 999) - (orderMap[b] ?? 999));
+
+    // Marker symbols per base_resolution_h
+    const resolutions = Array.from(new Set(rows.map(r => r.base_resolution_h))).sort((a,b) => a-b);
+    const markerCycle = ["circle","square","triangle-up","diamond","cross","x","star","triangle-down"];
+    const markerMap = new Map(resolutions.map((h,i) => [h, markerCycle[i % markerCycle.length]]));
+
+    function clamp0(x) { return x < 0 ? 0 : x; }
+
+    function qoe(mota, latencyMs, motaMin, dMax, gamma) {
+      const acc = mota - motaMin;
+      const penalty = Math.exp(-gamma * (latencyMs - dMax));
+      return clamp0(acc * penalty);
+    }
+
+    function buildTraces(motaMin, dMax, gamma, yMode) {
+      const traces = [];
+
+      for (const det of detectors) {
+        const sub = rows
+          .filter(r => r.detector === det)
+          .slice()
+          .sort((a,b) => a.total_latency_ms - b.total_latency_ms);
+
+        const x = sub.map(r => r.total_latency_ms);
+        const y = sub.map(r => {
+          if (yMode === "mota") return r.MOTA;
+          return qoe(r.MOTA, r.total_latency_ms, motaMin, dMax, gamma);
+        });
+
+        const text = sub.map(r => {
+          const q = qoe(r.MOTA, r.total_latency_ms, motaMin, dMax, gamma);
+          return [
+            `detector: ${r.detector}`,
+            `h: ${r.base_resolution_h}`,
+            `reid: ${r.reid_object_h}x${r.reid_object_w}`,
+            `latency: ${r.total_latency_ms.toFixed(2)} ms`,
+            `MOTA: ${r.MOTA.toFixed(5)}`,
+            `QoE: ${q.toFixed(5)}`
+          ].join("<br>");
+        });
+
+        traces.push({
+          type: "scatter",
+          mode: "lines+markers",
+          name: det,
+          x,
+          y,
+          text,
+          hoverinfo: "text",
+          marker: {
+            size: 10,
+            symbol: sub.map(r => markerMap.get(r.base_resolution_h) || "circle"),
+            line: { width: 1 }
+          },
+          line: { width: 2 }
+        });
+      }
+      return traces;
+    }
+
+    function layoutFor(yMode) {
+      return {
+        margin: { l: 60, r: 20, t: 40, b: 55 },
+        xaxis: { title: "Total latency (ms)" },
+        yaxis: { title: (yMode === "mota" ? "MOTA" : "QoE") },
+        legend: { orientation: "h", y: 1.15, x: 0, title: { text: "detector" } },
+        hoverlabel: { align: "left" }
+      };
+    }
+
+    function updateLabels() {
+      document.getElementById("motaMinVal").textContent = Number(motaMin.value).toFixed(2);
+      document.getElementById("dMaxVal").textContent = String(Number(dMax.value));
+      document.getElementById("gammaVal").textContent = Number(gamma.value).toFixed(3);
+    }
+
+    function redraw() {
+      updateLabels();
+      const motaMinV = Number(document.getElementById("motaMin").value);
+      const dMaxV = Number(document.getElementById("dMax").value);
+      const gammaV = Number(document.getElementById("gamma").value);
+      const yModeV = document.getElementById("yMode").value;
+
+      const traces = buildTraces(motaMinV, dMaxV, gammaV, yModeV);
+      Plotly.react("chart", traces, layoutFor(yModeV), { displayModeBar: true, responsive: true });
+    }
+
+    // Wire events
+    const motaMin = document.getElementById("motaMin");
+    const dMax = document.getElementById("dMax");
+    const gamma = document.getElementById("gamma");
+    const yMode = document.getElementById("yMode");
+
+    motaMin.addEventListener("input", redraw);
+    dMax.addEventListener("input", redraw);
+    gamma.addEventListener("input", redraw);
+    yMode.addEventListener("change", redraw);
+
+    // Initial draw
+    redraw();
+  </script>
+</body>
+</html>
