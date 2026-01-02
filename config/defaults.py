@@ -30,6 +30,7 @@ C.SYSTEM.GPU_IDS = [0]
 # it makes sense to provide a new directory under output, e.g output/run_1
 # (to be overridden)
 C.OUTPUT_DIR = None
+C.OUTPUT_FILE = "gt"
 
 # do only a debug run (only track the first few frames in MOT, and express runs)
 C.DEBUG_RUN = False

@@ -257,12 +257,23 @@ def test_environment_run(cfg_path: str, plot=False):
             )
 
         attackers = []
-        for a in area_cfg.get("attackers", []):
-            break #! Attackers not considered rn
+
+        for atk_ref in area_cfg.get("attackers", []):
+            atk_type = atk_ref["attacker_type"]
+
+            if atk_type not in cfg["globals"]["attack"]:
+                raise KeyError(f"Unknown attacker_type: {atk_type}")
+
+            atk_cfg = cfg["globals"]["attack"][atk_type]
+
             attackers.append(
                 Attacker(
-                    attacker_id=a["attacker_id"],
-                    df=pd.read_csv(a["ts"]),
+                    attacker_id=atk_type,
+                    attack_type=atk_cfg["type"],
+                    ts_df=pd.read_csv(atk_cfg["ts_path"]),
+                    cpu_usage_const=atk_cfg["cpu_usage_const"],
+                    non_defendable_bw_const=atk_cfg["non_defendable_bw_const"],
+                    slot_ms=globals_cfg.slot_ms,
                 )
             )
 
@@ -297,7 +308,7 @@ def test_environment_run(cfg_path: str, plot=False):
 
     # Run a short simulation (sanity check)
     env.reset()
-    for _ in range(2000):  # do NOT run full 2000 in test
+    for _ in range(cfg.t_max):  # do NOT run full 2000 in test
         env.step()
 
     df = pd.DataFrame([m.__dict__ for m in env.history])

@@ -32,7 +32,6 @@ from config.defaults import get_cfg_defaults
 from config.config_tools import expand_relative_paths
 from config.verify_config import check_mot_config, global_checks
 
-MOT_OUTPUT_NAME = "mot"
 
 def _empty_metrics():
     return {
@@ -152,12 +151,10 @@ def run_mot(cfg: CfgNode, write_outputs: bool = True):
     video_in = imageio.get_reader(cfg.MOT.VIDEO)
     video_meta = video_in.get_meta_data()
     # video_w, video_h = video_meta["size"]
-    video_w, video_h = 1280, 736
-    # video_w, video_h = 864, 480
-    # video_w, video_h = 640, 384
     if cfg.MOT.BASE_RESOLUTION:
         video_w, video_h = tuple(cfg.MOT.BASE_RESOLUTION)    
-    video_frames = video_in.count_frames()
+    # video_frames = video_in.count_frames()
+    video_frames = 304080
     video_fps = video_meta["fps"]
     VIDEO_EXT = cfg.MOT.VIDEO.split(".")[-1]
     log.info(
@@ -228,7 +225,7 @@ def run_mot(cfg: CfgNode, write_outputs: bool = True):
     if write_outputs and cfg.MOT.ONLINE_VIDEO_OUTPUT:
         video_out = FileVideo(cfg.FONT,
                               os.path.join(cfg.OUTPUT_DIR,
-                                           f"{MOT_OUTPUT_NAME}_online.{VIDEO_EXT}"),
+                                           f"{cfg.OUTPUT_FILE}_online.{VIDEO_EXT}"),
                               format='FFMPEG', mode='I', fps=video_meta["fps"],
                               codec=video_meta["codec"],
                               fontsize=cfg.FONTSIZE)
@@ -271,8 +268,8 @@ def run_mot(cfg: CfgNode, write_outputs: bool = True):
             cfg.MOT.TRACKED_CLASSES, MIN_CONFID, det_mask
         )
         # Remove small boxes
-        MIN_AREA = 0.0003 * video_w * video_h
-        boxes = [(x, y, w, h) for (x, y, w, h) in boxes if w * h >= MIN_AREA]
+        # MIN_AREA = 0.0003 * video_w * video_h
+        boxes = [(x, y, w, h) for (x, y, w, h) in boxes] # if w * h >= MIN_AREA]
 
         boxes_tlwh = [[int(x - w / 2), int(y - h / 2), w, h]
                       for x, y, w, h in boxes]
@@ -425,46 +422,44 @@ def run_mot(cfg: CfgNode, write_outputs: bool = True):
     if write_outputs and cfg.MOT.VIDEO_OUTPUT:
         annotate_video_with_tracklets(cfg.MOT.VIDEO,
                                       os.path.join(cfg.OUTPUT_DIR,
-                                                   f"{MOT_OUTPUT_NAME}.{VIDEO_EXT}"),
+                                                   f"{cfg.OUTPUT_FILE}.{VIDEO_EXT}"),
                                       final_tracks,
                                       cfg.FONT, cfg.FONTSIZE)
 
-    txt_save_path = os.path.join(cfg.OUTPUT_DIR, f"{MOT_OUTPUT_NAME}.txt")
+    txt_save_path = os.path.join(cfg.OUTPUT_DIR, f"{cfg.OUTPUT_FILE}.txt")
     save_tracklets_txt(final_tracks, txt_save_path)
     
-    csv_save_path = os.path.join(cfg.OUTPUT_DIR, f"{MOT_OUTPUT_NAME}.csv")
+    csv_save_path = os.path.join(cfg.OUTPUT_DIR, f"{cfg.OUTPUT_FILE}.csv")
     save_tracklets_csv(final_tracks, csv_save_path)
 
-    pkl_save_path = os.path.join(cfg.OUTPUT_DIR, f"{MOT_OUTPUT_NAME}.pkl")
-    save_tracklets(final_tracks, pkl_save_path)
+    # pkl_save_path = os.path.join(cfg.OUTPUT_DIR, f"{cfg.OUTPUT_FILE}.pkl")
+    # save_tracklets(final_tracks, pkl_save_path)
 
     eval_summary = None
+    print("Saved txt and csv files")
+    # if len(cfg.EVAL.GROUND_TRUTHS) == 1:
+    #     cfg.defrost()
+    #     cfg.EVAL.PREDICTIONS = [txt_save_path]
+    #     cfg.freeze()
 
-    if len(cfg.EVAL.GROUND_TRUTHS) == 1:
-        cfg.defrost()
-        cfg.EVAL.PREDICTIONS = [txt_save_path]
-        cfg.freeze()
-
-        eval_summary = run_evaluation(cfg, return_summary = True)
+    #     eval_summary = run_evaluation(cfg, return_summary = True)
 
     metrics = _empty_metrics()
 
     if eval_summary is not None:
         metrics["IDF1"] = float(eval_summary.loc["MTMC", "idf1"])
         metrics["MOTA"] = float(eval_summary.loc["MTMC", "mota"])
-
+        print("IDF1, MOTA = ", metrics["IDF1"], metrics["MOTA"])
     if det_filter_times:
         metrics["latency_ms"]["detection_filter"] = float(np.mean(det_filter_times))
 
     if reid_times:
         metrics["latency_ms"]["reid"] = float(np.mean(reid_times))
         
-    if len(frame_stats):
-        metrics["frame_stats"] = frame_stats
     if write_outputs:
-        return final_tracks
+        return final_tracks, []
     else:
-        return metrics
+        return metrics, frame_stats
 
 def run_single_experiment(cfg: CfgNode):
     """
@@ -494,6 +489,7 @@ def build_single_cfg(config_path: str = None, overrides: dict = None) -> CfgNode
 
 def test():
     args = parse_args("Run Multi-object tracker on a video.")
+    cfg.OUTPUT_FILE = "gt"
 
     cfg = get_cfg_defaults()
     if args.config:

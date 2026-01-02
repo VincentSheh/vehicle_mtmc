@@ -5,8 +5,9 @@ import os
 import json
 import csv
 
-OUT_DIR = "output/bellevue_150th_eastgate_nomask/"
-FRAME_STATS_DIR = OUT_DIR + "2017-09-11_07-08-31"
+OUT_DIR = "output/bellevue_150th_eastgate_full/"
+# FRAME_STATS_DIR = OUT_DIR + "2017-09-11_07-08-31"
+FRAME_STATS_DIR = OUT_DIR + "full"
 CSV_PATH = os.path.join(OUT_DIR, "results.csv")
 os.makedirs(FRAME_STATS_DIR, exist_ok=True)
 
@@ -71,7 +72,7 @@ def run_experiment(overrides: dict):
     cfg = get_cfg_defaults()
 
     # load base YAML
-    cfg.merge_from_file("config/bellevue_150th_eastgate/Bellevue_150th_Eastgate__2017-09-11_07-08-31.yaml")
+    cfg.merge_from_file("config/bellevue_150th_eastgate/Bellevue_150th_Eastgate__full.yaml")
 
     cfg.defrost()
 
@@ -79,8 +80,8 @@ def run_experiment(overrides: dict):
     for k, v in overrides.items():
         if k.startswith("MOT."):
             setattr(cfg.MOT, k.replace("MOT.", ""), v)
-        elif k == "OUTPUT_DIR":
-            # cfg.OUTPUT_DIR = v
+        elif k == "OUTPUT_FILE":
+            cfg.OUTPUT_FILE = v
             pass
         else:
             raise ValueError(f"Unknown override key: {k}")
@@ -92,119 +93,106 @@ def run_experiment(overrides: dict):
     return run_single_experiment(cfg)
     
 experiments = [
+    # {
+    #     "MOT.DETECTOR": "yolo11x",
+    #     "MOT.BASE_RESOLUTION": [1280, 736],
+    #     "MOT.REID_OBJECT_SIZE": [18,18],
+    #     "OUTPUT_FILE": "yolo11x_736"
+    # },
     {
         "MOT.DETECTOR": "yolo11x",
-        "MOT.BASE_RESOLUTION": [1280, 736],
-        "MOT.REID_OBJECT_SIZE": [18,18],
-    },
-    {
-        "MOT.DETECTOR": "yolo11x",
         "MOT.BASE_RESOLUTION": [960, 544],
         "MOT.REID_OBJECT_SIZE": [18,18],
+        "OUTPUT_FILE": "yolo11x_544"
     },
     {
         "MOT.DETECTOR": "yolo11x",
         "MOT.BASE_RESOLUTION": [640, 384],
         "MOT.REID_OBJECT_SIZE": [18,18],
+        "OUTPUT_FILE": "yolo11x_384"
     },
     {
         "MOT.DETECTOR": "yolo11l",
         "MOT.BASE_RESOLUTION": [1280, 736],
         "MOT.REID_OBJECT_SIZE": [18,18],
+        "OUTPUT_FILE": "yolo11l_736"
     },
     {
         "MOT.DETECTOR": "yolo11l",
         "MOT.BASE_RESOLUTION": [960, 544],
         "MOT.REID_OBJECT_SIZE": [18,18],
+        "OUTPUT_FILE": "yolo11l_544"
     },
     {
         "MOT.DETECTOR": "yolo11l",
         "MOT.BASE_RESOLUTION": [640, 384],
         "MOT.REID_OBJECT_SIZE": [18,18],
-    },
-    {
-        "MOT.DETECTOR": "yolo11l",
-        "MOT.BASE_RESOLUTION": [1280, 736],
-        "MOT.REID_OBJECT_SIZE": [18,18],
-    },
-    {
-        "MOT.DETECTOR": "yolo11l",
-        "MOT.BASE_RESOLUTION": [960, 544],
-        "MOT.REID_OBJECT_SIZE": [18,18],
-    },
-    {
-        "MOT.DETECTOR": "yolo11l",
-        "MOT.BASE_RESOLUTION": [640, 384],
-        "MOT.REID_OBJECT_SIZE": [18,18],
-    },
-    {
-        "MOT.DETECTOR": "yolo11m",
-        "MOT.BASE_RESOLUTION": [1280, 736],
-        "MOT.REID_OBJECT_SIZE": [64,64],
-    },
-    {
-        "MOT.DETECTOR": "yolo11m",
-        "MOT.BASE_RESOLUTION": [960, 544],
-        "MOT.REID_OBJECT_SIZE": [64,64],
-    },
-    {
-        "MOT.DETECTOR": "yolo11m",
-        "MOT.BASE_RESOLUTION": [640, 384],
-        "MOT.REID_OBJECT_SIZE": [64,64],
+        "OUTPUT_FILE": "yolo11l_384"
     },
     {
         "MOT.DETECTOR": "yolo11m",
         "MOT.BASE_RESOLUTION": [1280, 736],
         "MOT.REID_OBJECT_SIZE": [18,18],
+        "OUTPUT_FILE": "yolo11m_736"
     },
     {
         "MOT.DETECTOR": "yolo11m",
         "MOT.BASE_RESOLUTION": [960, 544],
         "MOT.REID_OBJECT_SIZE": [18,18],
+        "OUTPUT_FILE": "yolo11m_544"
     },
     {
         "MOT.DETECTOR": "yolo11m",
         "MOT.BASE_RESOLUTION": [640, 384],
         "MOT.REID_OBJECT_SIZE": [18,18],
+        "OUTPUT_FILE": "yolo11m_384"
     },
     {
         "MOT.DETECTOR": "yolo11s",
         "MOT.BASE_RESOLUTION": [1280, 736],
         "MOT.REID_OBJECT_SIZE": [18,18],
+        "OUTPUT_FILE": "yolo11s_736"
     },
     {
         "MOT.DETECTOR": "yolo11s",
         "MOT.BASE_RESOLUTION": [960, 544],
         "MOT.REID_OBJECT_SIZE": [18,18],
+        "OUTPUT_FILE": "yolo11s_544"
     },
     {
         "MOT.DETECTOR": "yolo11s",
         "MOT.BASE_RESOLUTION": [640, 384],
         "MOT.REID_OBJECT_SIZE": [18,18],
+        "OUTPUT_FILE": "yolo11s_384"
     },
     {
         "MOT.DETECTOR": "yolo11n",
         "MOT.BASE_RESOLUTION": [1280, 736],
         "MOT.REID_OBJECT_SIZE": [18,18],
+        "OUTPUT_FILE": "yolo11n_736"
     },
     {
         "MOT.DETECTOR": "yolo11n",
         "MOT.BASE_RESOLUTION": [960, 544],
         "MOT.REID_OBJECT_SIZE": [18,18],
+        "OUTPUT_FILE": "yolo11n_544"
     },
     {
         "MOT.DETECTOR": "yolo11n",
         "MOT.BASE_RESOLUTION": [640, 384],
         "MOT.REID_OBJECT_SIZE": [18,18],
+        "OUTPUT_FILE": "yolo11n_384"
     },
     
 ]
-results = []
 
 for i, exp in enumerate(experiments):
-    metrics = run_experiment(exp)
-    results.append(metrics)
-
+    metrics, frame_stats = run_experiment(exp)  # keep this object small
+    print("Experiment Finished with metrics", metrics)
+    # write frame stats, then drop the big list immediately
+    write_frame_stats_csv(frame_stats, f"{exp['MOT.DETECTOR']}_{exp['MOT.BASE_RESOLUTION'][1]}")
+    del frame_stats
+    
     row = {
         "experiment_id": i,
         "detector": exp["MOT.DETECTOR"],
@@ -212,10 +200,13 @@ for i, exp in enumerate(experiments):
         "base_resolution_h": exp["MOT.BASE_RESOLUTION"][1],
         "reid_object_w": exp["MOT.REID_OBJECT_SIZE"][0] if exp["MOT.REID_OBJECT_SIZE"] else -1,
         "reid_object_h": exp["MOT.REID_OBJECT_SIZE"][1] if exp["MOT.REID_OBJECT_SIZE"] else -1,
-        "IDF1": fmt(metrics.get("IDF1")),
-        "MOTA": fmt(metrics.get("MOTA")),
-        "latency_detection_filter_ms": fmt(metrics["latency_ms"].get("detection_filter")),
-        "latency_reid_ms": fmt(metrics["latency_ms"].get("reid")),
+        "IDF1": fmt(metrics.get("IDF1", 0)),
+        "MOTA": fmt(metrics.get("MOTA", 0)),
+        "latency_detection_filter_ms": fmt(metrics.get("latency_ms", {}).get("detection_filter")),
+        "latency_reid_ms": fmt(metrics.get("latency_ms", {}).get("reid")),
     }
     append_csv_row(row)
-    write_frame_stats_csv(metrics["frame_stats"], f"{exp['MOT.DETECTOR']}_{exp['MOT.BASE_RESOLUTION'][1]}")    
+
+    # drop the rest and collect
+    del metrics
+    import gc; gc.collect()

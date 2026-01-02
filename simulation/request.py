@@ -13,15 +13,30 @@ class Attacker:
     Optional:
       - cpu_per_req, mem_per_req, uplink_per_req (not required for this minimal emu)
     """
-    def __init__(self, attacker_id: str, df: pd.DataFrame):
+    def __init__(
+        self,
+        attacker_id,
+        attack_type,
+        ts_df,
+        cpu_usage_const,
+        non_defendable_bw_const,
+        slot_ms,
+    ):
         self.attacker_id = attacker_id
-        self.df = df.copy()
-        if "t" not in self.df.columns:
-            raise ValueError("Attacker df missing column 't'")
-        if "attack_type" not in self.df.columns:
-            raise ValueError("Attacker df missing column 'attack_type'")
-        if "lambda_req" not in self.df.columns:
-            raise ValueError("Attacker df missing column 'lambda_req'")
+        self.attack_type = attack_type
+        self.df = ts_df
+        self.cpu_usage_const = cpu_usage_const
+        self.non_defendable_bw_const = non_defendable_bw_const
+        self.slot_ms = slot_ms
+
+        required = {
+            "t",
+            "forward_packets_per_sec",
+            "forward_bytes_per_sec",
+            "flows_per_sec",
+        }
+        if not required.issubset(self.ts.columns):
+            raise ValueError(f"Attack trace missing columns: {required}")
 
     def load_at(self, t: int) -> pd.DataFrame:
         return self.df[self.df["t"] == t].copy()

@@ -9,6 +9,19 @@ globals:
 
   ids:
     latency_ms: 50
+  
+  attack:
+    atk_01:
+      type: drdos_dns
+      ts_path: output/cicddos2019_1/DrDoS_DNS.csv
+      cpu_usage_const: 0.30
+      non_defendable_bw_const: 0.15
+
+    atk_02:
+      type: udp_lag
+      ts_path: output/cicddos2019_1/UDPLag.csv
+      cpu_usage_const: 0.45
+      non_defendable_bw_const: 0.25
 
   video_pipeline:
     reid_latency: 20 #! Should consider batch processing
@@ -102,8 +115,7 @@ edge_areas:
       #   mota_table: "data/mota_table/bellevue_150th_eastgate.csv"
 
     attackers:
-      - attacker_id: "atk_01"
-        ts: "data/attacks/atk_01.csv"
+      - attacker_type: "atk_01"
 
   - area_id: "E2"
     cpu_cycle_per_ms: 3.8 #3.8GHz #3.8E6 / ms

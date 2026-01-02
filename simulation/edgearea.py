@@ -194,8 +194,7 @@ class EdgeArea:
 
     def _attack_df_at(self, t: int) -> pd.DataFrame:
         atk_rows = [atk.load_at(t) for atk in self.attackers]
-        if not atk_rows:
-            return pd.DataFrame(columns=["t", "attack_type", "lambda_req"])
+        assert atk_rows
         return pd.concat(atk_rows, ignore_index=True)
 
     def aggregate_load_after_ids(self, t: int) -> Dict[str, float]:
@@ -310,10 +309,9 @@ class EdgeArea:
         if "uplink_mbps" in attack_df.columns and not attack_df.empty:
             attack_uplink_in = float(attack_df["uplink_mbps"].sum())
         else:
-            attack_mbps_per_req = 0.0 #! TODO
             attack_uplink_in = (
-                float(attack_df["lambda_req"].sum()) * attack_mbps_per_req
-                if "lambda_req" in attack_df.columns
+                float(attack_df["forward_bytes_per_sec"].sum())
+                if "forward_bytes_per_sec" in attack_df.columns
                 else 0.0
             )
 
@@ -338,14 +336,38 @@ class EdgeArea:
             <= uplink_available + 1e-9
         ]
         upload_h = max(feasible_uploads) if feasible_uploads else min(upload_candidates)
-        # 4) VA compute supply
+        
+        # 4) VA compute supply (after attacks)
         total_cycles_per_ms = self.cpu_cycle_per_ms * self.budget.cpu
         avail_cycles_per_ms = total_cycles_per_ms * (1.0 - self.cpu_to_ids_ratio)
 
-        attack_cycles_per_ms = (
-            float(ids_out.get("attack_pass_rate", 0.0))
-            * self.ids.cycles_per_packet
-        )
+        # IDS pass fraction for attacks
+        atk_in = float(ids_out.get("attack_in_rate", 0.0))
+        atk_pass = float(ids_out.get("attack_pass_rate", 0.0))
+        atk_pass_frac = atk_pass / atk_in if atk_in > 0 else 0.0
+        
+        attack_cycles_per_ms = 0.0
+
+        # IDS pass fraction
+        atk_in = float(ids_out.get("attack_in_rate", 0.0))
+        atk_pass = float(ids_out.get("attack_pass_rate", 0.0))
+        atk_pass_frac = atk_pass / atk_in if atk_in > 0 else 0.0
+
+        for _, row in attack_df.iterrows():
+            attacker_id = row.get("attacker_id")
+
+            # find the attacker object
+            attacker = next(
+                a for a in self.attackers if a.attacker_id == attacker_id
+            )
+
+            flows_i = float(row["flows_per_sec"])          # flows/sec for this attacker
+            cpu_per_flow = attacker.cpu_usage_const         # cycles/flow
+
+            attack_cycles_per_ms += (
+                flows_i * cpu_per_flow * atk_pass_frac / 1000.0
+            )
+
         avail_cycles_per_ms = max(0.0, avail_cycles_per_ms - attack_cycles_per_ms)
 
         # 5) choose VA configuration locally

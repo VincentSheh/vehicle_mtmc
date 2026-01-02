@@ -53,14 +53,14 @@ class IDS:
         user_rate: float,
         cpu_ratio_to_ids: float,
     ) -> Dict[str, float]:
-        total_attack = float(attack_df["lambda_req"].sum()) if not attack_df.empty else 0.0
-        total_in = float(user_rate + total_attack)
+        total_attack = float(attack_df["forward_packets_per_sec"].sum()) if not attack_df.empty else 0.0
+        total_in = float(user_rate + total_attack) #! TODO: Change User rate to Packet
 
         speed = self.effective_speed_pkt_per_ms(cpu_ratio_to_ids)
-        coverage = float(min(1.0, speed / total_in)) if total_in > 0 else 0.0
+        coverage = float(min(1.0, speed / total_in)) if total_in > 0 else 0.0 #! TODO: Offloadinfg and add delay to the request
 
         attack_by_type = (
-            attack_df.groupby("attack_type")["lambda_req"].sum().to_dict()
+            attack_df.groupby("attack_type")["flows_per_sec"].sum().to_dict()
             if not attack_df.empty else {}
         )
 
