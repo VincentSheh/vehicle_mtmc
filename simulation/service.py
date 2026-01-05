@@ -20,6 +20,7 @@ class IDS:
         accuracy_by_type_fpr_fnr: Dict[str, Tuple[float, float]],
         cpu_cycle_per_ms: float,
         cpu_cores: int,
+        slot_ms: int,
     ):
         if cycles_per_packet <= 0:
             raise ValueError("IDS processing speed must be > 0")
@@ -28,6 +29,7 @@ class IDS:
 
         # cycles/packet at full CPU
         self.cycles_per_packet: float = cycles_per_packet
+        self.slot_ms: int = slot_ms
 
         # store (TPR, FPR) per attack type
         self.acc_tpr_fpr: Dict[str, Tuple[float, float]] = {}
@@ -37,12 +39,12 @@ class IDS:
             tpr = 1.0 - fnr
             self.acc_tpr_fpr[str(atk_type)] = (tpr, fpr)
 
-    def effective_cycles_per_ms(self, cpu_ratio_to_ids: float) -> float:
+    def effective_cycles_per_step(self, cpu_ratio_to_ids: float) -> float:
         cpu_ratio = float(np.clip(cpu_ratio_to_ids, 0.0, 1.0))
-        return cpu_ratio * self.total_cycles_per_ms_full
+        return cpu_ratio * self.total_cycles_per_ms_full * self.slot_ms
 
-    def effective_speed_pkt_per_ms(self, cpu_ratio_to_ids: float) -> float:
-        ids_cycles = self.effective_cycles_per_ms(cpu_ratio_to_ids)
+    def effective_speed_pkt_per_step(self, cpu_ratio_to_ids: float) -> float:
+        ids_cycles = self.effective_cycles_per_step(cpu_ratio_to_ids)
         if self.cycles_per_packet <= 0:
             return 0.0
         return ids_cycles / self.cycles_per_packet
@@ -53,10 +55,10 @@ class IDS:
         user_rate: float,
         cpu_ratio_to_ids: float,
     ) -> Dict[str, float]:
-        total_attack = float(attack_df["forward_packets_per_sec"].sum()) if not attack_df.empty else 0.0
+        total_attack = float(attack_df["flows_per_sec"].sum()) if not attack_df.empty else 0.0 #? Or use forward_packets_per_sec || flows_per_sec
         total_in = float(user_rate + total_attack) #! TODO: Change User rate to Packet
 
-        speed = self.effective_speed_pkt_per_ms(cpu_ratio_to_ids)
+        speed = self.effective_speed_pkt_per_step(cpu_ratio_to_ids)
         coverage = float(min(1.0, speed / total_in)) if total_in > 0 else 0.0 #! TODO: Offloadinfg and add delay to the request
 
         attack_by_type = (
@@ -67,7 +69,7 @@ class IDS:
         # attacks: expected dropped = coverage * TPR * rate
         attack_drop = 0.0
         for atk_type, lam in attack_by_type.items():
-            tpr, _fpr = self.acc_tpr_fpr.get(str(atk_type), (0.0, 0.0))
+            tpr, _fpr = self.acc_tpr_fpr[str(atk_type)]
             attack_drop += coverage * tpr * float(lam)
 
         attack_pass = max(0.0, total_attack - attack_drop)

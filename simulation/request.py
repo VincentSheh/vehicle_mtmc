@@ -20,26 +20,76 @@ class Attacker:
         ts_df,
         cpu_usage_const,
         non_defendable_bw_const,
+        scaling,
         slot_ms,
+        t_max,
     ):
         self.attacker_id = attacker_id
         self.attack_type = attack_type
-        self.df = ts_df
         self.cpu_usage_const = cpu_usage_const
         self.non_defendable_bw_const = non_defendable_bw_const
         self.slot_ms = slot_ms
+        
+        # -----------------------------
+        # Prepare dataframe
+        # -----------------------------
+        self.df = ts_df.reset_index(drop=True).copy()
+        self.df["attack_type"] = attack_type 
+        self.df["attacker_id"] = attacker_id 
+        self.df["forward_bytes_per_sec"] = self.df["forward_bytes_per_sec"] / (1024*1024)
 
         required = {
-            "t",
             "forward_packets_per_sec",
             "forward_bytes_per_sec",
             "flows_per_sec",
+            "attack_type",
+            "attacker_id",
         }
-        if not required.issubset(self.ts.columns):
-            raise ValueError(f"Attack trace missing columns: {required}")
+        if not required.issubset(self.df.columns):
+            raise ValueError(f"Attack trace missing columns: {required}")        
+
+        step_scale = slot_ms / 1000.0  # seconds per step
+        for col in (
+            "flows_per_sec",
+            "forward_packets_per_sec",
+            "forward_bytes_per_sec",
+        ):
+            self.df[col] *= step_scale        
+            self.df[col] *= scaling        
+
+        # -----------------------------
+        # Unit conversions
+        # -----------------------------
+        self.steps_per_sec = int(1000 // slot_ms)
+
+        trace_len_sec = len(self.df)
+        if trace_len_sec <= 0:
+            raise ValueError("Empty attack trace")
+
+        trace_len_steps = trace_len_sec * self.steps_per_sec
+
+        if trace_len_steps > t_max:
+            raise ValueError(
+                f"Attack trace longer than episode: "
+                f"{trace_len_steps} > {t_max}"
+            )     
+        max_start = t_max - trace_len_steps
+        rng = np.random.default_rng(42)
+        self.start = int(rng.integers(0, max_start + 1)) if max_start > 0 else 0
 
     def load_at(self, t: int) -> pd.DataFrame:
-        return self.df[self.df["t"] == t].copy()
+        """
+        Map step t → second index in attack trace.
+        """
+        local_step = t - self.start
+        if local_step < 0:
+            return pd.DataFrame(columns=self.df.columns)
+
+        sec_idx = local_step // self.steps_per_sec
+        if sec_idx >= len(self.df):
+            return pd.DataFrame(columns=self.df.columns)
+
+        return self.df.iloc[[sec_idx]].copy()
 
 
 def _parse_detector_res_from_filename(p: Path) -> Tuple[str, int]:

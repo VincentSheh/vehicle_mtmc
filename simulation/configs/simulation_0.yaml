@@ -1,5 +1,5 @@
 run:
-  t_max: 2000
+  t_max: 20000
   seed: 42
 
 globals:
@@ -8,7 +8,8 @@ globals:
   fps: 5
 
   ids:
-    latency_ms: 50
+    latency_ms: 0.06 #0.357
+    cycles_ms: 0.0
   
   attack:
     atk_01:
@@ -16,12 +17,14 @@ globals:
       ts_path: output/cicddos2019_1/DrDoS_DNS.csv
       cpu_usage_const: 0.30
       non_defendable_bw_const: 0.15
+      scaling: 1.0
 
     atk_02:
       type: udp_lag
       ts_path: output/cicddos2019_1/UDPLag.csv
       cpu_usage_const: 0.45
       non_defendable_bw_const: 0.25
+      scaling: 0.1
 
   video_pipeline:
     reid_latency: 20 #! Should consider batch processing
@@ -104,12 +107,12 @@ edge_areas:
 
     ids_config:
       accuracy_by_type:
-        syn_flood: [0.01, 0.05]   # FPR, FNR
+        drdos_dns: [0.01, 0.05]   # FPR, FNR
         http_flood: [0.01, 0.02]
 
     users:
       - user_id: "cam_001"
-        input_dir: "input/bellevue_150th_eastgate/"
+        input_dir: "input/bellevue_150th_eastgate_full/"
       # - user_id: "cam_002"
       #   obj_pred_ts: "data/users/cam_002_obj_pred.csv"
       #   mota_table: "data/mota_table/bellevue_150th_eastgate.csv"

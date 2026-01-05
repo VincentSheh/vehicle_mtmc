@@ -160,7 +160,7 @@ class EdgeArea:
         self.attackers = list(attackers)
         self.pipeline = pipeline
 
-        self.cpu_to_ids_ratio = 0.0 #! TODO
+        self.cpu_to_ids_ratio = 0.2 #! TODO
 
         self._last_action: Optional[Tuple[str, int]] = None
 
@@ -193,8 +193,15 @@ class EdgeArea:
     # --------------------------
 
     def _attack_df_at(self, t: int) -> pd.DataFrame:
-        atk_rows = [atk.load_at(t) for atk in self.attackers]
-        assert atk_rows
+        atk_rows = [
+            atk.load_at(t)
+            for atk in self.attackers
+            if not atk.load_at(t).empty
+        ]
+
+        if not atk_rows:
+            return pd.DataFrame()
+
         return pd.concat(atk_rows, ignore_index=True)
 
     def aggregate_load_after_ids(self, t: int) -> Dict[str, float]:
@@ -241,6 +248,7 @@ class EdgeArea:
         proc_action: Tuple[str, int],
         q_obj: int,
         avail_cycles_per_ms: float,
+        uplink_available:float
     ) -> OffloadState:
         """
         Build offloading state for the CURRENT frame after:
@@ -251,8 +259,19 @@ class EdgeArea:
 
         Assumes q_obj already reflects post-IDS surviving objects.
         """
-        det, proc_h = proc_action
+        if proc_action is None:
+            return OffloadState(
+                area_id=self.area_id,
+                local_q_obj=0,
+                recv_q_obj=0,
+                avail_cycles_per_ms=avail_cycles_per_ms,
+                track_cycles_per_obj=0.0,
+                latest_track_finish_ms=0.0,
+                uplink_available=uplink_available,
+                idx=-1,
+            )        
 
+        det, proc_h = proc_action
         # --- Reserve compute for object detection (OD) ---
         od_cycles = self.estimate_detection_cycles_this_frame(
             det,
@@ -276,6 +295,7 @@ class EdgeArea:
             avail_cycles_per_ms=float(avail_cycles_per_ms),
             track_cycles_per_obj=self.tracking_cycles_per_object(),
             latest_track_finish_ms=remaining_time_ms,
+            uplink_available=uplink_available,
             idx=-1,
         )
                 
@@ -337,15 +357,29 @@ class EdgeArea:
         ]
         upload_h = max(feasible_uploads) if feasible_uploads else min(upload_candidates)
         
-        # 4) VA compute supply (after attacks)
         total_cycles_per_ms = self.cpu_cycle_per_ms * self.budget.cpu
         avail_cycles_per_ms = total_cycles_per_ms * (1.0 - self.cpu_to_ids_ratio)
-
-        # IDS pass fraction for attacks
-        atk_in = float(ids_out.get("attack_in_rate", 0.0))
-        atk_pass = float(ids_out.get("attack_pass_rate", 0.0))
-        atk_pass_frac = atk_pass / atk_in if atk_in > 0 else 0.0
         
+        if not feasible_uploads:
+            # no feasible uplink → service outage
+            state = self.build_offload_state(
+                t=t,
+                proc_action=None,
+                q_obj=0,
+                avail_cycles_per_ms=avail_cycles_per_ms,
+                uplink_available=uplink_available,
+            )
+
+            cache = {
+                "best_od_cycles": 0.0,
+                "best_mean_mota": 0.0,
+                "ids_out": ids_out,
+                "force_zero_qoe": True,   # explicit flag
+            }
+
+            return state, cache                
+
+        # 4) VA compute supply (after attacks)
         attack_cycles_per_ms = 0.0
 
         # IDS pass fraction
@@ -437,6 +471,7 @@ class EdgeArea:
             proc_action=best_action,
             q_obj=q_obj,
             avail_cycles_per_ms=avail_cycles_per_ms,
+            uplink_available = uplink_available,
         )
 
         cache = {

@@ -29,7 +29,7 @@ class StepMetrics:
     area_id: str
     qoe_mean: float
     qoe_min: float
-    mean_latency_ms: float
+    uplink_available: float
     mean_mota: float
     local_num_objects: int
     num_objects: int
@@ -44,7 +44,7 @@ def load_globals(cfg: dict) -> GlobalConfig:
     cpu_cycle_per_ms = float(g["cpu_clock_cycle"])
     cpu_cores = int(g["cpu_cores"])
 
-    fps = float(g.get("fps", 30.0))
+    fps = float(g.get("fps", 5.0))
     slot_ms = 1000.0 / fps
 
     ids_latency_ms = float(g["ids"]["latency_ms"])
@@ -202,7 +202,7 @@ class Environment:
                     area_id=edge.area_id,
                     qoe_mean=float(final_q),
                     qoe_min=float(final_q),
-                    mean_latency_ms=float(final_latency),
+                    uplink_available=float(state.uplink_available),
                     mean_mota=float(cache["best_mean_mota"]),
                     local_num_objects = state.local_q_obj,
                     num_objects = state.total_q(),
@@ -241,10 +241,11 @@ def test_environment_run(cfg_path: str, plot=False):
             cycles_per_packet=globals_cfg.ids_cycles_per_packet,
             accuracy_by_type_fpr_fnr={
                 k: tuple(v)
-                for k, v in area_cfg.get("ids_config", {}).get("accuracy_by_type", {}).items()
+                for k, v in area_cfg["ids_config"]["accuracy_by_type"].items()
             },
             cpu_cycle_per_ms=globals_cfg.cpu_cycle_per_ms,
-            cpu_cores=globals_cfg.cpu_cores,            
+            cpu_cores=globals_cfg.cpu_cores,       
+            slot_ms=globals_cfg.slot_ms,  
         )
 
         users = []
@@ -274,6 +275,8 @@ def test_environment_run(cfg_path: str, plot=False):
                     cpu_usage_const=atk_cfg["cpu_usage_const"],
                     non_defendable_bw_const=atk_cfg["non_defendable_bw_const"],
                     slot_ms=globals_cfg.slot_ms,
+                    t_max=cfg["run"]["t_max"],
+                    scaling=atk_cfg["scaling"],
                 )
             )
 
@@ -308,7 +311,7 @@ def test_environment_run(cfg_path: str, plot=False):
 
     # Run a short simulation (sanity check)
     env.reset()
-    for _ in range(cfg.t_max):  # do NOT run full 2000 in test
+    for _ in range(env.t_max):  # do NOT run full 2000 in test
         env.step()
 
     df = pd.DataFrame([m.__dict__ for m in env.history])
@@ -318,12 +321,8 @@ def test_environment_run(cfg_path: str, plot=False):
     # --------------------------------------------------
     assert not df.empty, "No metrics produced"
     assert np.isfinite(df["qoe_mean"]).all(), "Invalid QoE values"
-    assert df["mean_latency_ms"].ge(0).all(), "Negative latency"
     assert df["ids_coverage"].between(0, 1).all(), "IDS coverage out of range"
 
-    print("Environment test passed ✔")
-    print(df.head(10))    
-        
 
     out_dir = "logs/test"
     os.makedirs(out_dir, exist_ok=True)
@@ -338,10 +337,10 @@ def test_environment_run(cfg_path: str, plot=False):
 
     # Latency over time
     (
-        df.pivot(index="t", columns="area_id", values="mean_latency_ms")
-        .plot(figsize=(10, 4), title="Latency over time")
+        df.pivot(index="t", columns="area_id", values="uplink_available")
+        .plot(figsize=(10, 4), title="Available uplink over time")
         .get_figure()
-        .savefig(f"{out_dir}/latency_over_time.png", bbox_inches="tight")
+        .savefig(f"{out_dir}/uplink_available.png", bbox_inches="tight")
     )
 
     # Executed objects (post-offload)
@@ -358,6 +357,14 @@ def test_environment_run(cfg_path: str, plot=False):
         .plot(figsize=(10, 4), title="IDS coverage")
         .get_figure()
         .savefig(f"{out_dir}/ids_coverage.png", bbox_inches="tight")
+    )
+    
+    # Attack in 
+    (
+        df.pivot(index="t", columns="area_id", values="attack_in_rate")
+        .plot(figsize=(10, 4), title="Attack In Rate")
+        .get_figure()
+        .savefig(f"{out_dir}/attack_in_rate.png", bbox_inches="tight")
     )
 
     print(f"Plots saved to {out_dir}/")    

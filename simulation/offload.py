@@ -11,6 +11,7 @@ class OffloadState:
     recv_q_obj: int
 
     avail_cycles_per_ms: float
+    uplink_available: float
     track_cycles_per_obj: float
     latest_track_finish_ms: float
     idx: int
