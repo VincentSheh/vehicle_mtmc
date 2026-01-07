@@ -1,197 +1,223 @@
-from __future__ import annotations
-
-from typing import List, Tuple, Dict, Any, Optional
-import numpy as np
+import math
 import torch
-
+import torch.nn as nn
+import numpy as np
 from tensordict import TensorDict
-from torchrl.envs import EnvBase
-from torchrl.data import CompositeSpec
-from torchrl.data.tensor_specs import (
-    BoundedTensorSpec,
-    UnboundedContinuousTensorSpec,
-    DiscreteTensorSpec,
-    MultiDiscreteTensorSpec,
-)
 
-from simulation.environment import Environment
-from simulation.edgearea import EdgeArea
+from torchrl.collectors import SyncDataCollector
+from torchrl.modules import ProbabilisticActor, ValueOperator
+from tensordict.nn import TensorDictModule, TensorDictSequential
+from torchrl.objectives import ClipPPOLoss
+from torchrl.objectives.value import GAE
+from torch.distributions import Categorical, Independent
+from environment import TorchRLEnvWrapper
 
 
-class EdgeDefenseTorchRLEnv(EnvBase):
-    """
+class ActorNet(nn.Module):
+    def __init__(self, n_edges: int, obs_dim: int):
+        super().__init__()
+        self.n_edges = n_edges
+        obs_size = n_edges * obs_dim
 
-    Action per edge area:
-      - ids_ratio_idx: index into ids_ratio_grid
-      - pipeline_idx: index into pipeline_actions
-
-    Observation per edge area (example):
-      - num_users
-      - attack_in_rate
-      - ids_coverage
-      - mean_latency_ms
-      - mean_mota
-    """
-
-    def __init__(
-        self,
-        env: Environment,
-        device: Optional[torch.device] = None,
-        ids_ratio_grid: Optional[List[float]] = None,
-    ):
-        super().__init__(device=device)
-
-        self.env = env
-        self.device = device if device is not None else torch.device("cpu")
-
-        self.edge_areas: List[EdgeArea] = self.env.edge_areas
-        self.n_areas = len(self.edge_areas)
-
-        # discrete grid for cpu_to_ids_ratio
-        self.ids_ratio_grid = ids_ratio_grid or [0.05, 0.10, 0.15, 0.20, 0.30, 0.40]
-        self.n_ratio = len(self.ids_ratio_grid)
-
-        # global pipeline action list from the shared pipeline catalog
-        # assumes all areas share the same pipeline object and it exposes all_actions()
-        pipeline = self.edge_areas[0].pipeline
-        self.pipeline_actions: List[Tuple[str, int]] = pipeline.all_actions()
-        self.n_pipeline = len(self.pipeline_actions)
-
-        # observation vector dimension
-        self.obs_per_area = 5
-        self.obs_dim = self.n_areas * self.obs_per_area
-
-        self._make_specs()
-
-    def _make_specs(self) -> None:
-        # action is MultiDiscrete, shape [n_areas, 2]
-        # each row: [ids_ratio_idx, pipeline_idx]
-        self.action_spec = CompositeSpec(
-            action=MultiDiscreteTensorSpec(
-                nvec=torch.tensor([self.n_ratio, self.n_pipeline], dtype=torch.long).repeat(self.n_areas, 1),
-                shape=(self.n_areas, 2),
-                device=self.device,
-            )
+        self.backbone = nn.Sequential(
+            nn.Linear(obs_size, 256),
+            nn.ReLU(),
+            nn.Linear(256, 256),
+            nn.ReLU(),
         )
 
-        # observation is a flat float vector
-        # bounds are loose, you can tighten later
-        self.observation_spec = CompositeSpec(
-            observation=UnboundedContinuousTensorSpec(
-                shape=(self.obs_dim,),
-                device=self.device,
-                dtype=torch.float32,
-            )
+        self.proj = nn.Linear(256, n_edges * 4)
+
+    def forward(self, obs):
+        x = obs.reshape(*obs.shape[:-2], -1)
+        h = self.backbone(x)
+
+        logits = self.proj(h)
+        logits = logits.view(*h.shape[:-1], self.n_edges, 4)
+        return logits
+
+
+class CriticNet(nn.Module):
+    def __init__(self, n_edges: int, obs_dim: int):
+        super().__init__()
+        obs_size = n_edges * obs_dim
+        self.net = nn.Sequential(
+            nn.Linear(obs_size, 256),
+            nn.ReLU(),
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1),
         )
 
-        self.reward_spec = CompositeSpec(
-            reward=UnboundedContinuousTensorSpec(
-                shape=(1,),
-                device=self.device,
-                dtype=torch.float32,
-            )
+    def forward(self, obs):
+        # obs: (..., n_edges, obs_dim)
+        x = obs.reshape(*obs.shape[:-2], -1)  # -> (..., n_edges*obs_dim)
+        return self.net(x)  # -> (..., 1)
+
+
+def train(cfg_path="./configs/simulation_0.yaml", device="cpu"):
+    torch.manual_seed(0)
+    np.random.seed(0)
+    decision_interval=100
+    decisions_per_episode = math.ceil(20000 / decision_interval)
+
+    env = TorchRLEnvWrapper(
+        cfg_path=cfg_path,
+        seed=0,
+        device=device,
+        decision_interval=decision_interval
+    )
+
+    obs_size = env.n_edges * env.obs_dim
+    action_dim = env.action_dim
+
+    # Flatten obs inside tensordict: (n_edges, obs_dim) -> (obs_size,)
+    def add_obs_flat_td(td):
+        obs = td["observation"]
+        td.set("observation_flat", obs.flatten(-2, -1))
+
+        # if next exists, also create next/observation_flat
+        if "next" in td.keys(True, True):
+            nxt_obs = td["next", "observation"]
+            td.set(("next", "observation_flat"), nxt_obs.flatten(-2, -1))
+        return td
+
+    actor_net = ActorNet(env.n_edges, env.obs_dim).to(device)
+    critic_net = CriticNet(env.n_edges, env.obs_dim).to(device)
+
+    actor_module = TensorDictModule(
+        actor_net,
+        in_keys=["observation"],
+        out_keys=["logits"],
+    )
+
+
+    actor = ProbabilisticActor(
+        module=actor_module,
+        in_keys=["logits"],
+        out_keys=["action"],
+        distribution_class=lambda logits: Independent(
+            Categorical(logits=logits),
+            reinterpreted_batch_ndims=1,
+        ),
+        return_log_prob=True,
+    )
+
+    value_module = TensorDictModule(
+        critic_net,
+        in_keys=["observation"],
+        out_keys=["state_value"],
+    )
+    value = ValueOperator(value_module)
+    
+    adv = GAE(gamma=0.995, lmbda=0.95, value_network=value)
+    adv.set_keys(
+        value="state_value",
+        advantage="advantage",
+        value_target="value_target",
+        reward="reward",
+        done="done",
+        terminated="terminated",
+    )
+
+    loss = ClipPPOLoss(
+        actor_network=actor,
+        critic_network=value,
+        clip_epsilon=0.2,
+        entropy_bonus=True,
+        entropy_coef=1e-3,
+        critic_coef=1.0,
+        loss_critic_type="smooth_l1",
+    )
+    loss.set_keys(
+        value="state_value",
+        advantage="advantage",
+        value_target="value_target",
+    )    
+    
+    
+    collector = SyncDataCollector(
+        env,
+        policy=actor,
+        frames_per_batch=decisions_per_episode,
+        total_frames=decisions_per_episode * 100,
+        device=device,
+        trust_policy=True,
+    )
+
+    optim = torch.optim.Adam(
+        list(actor_net.parameters()) + list(critic_net.parameters()),
+        lr=3e-4,
+    )
+
+    ppo_epochs = 4
+    minibatch_size = 1024
+
+    def assert_finite(td, prefix=""):
+        for k in td.keys(True, True):
+            v = td.get(k)
+            if torch.is_tensor(v) and not torch.isfinite(v).all():
+                bad = v[~torch.isfinite(v)]
+                print(prefix, "NON-FINITE at key:", k, "example:", bad.flatten()[:5])
+                raise RuntimeError(f"NaN/Inf in {k}")
+
+    env.reset()
+
+    for it, batch in enumerate(collector):
+        batch = add_obs_flat_td(batch)
+
+        # safety checks
+        assert_finite(batch, "BATCH")
+        assert_finite(batch["next"], "NEXT")
+
+        # remove reset + terminal
+        traj = batch[1:-1]
+
+        traj.set("reward", traj.get(("next", "reward")))
+        traj.set("done", traj.get(("next", "done")))
+        traj.set("terminated", traj.get(("next", "terminated")))
+        traj.set("truncated", traj.get(("next", "truncated")))
+
+        with torch.no_grad():
+            adv(traj)
+
+        adv_t = traj["advantage"]
+        traj.set(
+            "advantage",
+            (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
         )
 
-        self.done_spec = CompositeSpec(
-            done=DiscreteTensorSpec(
-                n=2,
-                shape=(1,),
-                device=self.device,
-                dtype=torch.bool,
-            )
+        flat = traj.flatten(0, -1)
+        B = flat.numel()
+
+        for _ in range(ppo_epochs):
+            perm = torch.randperm(B, device=device)
+            for start in range(0, B, minibatch_size):
+                mb = flat[perm[start:start + minibatch_size]]
+
+                out = loss(mb)
+                total_loss = (
+                    out["loss_objective"]
+                    + out["loss_critic"]
+                    + out.get("loss_entropy", torch.tensor(0.0, device=device))
+                )
+
+                optim.zero_grad(set_to_none=True)
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    list(actor_net.parameters()) + list(critic_net.parameters()),
+                    1.0,
+                )
+                optim.step()
+
+        print(
+            f"Iteration={it} "
+            f"reward_mean={batch['next', 'reward'].mean().item():.4f}"
         )
 
-    # -------------------------
-    # Helpers
-    # -------------------------
+        # stop once episode is finished
+        if batch["done"].any():
+            break
 
-    def _apply_action(self, action: torch.Tensor) -> None:
-        """
-        action: tensor shape (n_areas, 2)
-        """
-        action = action.detach().cpu().long().numpy()
-
-        for i, ea in enumerate(self.edge_areas):
-            ratio_idx = int(action[i, 0])
-            pipe_idx = int(action[i, 1])
-
-            ratio_idx = max(0, min(self.n_ratio - 1, ratio_idx))
-            pipe_idx = max(0, min(self.n_pipeline - 1, pipe_idx))
-
-            ea.cpu_to_ids_ratio = float(self.ids_ratio_grid[ratio_idx])
-
-            det, h = self.pipeline_actions[pipe_idx]
-            # store as a forced action for this step
-            # you need a small hook in EdgeArea.choose_action() to use it
-            ea.forced_pipeline_action = (det, h)
-
-    def _collect_obs(self, metrics_batch: List[Any]) -> torch.Tensor:
-        """
-        metrics_batch: list of StepMetrics returned by env.step()
-        """
-        feats = []
-        for i, ea in enumerate(self.edge_areas):
-            m = metrics_batch[i]
-
-            num_users = float(len(ea.users))
-            attack_in = float(m.attack_in_rate)
-            cov = float(m.ids_coverage)
-            lat = float(m.mean_latency_ms)
-            mota = float(m.mean_mota)
-
-            feats.extend([num_users, attack_in, cov, lat, mota])
-
-        obs = torch.tensor(feats, dtype=torch.float32, device=self.device)
-        return obs
-
-    def _reward_from_metrics(self, metrics_batch: List[Any]) -> float:
-        # global mean QoE across areas
-        vals = [float(m.qoe_mean) for m in metrics_batch]
-        return float(np.mean(vals)) if vals else 0.0
-
-    # -------------------------
-    # TorchRL required API
-    # -------------------------
-
-    def _reset(self, tensordict: Optional[TensorDict] = None, **kwargs) -> TensorDict:
-        self.env.reset()
-
-        # create initial metrics by stepping with current defaults
-        metrics_batch = self.env.step()
-
-        obs = self._collect_obs(metrics_batch)
-        reward = torch.tensor([0.0], dtype=torch.float32, device=self.device)
-        done = torch.tensor([False], dtype=torch.bool, device=self.device)
-
-        return TensorDict(
-            {
-                "observation": obs,
-                "reward": reward,
-                "done": done,
-            },
-            batch_size=[],
-            device=self.device,
-        )
-
-    def _step(self, tensordict: TensorDict) -> TensorDict:
-        action = tensordict["action"]
-        self._apply_action(action)
-
-        metrics_batch = self.env.step()
-
-        obs = self._collect_obs(metrics_batch)
-        r = self._reward_from_metrics(metrics_batch)
-        reward = torch.tensor([r], dtype=torch.float32, device=self.device)
-
-        done_flag = bool(self.env.t >= self.env.t_max)
-        done = torch.tensor([done_flag], dtype=torch.bool, device=self.device)
-
-        return TensorDict(
-            {
-                "observation": obs,
-                "reward": reward,
-                "done": done,
-            },
-            batch_size=[],
-            device=self.device,
-        )
+if __name__ == "__main__":
+    train("./configs/simulation_0.yaml", device="cuda")

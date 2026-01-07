@@ -78,7 +78,9 @@ class IDS:
         avg_fpr = float(np.mean([v[1] for v in self.acc_tpr_fpr.values()])) if self.acc_tpr_fpr else 0.0
         user_drop = coverage * avg_fpr * float(user_rate)
         user_pass = max(0.0, float(user_rate) - user_drop)
-
+        ids_cycles_available = self.effective_cycles_per_step(cpu_ratio_to_ids)
+        ids_used_cycles = min(total_in * self.cycles_per_packet, ids_cycles_available)
+        ids_cpu_util = ids_used_cycles / ids_cycles_available
         return {
             "coverage": coverage,
             "attack_in_rate": total_attack,
@@ -86,6 +88,7 @@ class IDS:
             "attack_pass_rate": attack_pass,
             "user_drop_rate": user_drop,
             "user_pass_rate": user_pass,
+            "ids_cpu_util": ids_cpu_util,
         }
 
 class VideoPipeline:

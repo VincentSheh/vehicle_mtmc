@@ -8,7 +8,7 @@ globals:
   fps: 5
 
   ids:
-    latency_ms: 0.06 #0.357
+    latency_ms: 0.0006 #0.357
     cycles_ms: 0.0
   
   attack:
@@ -120,14 +120,14 @@ edge_areas:
     attackers:
       - attacker_type: "atk_01"
 
-  - area_id: "E2"
-    cpu_cycle_per_ms: 3.8 #3.8GHz #3.8E6 / ms
-    budget: { cpu: 8.0, mem: 8.0, uplink: 12.5 }
-    constraints:
-      D_Max: 250.0
-      MOTA_min: 0.40    
-      Gamma: 0.0005 
-    ids_config:
-      accuracy_by_type: {}
-    users: []
-    attackers: []
+  # - area_id: "E2"
+  #   cpu_cycle_per_ms: 3.8 #3.8GHz #3.8E6 / ms
+  #   budget: { cpu: 8.0, mem: 8.0, uplink: 12.5 }
+  #   constraints:
+  #     D_Max: 250.0
+  #     MOTA_min: 0.40    
+  #     Gamma: 0.0005 
+  #   ids_config:
+  #     accuracy_by_type: {}
+  #   users: []
+  #   attackers: []

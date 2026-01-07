@@ -10,8 +10,10 @@ class OffloadState:
     # objects received from other edges
     recv_q_obj: int
 
-    avail_cycles_per_ms: float
+    va_avail_cycles_per_ms: float
+    avail_cycles_aft_atk_per_ms: float
     uplink_available: float
+    uplink_util: float
     track_cycles_per_obj: float
     latest_track_finish_ms: float
     idx: int

@@ -247,8 +247,10 @@ class EdgeArea:
         t: int,
         proc_action: Tuple[str, int],
         q_obj: int,
-        avail_cycles_per_ms: float,
-        uplink_available:float
+        va_avail_cycles_per_ms: float,
+        avail_cycles_aft_atk_per_ms: float,
+        uplink_available:float,
+        uplink_util:float
     ) -> OffloadState:
         """
         Build offloading state for the CURRENT frame after:
@@ -264,10 +266,11 @@ class EdgeArea:
                 area_id=self.area_id,
                 local_q_obj=0,
                 recv_q_obj=0,
-                avail_cycles_per_ms=avail_cycles_per_ms,
+                avail_cycles_aft_atk_per_ms=avail_cycles_aft_atk_per_ms,
                 track_cycles_per_obj=0.0,
                 latest_track_finish_ms=0.0,
                 uplink_available=uplink_available,
+                uplink_util=uplink_util,
                 idx=-1,
             )        
 
@@ -280,7 +283,7 @@ class EdgeArea:
         )
 
         # OD execution time in ms
-        od_time_ms = od_cycles / max(1e-9, avail_cycles_per_ms)
+        od_time_ms = od_cycles / max(1e-9, avail_cycles_aft_atk_per_ms)
 
         # Detection-safe deadline for OT
         latest_track_finish_ms = self.detection_safe_latest_track_finish_ms()
@@ -292,10 +295,12 @@ class EdgeArea:
             area_id=self.area_id,
             local_q_obj=int(q_obj),   # all local initially
             recv_q_obj=0,             # nothing received yet
-            avail_cycles_per_ms=float(avail_cycles_per_ms),
+            va_avail_cycles_per_ms=float(va_avail_cycles_per_ms),
+            avail_cycles_aft_atk_per_ms=float(avail_cycles_aft_atk_per_ms),
             track_cycles_per_obj=self.tracking_cycles_per_object(),
             latest_track_finish_ms=remaining_time_ms,
             uplink_available=uplink_available,
+            uplink_util=uplink_util,
             idx=-1,
         )
                 
@@ -355,31 +360,12 @@ class EdgeArea:
             if user_pass_frac * total_users * uplink_mbps_for_h(h)
             <= uplink_available + 1e-9
         ]
-        upload_h = max(feasible_uploads) if feasible_uploads else min(upload_candidates)
-        
+        upload_h = max(feasible_uploads) if feasible_uploads else min(upload_candidates)        
+
+        # 4) VA compute supply (after attacks)    
         total_cycles_per_ms = self.cpu_cycle_per_ms * self.budget.cpu
         avail_cycles_per_ms = total_cycles_per_ms * (1.0 - self.cpu_to_ids_ratio)
         
-        if not feasible_uploads:
-            # no feasible uplink → service outage
-            state = self.build_offload_state(
-                t=t,
-                proc_action=None,
-                q_obj=0,
-                avail_cycles_per_ms=avail_cycles_per_ms,
-                uplink_available=uplink_available,
-            )
-
-            cache = {
-                "best_od_cycles": 0.0,
-                "best_mean_mota": 0.0,
-                "ids_out": ids_out,
-                "force_zero_qoe": True,   # explicit flag
-            }
-
-            return state, cache                
-
-        # 4) VA compute supply (after attacks)
         attack_cycles_per_ms = 0.0
 
         # IDS pass fraction
@@ -402,7 +388,26 @@ class EdgeArea:
                 flows_i * cpu_per_flow * atk_pass_frac / 1000.0
             )
 
-        avail_cycles_per_ms = max(0.0, avail_cycles_per_ms - attack_cycles_per_ms)
+        avail_cycles_aft_atk_per_ms = max(0.0, avail_cycles_per_ms - attack_cycles_per_ms)
+
+        if not feasible_uploads:
+            # no feasible uplink → service outage
+            state = self.build_offload_state(
+                t=t,
+                proc_action=None,
+                q_obj=0,
+                avail_cycles_aft_atk_per_ms=avail_cycles_aft_atk_per_ms,
+                uplink_available=uplink_available,
+            )
+
+            cache = {
+                "best_od_cycles": 0.0,
+                "best_mean_mota": 0.0,
+                "ids_out": ids_out,
+                "force_zero_qoe": True,   # explicit flag
+            }
+
+            return state, cache     
 
         # 5) choose VA configuration locally
         D_Max = self.constraints["D_Max"]
@@ -413,7 +418,8 @@ class EdgeArea:
         best_action = None
         best_mean_mota = 0.0
         best_od_cycles = 0.0
-
+        demand_cycles = 0.0
+        
         for det, proc_h in self.pipeline.all_actions():
             if proc_h > upload_h:
                 continue
@@ -436,8 +442,8 @@ class EdgeArea:
 
             demand_cycles *= user_pass_frac
             mean_latency = (
-                demand_cycles / max(1e-9, avail_cycles_per_ms)
-                if avail_cycles_per_ms > 0
+                demand_cycles / max(1e-9, avail_cycles_aft_atk_per_ms)
+                if avail_cycles_aft_atk_per_ms > 0
                 else float("inf")
             )
             mean_mota = float(np.mean(motas)) if motas else 0.0
@@ -465,13 +471,20 @@ class EdgeArea:
             for u in self.users
         )
         q_obj = int(np.floor(q_obj * user_pass_frac))
-
+        
+        uplink_total = self.budget.uplink / (1000.0 / self.slot_ms)
+        uplink_user_used = (user_pass_frac * total_users * uplink_mbps_for_h(upload_h))
+        uplink_attack_used = attack_uplink_in * atk_pass_frac
+        uplink_used = uplink_user_used + uplink_attack_used
+        uplink_util = min(1.0, uplink_used / max(1e-9, uplink_total))        
         state = self.build_offload_state(
             t=t,
             proc_action=best_action,
             q_obj=q_obj,
-            avail_cycles_per_ms=avail_cycles_per_ms,
+            va_avail_cycles_per_ms = avail_cycles_per_ms,
+            avail_cycles_aft_atk_per_ms=avail_cycles_aft_atk_per_ms,
             uplink_available = uplink_available,
+            uplink_util = uplink_util,
         )
 
         cache = {

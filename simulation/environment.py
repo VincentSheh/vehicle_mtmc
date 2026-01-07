@@ -3,6 +3,17 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any
 
+import torch
+from tensordict import TensorDict
+from torchrl.envs import EnvBase
+from torchrl.data import (
+    CompositeSpec,
+    UnboundedContinuousTensorSpec,
+    BoundedTensorSpec,
+    DiscreteTensorSpec,
+    MultiDiscreteTensorSpec,
+)
+
 import yaml
 import os
 import numpy as np
@@ -37,6 +48,12 @@ class StepMetrics:
     attack_in_rate: float
     attack_drop_rate: float
     user_drop_rate: float
+    cpu_to_ids_ratio: float
+    va_cpu_utilization: float
+    ids_cpu_utilization: float
+    bw_utilization: float
+    I_net: float
+
     
 def load_globals(cfg: dict) -> GlobalConfig:
     g = cfg["globals"]
@@ -77,17 +94,17 @@ class Environment:
         self.t = 0
         self.history.clear()
 
-    def run(self) -> pd.DataFrame:
-        while self.t < self.t_max:
-            self.step()
-        return pd.DataFrame([m.__dict__ for m in self.history])
-    
     def cooperative_offload_ot(
         self,
         states: List[OffloadState],
-    ) -> Tuple[List[OffloadState], List[OffloadDecision]]:
+    ) -> Tuple[List[OffloadState], List[OffloadDecision], np.ndarray]:
         """
         Synchronized greedy OT offloading across all edges.
+
+        Returns:
+        - updated states
+        - list of OffloadDecision
+        - I_net array of shape (n,) where I_net[i] = I_in[i] - I_out[i]
         """
         n = len(states)
         for i, st in enumerate(states):
@@ -95,13 +112,18 @@ class Environment:
 
         decisions: List[OffloadDecision] = []
 
+        # per-slot offload counters
+        I_in = np.zeros(n, dtype=np.int64)
+        I_out = np.zeros(n, dtype=np.int64)
+
         def finish_time_ms(st: OffloadState) -> float:
-            if st.total_q() <= 0:
+            q = st.total_q()
+            if q <= 0:
                 return 0.0
-            cycles = st.total_q() * st.track_cycles_per_obj
-            if st.avail_cycles_per_ms <= 0:
-                return float("inf")            
-            return cycles / max(1e-9, st.avail_cycles_per_ms)
+            if st.avail_cycles_aft_atk_per_ms <= 0:
+                return float("inf")
+            cycles = q * st.track_cycles_per_obj
+            return cycles / max(1e-9, st.avail_cycles_aft_atk_per_ms)
 
         TOP = list(range(n))
         TOP.sort(key=lambda i: finish_time_ms(states[i]))
@@ -110,11 +132,7 @@ class Environment:
         while changed:
             changed = False
 
-            slow_order = sorted(
-                TOP,
-                key=lambda i: finish_time_ms(states[i]),
-                reverse=True,
-            )
+            slow_order = sorted(TOP, key=lambda i: finish_time_ms(states[i]), reverse=True)
 
             for src in slow_order:
                 src_st = states[src]
@@ -131,57 +149,61 @@ class Environment:
 
                     remote_cycles = (dst_st.total_q() + 1) * dst_st.track_cycles_per_obj
                     remote_C = (
-                        remote_cycles / max(1e-9, dst_st.avail_cycles_per_ms)
-                        + self.delay_ms[src, dst]
+                        remote_cycles / max(1e-9, dst_st.avail_cycles_aft_atk_per_ms)
+                        + float(self.delay_ms[src, dst])
                     )
 
+                    # must still meet dst slack window
                     if remote_C > dst_st.latest_track_finish_ms:
                         continue
 
+                    # beneficial move
                     if remote_C < local_C:
+                        # move exactly one object
                         src_st.local_q_obj -= 1
                         dst_st.recv_q_obj += 1
 
-                        decisions.append(
-                            OffloadDecision(src_idx=src, dst_idx=dst, num_obj=1)
-                        )
+                        I_out[src] += 1
+                        I_in[dst] += 1
 
+                        decisions.append(OffloadDecision(src_idx=src, dst_idx=dst, num_obj=1))
+
+                        # resort since workloads changed
                         TOP.sort(key=lambda i: finish_time_ms(states[i]))
                         changed = True
                         break
 
-        return states, decisions    
+        I_net = I_in - I_out  # shape: (n,)
+        return states, decisions, I_net
     
-    def step(self):
-        """
-        One global timestep:
-        1) Each edge makes local decisions independently
-        2) Environment aggregates offload states
-        3) Cooperative OT offloading
-        4) Final QoE computation
-        """
+    def step(self, action):
+        offload_states = []
+        local_cache = {}
 
-        # 1) Local decisions (no cross-edge information)
-        offload_states: List[OffloadState] = []
-        local_cache: Dict[str, Dict[str, Any]] = {}
+        # action expected shape: (n_edges,)
+        for i, edge in enumerate(self.edge_areas):
+            ai = action[i]
+            if torch.is_tensor(ai):
+                ai = float(ai.detach().item())
+            edge.cpu_to_ids_ratio = ai
 
-        for edge in self.edge_areas:
             state, cache = edge.step_local(self.t)
             offload_states.append(state)
             local_cache[edge.area_id] = cache
 
         # 2) Cooperative OT offloading (global)
-        offload_states, _ = self.cooperative_offload_ot(offload_states)
+        offload_states, _, I_net = self.cooperative_offload_ot(offload_states)
 
         # 3) Final QoE computation per edge
         for edge in self.edge_areas:
             cache = local_cache[edge.area_id]
             state = next(s for s in offload_states if s.area_id == edge.area_id)
             
-            od_latency = cache["best_od_cycles"] / max(1e-9, state.avail_cycles_per_ms)
+            od_cycles = cache["best_od_cycles"]
+            od_latency = od_cycles / max(1e-9, state.avail_cycles_aft_atk_per_ms)
 
             ot_cycles = state.local_q_obj * state.track_cycles_per_obj
-            ot_latency = ot_cycles / max(1e-9, state.avail_cycles_per_ms)
+            ot_latency = ot_cycles / max(1e-9, state.avail_cycles_aft_atk_per_ms)
 
             final_latency = od_latency + ot_latency
 
@@ -195,7 +217,7 @@ class Environment:
             final_q = cache["best_mean_mota"] if final_latency <= D_Max else 0
 
             ids_out = cache["ids_out"]
-
+            I_net_e = I_net[state.idx]
             self.history.append(
                 StepMetrics(
                     t=self.t,
@@ -204,19 +226,27 @@ class Environment:
                     qoe_min=float(final_q),
                     uplink_available=float(state.uplink_available),
                     mean_mota=float(cache["best_mean_mota"]),
-                    local_num_objects = state.local_q_obj,
+                    
                     num_objects = state.total_q(),
                     ids_coverage=float(ids_out.get("coverage", 0.0)),
                     attack_in_rate=float(ids_out.get("attack_in_rate", 0.0)),
-                    attack_drop_rate=float(ids_out.get("attack_drop_rate", 0.0)),
                     user_drop_rate=float(ids_out.get("user_drop_rate", 0.0)),
+                    
+                    # RL Observation
+                    local_num_objects = state.local_q_obj,
+                    attack_drop_rate=float(ids_out.get("attack_drop_rate", 0.0)),
+                    cpu_to_ids_ratio = edge.cpu_to_ids_ratio,
+                    va_cpu_utilization = (od_cycles + ot_cycles) / state.va_avail_cycles_per_ms * edge.slot_ms,
+                    ids_cpu_utilization = ids_out["ids_cpu_util"],
+                    bw_utilization = state.uplink_util,
+                    I_net = I_net_e,
                 )
             )
 
         self.t += 1
         
         
-def test_environment_run(cfg_path: str, plot=False):
+def build_env_base(cfg_path: str):
     with open(cfg_path, "r") as f:
         cfg = yaml.safe_load(f)
 
@@ -308,17 +338,234 @@ def test_environment_run(cfg_path: str, plot=False):
         t_max=cfg["run"]["t_max"],
         seed=cfg["run"]["seed"],
     )
+    return env
 
-    # Run a short simulation (sanity check)
+
+class TorchRLEnvWrapper(EnvBase):
+    """
+    Correct TorchRL EnvBase wrapper.
+
+    - reset() returns a td with keys: observation, done, terminated (and optionally reward)
+    - _step(td) returns NEXT td with keys: observation, reward, done, terminated
+      TorchRL will create td["next"] automatically.
+    """
+
+    def __init__(
+        self,
+        cfg_path: str,
+        decision_interval: int = 3000,
+        seed: int = 0,
+        device: str | torch.device = "cpu",
+    ):
+        super().__init__(device=torch.device(device), batch_size=[])
+
+        self.env = build_env_base(cfg_path)
+        self.n_edges = len(self.env.edge_areas)
+        self.area_ids = [e.area_id for e in self.env.edge_areas]
+
+        self.decision_interval = int(decision_interval)
+        # self._step_count = 0
+
+        self.obs_keys = [
+            "local_num_objects",
+            "attack_drop_rate",
+            "cpu_to_ids_ratio",
+            "va_cpu_utilization",
+            "ids_cpu_utilization",
+            "ids_coverage",
+            "bw_utilization",
+            "I_net",
+            "user_drop_rate",
+        ]
+        
+        self.obs_dim = len(self.obs_keys)
+
+        self.action_dim = self.n_edges
+        self._last_action = torch.zeros(self.action_dim, device=self.device, dtype=torch.float32)
+        self.cpu_levels = torch.tensor(
+            [0.1,0.2,0.4,0.6,0.7,0.8],
+            device=self.device,
+        )        
+
+        self._set_seed(seed)
+        self._make_specs()
+
+    # ---------------- TorchRL required ----------------
+
+    def _set_seed(self, seed: Optional[int]):
+        if seed is None:
+            return None
+        np.random.seed(int(seed))
+        torch.manual_seed(int(seed))
+        return seed
+
+    def _make_specs(self):
+        self.observation_spec = CompositeSpec(
+            observation=UnboundedContinuousTensorSpec(
+                shape=(self.n_edges, self.obs_dim),
+                dtype=torch.float32,
+                device=self.device,
+            )
+        )
+
+        self.action_spec = CompositeSpec(
+            action=MultiDiscreteTensorSpec(
+                nvec=torch.tensor([6] * self.n_edges),  # 4 choices per edge
+                dtype=torch.int64,
+                device=self.device,
+            )
+        )
+
+        self.reward_spec = CompositeSpec(
+            reward=UnboundedContinuousTensorSpec(
+                shape=(1,),
+                dtype=torch.float32,
+                device=self.device,
+            )
+        )
+
+        self.done_spec = CompositeSpec(
+            done=BoundedTensorSpec(
+                low=0,
+                high=1,
+                shape=(1,),
+                dtype=torch.bool,
+                device=self.device,
+            ),
+            terminated=BoundedTensorSpec(
+                low=0,
+                high=1,
+                shape=(1,),
+                dtype=torch.bool,
+                device=self.device,
+            ),
+            truncated=BoundedTensorSpec(
+                low=0,
+                high=1,
+                shape=(1,),
+                dtype=torch.bool,
+                device=self.device,
+            ),
+        )
+
+    # ---------------- Reset / Step ----------------
+    def _reset(self, tensordict=None):
+        self.env.reset()
+        # self._step_count = 0
+
+        obs = self._build_observation().to(self.device)
+
+        return TensorDict(
+            {
+                "observation": obs,
+                "done": torch.zeros(1, dtype=torch.bool, device=self.device),
+                "terminated": torch.zeros(1, dtype=torch.bool, device=self.device),
+                "truncated": torch.zeros(1, dtype=torch.bool, device=self.device),
+            },
+            batch_size=[],
+            device=self.device,
+        )
+
+    def _step(self, tensordict: TensorDict) -> TensorDict:
+        # 1) Read action at decision boundary
+        action = tensordict.get("action", None)
+        if action is not None:
+            self._last_action = action.detach().to(self.device).clone()
+
+        cpu_ratios = self.cpu_levels[self._last_action]  # (n_edges,)
+
+        total_reward = 0.0
+        terminated_flag = False
+
+        # 2) Simulate decision_interval internal timesteps
+        for _ in range(self.decision_interval):
+            self.env.step(cpu_ratios)
+            # self._step_count += 1
+
+            # accumulate reward
+            total_reward += float(self._build_reward())
+
+            # early stop if episode ends
+            if self.env.t >= self.env.t_max:
+                terminated_flag = True
+                break
+
+        # 3) Build aggregated outputs
+        obs = self._build_observation().to(self.device)
+
+        reward = torch.tensor(
+            [total_reward], dtype=torch.float32, device=self.device
+        )
+
+        terminated = torch.tensor(
+            [terminated_flag], dtype=torch.bool, device=self.device
+        )
+        truncated = torch.zeros(1, dtype=torch.bool, device=self.device)
+        done = terminated | truncated
+
+        return TensorDict(
+            {
+                "observation": obs,
+                "reward": reward,
+                "done": done,
+                "terminated": terminated,
+                "truncated": truncated,
+            },
+            batch_size=[],
+            device=self.device,
+        )
+
+    # ---------------- Helpers ----------------
+    def _build_observation(self) -> torch.Tensor:
+        obs = torch.zeros((self.n_edges, self.obs_dim), dtype=torch.float32)
+
+        if not self.env.history:
+            return obs
+
+        hist = self.env.history[-self.decision_interval * self.n_edges :]
+
+        # group by area
+        by_area = {aid: [] for aid in self.area_ids}
+        for m in hist:
+            by_area[m.area_id].append(m)
+
+        for i, aid in enumerate(self.area_ids):
+            records = by_area.get(aid, [])
+            if not records:
+                continue
+
+            for j, k in enumerate(self.obs_keys):
+                vals = [getattr(r, k) for r in records]
+
+                # aggregation rule
+                if k == "I_net":
+                    obs[i, j] = float(np.sum(vals))
+                elif k == "cpu_to_ids_ratio":
+                    obs[i, j] = float(vals[-1])
+                else:
+                    obs[i, j] = float(np.mean(vals))
+
+        return obs
+
+    def _build_reward(self) -> torch.Tensor:
+        if not self.env.history:
+            return torch.zeros(1, dtype=torch.float32, device=self.device)
+
+        last_block = self.env.history[-self.n_edges:]
+        qoes = [float(m.qoe_mean) for m in last_block]
+        return torch.tensor(
+            [float(np.mean(qoes))],
+            dtype=torch.float32,
+        )
+        
+def test_environment_run(cfg_path: str, plot=False):
+    env = build_env_base(cfg_path)
     env.reset()
-    for _ in range(env.t_max):  # do NOT run full 2000 in test
-        env.step()
+    for _ in range(env.t_max): 
+        env.step([0.2])
 
     df = pd.DataFrame([m.__dict__ for m in env.history])
 
-    # --------------------------------------------------
-    # Assertions / sanity checks
-    # --------------------------------------------------
     assert not df.empty, "No metrics produced"
     assert np.isfinite(df["qoe_mean"]).all(), "Invalid QoE values"
     assert df["ids_coverage"].between(0, 1).all(), "IDS coverage out of range"
@@ -366,7 +613,8 @@ def test_environment_run(cfg_path: str, plot=False):
         .get_figure()
         .savefig(f"{out_dir}/attack_in_rate.png", bbox_inches="tight")
     )
-
+    avg_qoe = df["qoe_mean"].mean()
+    print(f"Average QoE (qoe_mean): {avg_qoe:.4f}")
     print(f"Plots saved to {out_dir}/")    
         
 if __name__ == "__main__":
