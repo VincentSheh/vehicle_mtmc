@@ -14,3 +14,4 @@ mot/deep_sort_orig/
 __py*
 .venv
 .jedi
+simulation/wandb/

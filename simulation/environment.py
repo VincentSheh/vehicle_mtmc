@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -43,6 +44,7 @@ class StepMetrics:
     uplink_available: float
     mean_mota: float
     local_num_objects: int
+    local_gt_num_objects: int
     num_objects: int
     ids_coverage: float
     attack_in_rate: float
@@ -87,11 +89,13 @@ class Environment:
         self.t_max = int(t_max)
         self.t = 0
         self.history: List[StepMetrics] = []
+        self.last_history: List[StepMetrics] = []
 
         np.random.seed(seed)
 
     def reset(self):
         self.t = 0
+        self.last_history = list(self.history)
         self.history.clear()
 
     def cooperative_offload_ot(
@@ -185,7 +189,7 @@ class Environment:
             ai = action[i]
             if torch.is_tensor(ai):
                 ai = float(ai.detach().item())
-            edge.cpu_to_ids_ratio = ai
+            edge.cpu_to_ids_ratio =  ai / edge.budget.cpu
 
             state, cache = edge.step_local(self.t)
             offload_states.append(state)
@@ -217,6 +221,7 @@ class Environment:
             final_q = cache["best_mean_mota"] if final_latency <= D_Max else 0
 
             ids_out = cache["ids_out"]
+            local_gt_num_objects = cache["local_gt_num_object"]
             I_net_e = I_net[state.idx]
             self.history.append(
                 StepMetrics(
@@ -234,9 +239,10 @@ class Environment:
                     
                     # RL Observation
                     local_num_objects = state.local_q_obj,
+                    local_gt_num_objects = local_gt_num_objects,
                     attack_drop_rate=float(ids_out.get("attack_drop_rate", 0.0)),
                     cpu_to_ids_ratio = edge.cpu_to_ids_ratio,
-                    va_cpu_utilization = (od_cycles + ot_cycles) / state.va_avail_cycles_per_ms * edge.slot_ms,
+                    va_cpu_utilization = (od_cycles + ot_cycles) / (state.va_avail_cycles_per_ms * edge.slot_ms),
                     ids_cpu_utilization = ids_out["ids_cpu_util"],
                     bw_utilization = state.uplink_util,
                     I_net = I_net_e,
@@ -284,6 +290,8 @@ def build_env_base(cfg_path: str):
                 UserCamera(
                     user_id=u["user_id"],
                     input_dir=u["input_dir"],
+                    t_max=cfg["run"]["t_max"],
+                    seed=cfg["run"]["seed"]
                 )
             )
 
@@ -307,6 +315,7 @@ def build_env_base(cfg_path: str):
                     slot_ms=globals_cfg.slot_ms,
                     t_max=cfg["run"]["t_max"],
                     scaling=atk_cfg["scaling"],
+                    seed=cfg["run"]["seed"]
                 )
             )
 
@@ -362,30 +371,35 @@ class TorchRLEnvWrapper(EnvBase):
         self.env = build_env_base(cfg_path)
         self.n_edges = len(self.env.edge_areas)
         self.area_ids = [e.area_id for e in self.env.edge_areas]
+        self.episode_id = 0
+        self.base_seed = seed
 
         self.decision_interval = int(decision_interval)
         # self._step_count = 0
 
         self.obs_keys = [
-            "local_num_objects",
+            # "local_num_objects",
+            "local_gt_num_objects",
             "attack_drop_rate",
             "cpu_to_ids_ratio",
-            "va_cpu_utilization",
-            "ids_cpu_utilization",
-            "ids_coverage",
+            # "va_cpu_utilization",
+            # "ids_cpu_utilization",
             "bw_utilization",
-            "I_net",
-            "user_drop_rate",
+            # "I_net",
         ]
         
         self.obs_dim = len(self.obs_keys)
 
         self.action_dim = self.n_edges
         self._last_action = torch.zeros(self.action_dim, device=self.device, dtype=torch.float32)
-        self.cpu_levels = torch.tensor(
-            [0.1,0.2,0.4,0.6,0.7,0.8],
+        self.scale_step = 0.5  # CPU units per scale
+        self.ids_cpu_min = 0.5
+
+        self.ids_cpu = torch.tensor(
+            [e.cpu_to_ids_ratio * e.budget.cpu for e in self.env.edge_areas],
             device=self.device,
-        )        
+            dtype=torch.float32,
+        )
 
         self._set_seed(seed)
         self._make_specs()
@@ -409,9 +423,8 @@ class TorchRLEnvWrapper(EnvBase):
         )
 
         self.action_spec = CompositeSpec(
-            action=MultiDiscreteTensorSpec(
-                nvec=torch.tensor([6] * self.n_edges),  # 4 choices per edge
-                dtype=torch.int64,
+            action=DiscreteTensorSpec(
+                n=3,   # {-1, 0, +1}
                 device=self.device,
             )
         )
@@ -450,8 +463,16 @@ class TorchRLEnvWrapper(EnvBase):
 
     # ---------------- Reset / Step ----------------
     def _reset(self, tensordict=None):
+        self.episode_id += 1
+        episode_seed = self.base_seed + self.episode_id * 1000
+
+        # Seed ONLY torch (policy randomness)
+        torch.manual_seed(episode_seed)
+
+        # Reset env with explicit seeds
         self.env.reset()
-        # self._step_count = 0
+        for i, edge in enumerate(self.env.edge_areas):
+            edge.reset(seed=episode_seed + i)
 
         obs = self._build_observation().to(self.device)
 
@@ -465,21 +486,51 @@ class TorchRLEnvWrapper(EnvBase):
             batch_size=[],
             device=self.device,
         )
+        
+    def _decision_ids_util(self) -> float:
+        """Max IDS CPU utilization across edges over the last decision window."""
+        if len(self.env.history) < self.decision_interval * self.n_edges:
+            return 0.0
+        records = self.env.history[-self.decision_interval * self.n_edges:]
+        df = pd.DataFrame([m.__dict__ for m in records])
+
+        utils = []
+        for area_id in self.area_ids:
+            g = df[df["area_id"] == area_id]
+            if g.empty or "ids_cpu_utilization" not in g:
+                continue
+            utils.append(float(np.clip(np.mean(g["ids_cpu_utilization"].values), 0.0, 1.0)))
+        return float(max(utils)) if utils else 0.0
+
+    def _reactive_delta(self) -> float:
+        """Return delta in {-1,0,+1} based on IDS util thresholding."""
+        util = self._decision_ids_util()
+        if util >= 0.80:
+            return 1.0
+        if util <= 0.20:
+            return -1.0
+        return 0.0        
 
     def _step(self, tensordict: TensorDict) -> TensorDict:
-        # 1) Read action at decision boundary
-        action = tensordict.get("action", None)
-        if action is not None:
-            self._last_action = action.detach().to(self.device).clone()
+        action = tensordict["action"]                       # scalar 0/1/2
+        delta = action.to(self.device).float() - 1.0
+        # delta = self._reactive_delta()  # -1, 0, +1
 
-        cpu_ratios = self.cpu_levels[self._last_action]  # (n_edges,)
+        edge = self.env.edge_areas[0]
+        self.ids_cpu[0] = torch.clamp(
+            self.ids_cpu[0] + delta * self.scale_step,
+            min=self.ids_cpu_min,
+            max=edge.budget.cpu - 0.5,
+        )
+        ids_cpu = self.ids_cpu.clone()
+        print(action, delta, ids_cpu)
 
         total_reward = 0.0
         terminated_flag = False
 
         # 2) Simulate decision_interval internal timesteps
         for _ in range(self.decision_interval):
-            self.env.step(cpu_ratios)
+            self.env.step(ids_cpu)
             # self._step_count += 1
 
             # accumulate reward
@@ -494,7 +545,7 @@ class TorchRLEnvWrapper(EnvBase):
         obs = self._build_observation().to(self.device)
 
         reward = torch.tensor(
-            [total_reward], dtype=torch.float32, device=self.device
+            [total_reward / self.decision_interval], dtype=torch.float32, device=self.device
         )
 
         terminated = torch.tensor(
@@ -517,27 +568,21 @@ class TorchRLEnvWrapper(EnvBase):
 
     # ---------------- Helpers ----------------
     def _build_observation(self) -> torch.Tensor:
-        obs = torch.zeros((self.n_edges, self.obs_dim), dtype=torch.float32)
+        obs = torch.zeros((self.n_edges, self.obs_dim), dtype=torch.float32, device=self.device)
 
         if not self.env.history:
             return obs
 
-        hist = self.env.history[-self.decision_interval * self.n_edges :]
+        records = self.env.history[-self.decision_interval * self.n_edges:]
 
-        # group by area
-        by_area = {aid: [] for aid in self.area_ids}
-        for m in hist:
-            by_area[m.area_id].append(m)
+        df = pd.DataFrame([m.__dict__ for m in records])
 
-        for i, aid in enumerate(self.area_ids):
-            records = by_area.get(aid, [])
-            if not records:
+        for i, area_id in enumerate(self.area_ids):
+            g = df[df["area_id"] == area_id]
+            if g.empty:
                 continue
-
             for j, k in enumerate(self.obs_keys):
-                vals = [getattr(r, k) for r in records]
-
-                # aggregation rule
+                vals = g[k].values
                 if k == "I_net":
                     obs[i, j] = float(np.sum(vals))
                 elif k == "cpu_to_ids_ratio":
@@ -553,16 +598,21 @@ class TorchRLEnvWrapper(EnvBase):
 
         last_block = self.env.history[-self.n_edges:]
         qoes = [float(m.qoe_mean) for m in last_block]
+
+        mean_qoe = float(np.mean(qoes))
+        reward = mean_qoe # if mean_qoe >= 0.1 else -1
+
         return torch.tensor(
-            [float(np.mean(qoes))],
+            [reward],
             dtype=torch.float32,
-        )
+            device=self.device,
+        )        
         
 def test_environment_run(cfg_path: str, plot=False):
     env = build_env_base(cfg_path)
     env.reset()
     for _ in range(env.t_max): 
-        env.step([0.2])
+        env.step([3.5])
 
     df = pd.DataFrame([m.__dict__ for m in env.history])
 

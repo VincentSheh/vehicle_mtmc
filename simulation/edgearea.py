@@ -160,10 +160,36 @@ class EdgeArea:
         self.attackers = list(attackers)
         self.pipeline = pipeline
 
-        self.cpu_to_ids_ratio = 0.2 #! TODO
+        self.cpu_to_ids_ratio = 0.9375
 
         self._last_action: Optional[Tuple[str, int]] = None
 
+    def reset(self, seed: int | None = None):
+        """
+        Reset EdgeArea stochastic state.
+
+        - Re-seeds internal RNG
+        - Re-seeds all users and attackers independently
+        - Resets per-episode dynamic state
+        """
+
+        # 1) Reset own RNG
+        if seed is not None:
+            self.rng = np.random.default_rng(seed)
+        elif not hasattr(self, "rng"):
+            self.rng = np.random.default_rng()
+
+
+        # 2) Reset users (independent seeds)
+        for i, user in enumerate(self.users):
+            user_seed = int(self.rng.integers(0, 2**32))
+            user.reset(seed=user_seed)
+
+        # 3) Reset attackers (independent seeds)
+        for i, atk in enumerate(self.attackers):
+            atk_seed = int(self.rng.integers(0, 2**32))
+            atk.reset(seed=atk_seed)        
+    
     # --------------------------
     # Resource model (cycles)
     # --------------------------
@@ -266,6 +292,7 @@ class EdgeArea:
                 area_id=self.area_id,
                 local_q_obj=0,
                 recv_q_obj=0,
+                va_avail_cycles_per_ms=float(va_avail_cycles_per_ms),
                 avail_cycles_aft_atk_per_ms=avail_cycles_aft_atk_per_ms,
                 track_cycles_per_obj=0.0,
                 latest_track_finish_ms=0.0,
@@ -330,6 +357,7 @@ class EdgeArea:
         atk_in = float(ids_out.get("attack_in_rate", 0.0))
         atk_pass = float(ids_out.get("attack_pass_rate", 0.0))
         atk_pass_frac = atk_pass / atk_in if atk_in > 0 else 0.0
+        
 
         if "uplink_mbps" in attack_df.columns and not attack_df.empty:
             attack_uplink_in = float(attack_df["uplink_mbps"].sum())
@@ -362,6 +390,12 @@ class EdgeArea:
         ]
         upload_h = max(feasible_uploads) if feasible_uploads else min(upload_candidates)        
 
+        uplink_total = self.budget.uplink / (1000.0 / self.slot_ms)
+        uplink_user_used = (user_pass_frac * total_users * uplink_mbps_for_h(upload_h))
+        uplink_attack_used = attack_uplink_in * atk_pass_frac
+        uplink_used = uplink_user_used + uplink_attack_used
+        uplink_util = min(1.0, uplink_used / max(1e-9, uplink_total))      
+
         # 4) VA compute supply (after attacks)    
         total_cycles_per_ms = self.cpu_cycle_per_ms * self.budget.cpu
         avail_cycles_per_ms = total_cycles_per_ms * (1.0 - self.cpu_to_ids_ratio)
@@ -389,6 +423,13 @@ class EdgeArea:
             )
 
         avail_cycles_aft_atk_per_ms = max(0.0, avail_cycles_per_ms - attack_cycles_per_ms)
+        
+        local_gt_num_object = 0
+        for u in self.users:
+            local_gt_num_object += int(u.get_num_objects(t - 1, "yolo11x", 736))
+
+        # apply IDS pass fraction for consistency with local_num_objects
+        local_gt_num_object = int(np.floor(local_gt_num_object * user_pass_frac))          
 
         if not feasible_uploads:
             # no feasible uplink → service outage
@@ -398,12 +439,15 @@ class EdgeArea:
                 q_obj=0,
                 avail_cycles_aft_atk_per_ms=avail_cycles_aft_atk_per_ms,
                 uplink_available=uplink_available,
+                uplink_util = uplink_util,       
+                va_avail_cycles_per_ms=avail_cycles_per_ms         
             )
 
             cache = {
                 "best_od_cycles": 0.0,
                 "best_mean_mota": 0.0,
                 "ids_out": ids_out,
+                "local_gt_num_object": local_gt_num_object,
                 "force_zero_qoe": True,   # explicit flag
             }
 
@@ -472,11 +516,8 @@ class EdgeArea:
         )
         q_obj = int(np.floor(q_obj * user_pass_frac))
         
-        uplink_total = self.budget.uplink / (1000.0 / self.slot_ms)
-        uplink_user_used = (user_pass_frac * total_users * uplink_mbps_for_h(upload_h))
-        uplink_attack_used = attack_uplink_in * atk_pass_frac
-        uplink_used = uplink_user_used + uplink_attack_used
-        uplink_util = min(1.0, uplink_used / max(1e-9, uplink_total))        
+      
+  
         state = self.build_offload_state(
             t=t,
             proc_action=best_action,
@@ -491,6 +532,7 @@ class EdgeArea:
             "best_od_cycles": best_od_cycles,
             "best_mean_mota": best_mean_mota,
             "ids_out": ids_out,
+            "local_gt_num_object": local_gt_num_object,
         }
 
         return state, cache

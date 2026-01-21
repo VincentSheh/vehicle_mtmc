@@ -23,12 +23,14 @@ class Attacker:
         scaling,
         slot_ms,
         t_max,
+        seed,
     ):
         self.attacker_id = attacker_id
         self.attack_type = attack_type
         self.cpu_usage_const = cpu_usage_const
         self.non_defendable_bw_const = non_defendable_bw_const
         self.slot_ms = slot_ms
+        self.t_max=t_max
         
         # -----------------------------
         # Prepare dataframe
@@ -73,9 +75,18 @@ class Attacker:
                 f"Attack trace longer than episode: "
                 f"{trace_len_steps} > {t_max}"
             )     
-        max_start = t_max - trace_len_steps
-        rng = np.random.default_rng(42)
-        self.start = int(rng.integers(0, max_start + 1)) if max_start > 0 else 0
+        self.base_seed = seed
+        self.rng = np.random.default_rng(seed)
+        self._init_start()
+    def _init_start(self):
+        trace_len_steps = len(self.df) * self.steps_per_sec
+        max_start = self.t_max - trace_len_steps
+        self.start = int(self.rng.integers(0, max_start + 1)) if max_start > 0 else 0
+
+    def reset(self, seed=None):
+        if seed is not None:
+            self.rng = np.random.default_rng(seed)
+        self._init_start()        
 
     def load_at(self, t: int) -> pd.DataFrame:
         """
@@ -113,47 +124,87 @@ def _parse_detector_res_from_filename(p: Path) -> Tuple[str, int]:
 
 
 class UserCamera:
-    """
-    UserCamera with configuration-aware object predictions.
-
-    input_dir must contain:
-      - frame_stats_*.csv          (object predictions per configuration)
-      - mota_table.csv             (MOTA lookup table)
-
-    Object prediction CSV format:
-      - frame (int)
-      - num_objects (int / float)
-
-    Filename format:
-      frame_stats_<detector>_<h>.csv
-      frame_stats_yolo11l_384.csv
-      frame_stats_yolo11x-736.csv
-
-    MOTA table format:
-      - detector
-      - base_resolution_h
-      - MOTA
-    """
-
     def __init__(
         self,
         user_id: str,
         input_dir: str | Path,
+        t_max: int,
+        seed: int,
     ):
         self.user_id = str(user_id)
-        input_dir = Path(input_dir)
+        self.input_dir = Path(input_dir)
+        self.t_max = int(t_max)
 
-        if not input_dir.is_dir():
-            raise ValueError(f"input_dir must be a directory: {input_dir}")
+        if not self.input_dir.is_dir():
+            raise ValueError(f"input_dir must be a directory: {self.input_dir}")
 
-        # =================================================
-        # Load object prediction CSVs
-        # =================================================
+        self.base_seed = int(seed)
+        self.rng = np.random.default_rng(self.base_seed)
+
         self._obj_lookup: Dict[Tuple[str, int], Dict[int, float]] = {}
+        self._mota_lookup: Dict[Tuple[str, int], float] = {}
 
-        obj_files = sorted(input_dir.glob("frame_stats_*.csv"))
+        self._load_mota_table()
+        self._build_obj_lookup()
+        self._set_start()
+        
+    def _load_mota_table(self):
+        """
+        Load MOTA lookup table.
+
+        Expected CSV format:
+        - detector (str)
+        - base_resolution_h (int)
+        - MOTA (float)
+
+        Builds:
+        self._mota_lookup[(detector, base_resolution_h)] -> MOTA
+        """
+        mota_path = self.input_dir / "mota_table.csv"
+        if not mota_path.exists():
+            raise ValueError(f"Missing mota_table.csv in {self.input_dir}")
+
+        mota_df = pd.read_csv(mota_path)
+
+        required = {"detector", "base_resolution_h", "MOTA"}
+        if not required.issubset(mota_df.columns):
+            raise ValueError(
+                f"mota_table.csv must contain columns {required}, "
+                f"got {set(mota_df.columns)}"
+            )
+
+        # clean + type normalize
+        mota_df = mota_df[["detector", "base_resolution_h", "MOTA"]].dropna()
+        mota_df["detector"] = mota_df["detector"].astype(str)
+        mota_df["base_resolution_h"] = mota_df["base_resolution_h"].astype(int)
+        mota_df["MOTA"] = mota_df["MOTA"].astype(float)
+
+        # ensure uniqueness
+        if mota_df.duplicated(subset=["detector", "base_resolution_h"]).any():
+            dups = mota_df[mota_df.duplicated(
+                subset=["detector", "base_resolution_h"], keep=False
+            )]
+            raise ValueError(
+                "Duplicate (detector, base_resolution_h) entries in mota_table.csv:\n"
+                f"{dups}"
+            )
+
+        self._mota_lookup = {
+            (row.detector, row.base_resolution_h): row.MOTA
+            for row in mota_df.itertuples(index=False)
+        }        
+        
+    def _build_obj_lookup(self):
+        """
+        Build object count lookup for each (detector, resolution).
+        Randomly selects a contiguous window of length t_max
+        using the instance RNG.
+        """
+        self._obj_lookup.clear()
+
+        obj_files = sorted(self.input_dir.glob("frame_stats_*.csv"))
         if not obj_files:
-            raise ValueError(f"No frame_stats_*.csv found in {input_dir}")
+            raise ValueError(f"No frame_stats_*.csv found in {self.input_dir}")
 
         for csv_path in obj_files:
             detector, h = self._parse_detector_res(csv_path.name)
@@ -164,31 +215,49 @@ class UserCamera:
                     f"{csv_path.name} must contain columns: frame, num_objects"
                 )
 
-            df = df[["frame", "num_objects"]].dropna().sort_values("frame")
+            df = (
+                df[["frame", "num_objects"]]
+                .dropna()
+                .sort_values("frame")
+                .reset_index(drop=True)
+            )
+
+            if len(df) <= self.t_max:
+                start = 0
+                df_slice = df
+            else:
+                max_start = len(df) - self.t_max
+                start = int(self.rng.integers(0, max_start + 1))
+                df_slice = df.iloc[start : start + self.t_max]
+
+            df_slice = df_slice.copy()
+            df_slice["frame"] = np.arange(len(df_slice))  # reindex 0..t_max-1
 
             self._obj_lookup[(detector, h)] = {
                 int(r.frame): float(r.num_objects)
-                for r in df.itertuples(index=False)
+                for r in df_slice.itertuples(index=False)
             }
+    def _set_start(self):
+        """
+        Random start offset for this user within an episode.
+        """
+        if self.t_max <= 0:
+            self.start = 0
+            return
 
-        # =================================================
-        # Load MOTA table
-        # =================================================
-        mota_path = input_dir / "mota_table.csv"
-        if not mota_path.exists():
-            raise ValueError(f"Missing mota_table.csv in {input_dir}")
+        max_start = self.t_max
+        self.start = int(self.rng.integers(0, max_start))
+        
+    def reset(self, seed: int | None = None):
+        """
+        Reset user randomness for a new episode.
+        """
+        if seed is not None:
+            self.base_seed = int(seed)
+            self.rng = np.random.default_rng(self.base_seed)
 
-        mota_df = pd.read_csv(mota_path)
-
-        required = {"detector", "base_resolution_h", "MOTA"}
-        if not required.issubset(mota_df.columns):
-            raise ValueError(f"mota_table.csv must contain columns {required}")
-
-        self._mota_lookup: Dict[Tuple[str, int], float] = {
-            (str(r.detector), int(r.base_resolution_h)): float(r.MOTA)
-            for r in mota_df.itertuples(index=False)
-        }
-
+        self._build_obj_lookup()
+        self._set_start()                    
     # =================================================
     # Public API
     # =================================================
