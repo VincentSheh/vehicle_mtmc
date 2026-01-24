@@ -14,24 +14,8 @@ import torch.nn as nn
 import matplotlib.pyplot as plt
 
 from environment import build_env_base  # your project
+from train import ActorNet
 from tqdm import tqdm
-
-# ----------------------------
-# RL policy network (same as training)
-# ----------------------------
-class ActorNet(nn.Module):
-    def __init__(self, obs_dim: int, n_actions: int = 3):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(obs_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, n_actions),
-        )
-
-    def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        return torch.clamp(self.net(obs), -10.0, 10.0)
 
 
 class RLPolicy:
@@ -129,6 +113,8 @@ def decision_cpu_util(env, decision_interval: int) -> float:
     df = pd.DataFrame([m.__dict__ for m in block])
 
     utils = []
+    attack_in_rate_ts = []
+    local_gt_num_objects_ts = []    
     for area_id in [e.area_id for e in env.edge_areas]:
         g = df[df["area_id"] == area_id]
         if g.empty or "ids_cpu_utilization" not in g:
@@ -136,6 +122,8 @@ def decision_cpu_util(env, decision_interval: int) -> float:
 
         ids_util = float(np.mean(g["ids_cpu_utilization"].values))
         utils.append(float(np.clip(ids_util, 0.0, 1.0)))
+        attack_in_rate_ts.append(float(df["attack_in_rate"].mean()) if "attack_in_rate" in df else 0.0)
+        local_gt_num_objects_ts.append(float(df["local_gt_num_objects"].mean()) if "local_gt_num_objects" in df else 0.0)        
 
     return float(max(utils)) if utils else 0.0
 
@@ -190,6 +178,9 @@ def run_episode(
     local_num_obj_ts = []
     cpu_to_ids_ratio_ts = []
 
+    local_gt_num_obj_ts = []
+    attack_in_rate_ts = []
+
     for _k in tqdm(range(decisions)):
         if env.t >= env.t_max:
             break
@@ -234,24 +225,48 @@ def run_episode(
         local_num_obj_ts.append(df["local_num_objects"].mean())
         cpu_to_ids_ratio_ts.append(df["cpu_to_ids_ratio"].mean())
 
+        # new metrics
+        if "local_gt_num_objects" in df.columns:
+            local_gt_num_obj_ts.append(df["local_gt_num_objects"].mean())
+        else:
+            local_gt_num_obj_ts.append(0.0)
+
+        if "attack_in_rate" in df.columns:
+            attack_in_rate_ts.append(df["attack_in_rate"].mean())
+        else:
+            attack_in_rate_ts.append(0.0)
+
     return {
         "qoe": np.array(qoe_ts),
         "cpu_util": np.array(cpu_util_ts),
         "local_num_objects": np.array(local_num_obj_ts),
+        "local_gt_num_objects": np.array(local_gt_num_obj_ts),
+        "attack_in_rate": np.array(attack_in_rate_ts),
         "cpu_to_ids_ratio": np.array(cpu_to_ids_ratio_ts),
     }
-    
+        
 def plot_ts_continuous(results, key, outpath, ylabel):
-    plt.figure(figsize=(8, 4))
-    for method, series in results.items():
-        if series[key].size == 0:
-            continue
-        x = np.arange(len(series[key]))
-        plt.plot(x, series[key], label=method)
+    fig, axes = plt.subplots(4, 1, figsize=(9, 9), sharex=True)
 
-    plt.xlabel("decision step")
-    plt.ylabel(ylabel)
-    plt.legend()
+    panels = [
+        ("qoe", "QoE"),
+        ("local_gt_num_objects", "Local GT #Objects"),
+        ("attack_in_rate", "Attack in rate"),
+        ("cpu_to_ids_ratio", "CPU→IDS Ratio"),
+    ]
+
+    for ax, (key, ylabel) in zip(axes, panels):
+        for method, series in results.items():
+            y = series.get(key, None)
+            if y is None or y.size == 0:
+                continue
+            x = np.arange(len(y))
+            ax.plot(x, y, label=method)
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.3)
+
+    axes[-1].set_xlabel("decision step")
+    axes[0].legend(loc="upper right")
     plt.tight_layout()
     plt.savefig(outpath, dpi=200)
     plt.close()
@@ -273,13 +288,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cfg", type=str, required=True)
     ap.add_argument("--outdir", type=str, default="eval_out")
-    ap.add_argument("--episodes", type=int, default=5)
+    ap.add_argument("--episodes", type=int, default=10)
     ap.add_argument("--decision_interval", type=int, default=500)
     ap.add_argument("--scale_step", type=float, default=0.5)
     ap.add_argument("--ids_cpu_min", type=float, default=0.5)
     ap.add_argument("--constant_ids_cpu", type=float, default=0.5)
 
-    ap.add_argument("--rl_ckpt", type=str, default="checkpoints/ppo_simulation_0/ckpt_iter_000050.pt")
+    ap.add_argument("--rl_ckpt", type=str, default="checkpoints/ppo_simulation_0/ckpt_baseline_000800.pt")
     ap.add_argument("--rl_device", type=str, default="cuda")
     ap.add_argument("--rl_greedy", action="store_true")
 
@@ -311,12 +326,14 @@ def main():
         )
 
     # methods = ["rl", "random", "constant", "reactive"]
-    methods = ["rl", "reactive"]
+    methods = ["constant", "reactive"]
     results: Dict[str, Dict[str, np.ndarray]] = {
         m: {
             "qoe": np.array([], dtype=np.float32),
             "cpu_util": np.array([], dtype=np.float32),
             "local_num_objects": np.array([], dtype=np.float32),
+            "local_gt_num_objects": np.array([], dtype=np.float32),
+            "attack_in_rate": np.array([], dtype=np.float32),
             "cpu_to_ids_ratio": np.array([], dtype=np.float32),
         }
         for m in methods

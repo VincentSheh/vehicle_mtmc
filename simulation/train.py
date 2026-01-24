@@ -33,35 +33,43 @@ def save_ckpt(path: str, actor_net, critic_net, optim, cfg, it: int, device: str
         },
         str(path),
     )
+
+def orthogonal_init(m, gain=1.0):
+    if isinstance(m, nn.Linear):
+        nn.init.orthogonal_(m.weight, gain=gain)
+        nn.init.constant_(m.bias, 0.0)
+
 class ActorNet(nn.Module):
-    def __init__(self, obs_dim, n_actions=3):
+    def __init__(self, obs_dim, n_actions=3, hidden=64):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(obs_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, n_actions),            
+            nn.Linear(obs_dim, hidden),
+            nn.Tanh(),
+            nn.Linear(hidden, hidden),
+            nn.Tanh(),
+            nn.Linear(hidden, n_actions),
         )
+        self.apply(lambda m: orthogonal_init(m, gain=nn.init.calculate_gain("tanh")))
+        orthogonal_init(self.net[-1], gain=0.01)
 
     def forward(self, obs):
-        logits = torch.clamp(self.net(obs), -10.0, 10.0)
-        return logits
-
-
+        return self.net(obs)
 
 class CriticNet(nn.Module):
-    def __init__(self, obs_dim):
+    def __init__(self, obs_dim, hidden=64):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(obs_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1),
+            nn.Linear(obs_dim, hidden),
+            nn.Tanh(),
+            nn.Linear(hidden, hidden),
+            nn.Tanh(),
+            nn.Linear(hidden, 1),
         )
+        self.apply(lambda m: orthogonal_init(m, gain=nn.init.calculate_gain("tanh")))
+        orthogonal_init(self.net[-1], gain=1.0)
 
     def forward(self, obs):
         return self.net(obs).squeeze(-1)
-
 
 def train(cfg_path="./configs/simulation_0.yaml", device="cpu"):
     with open(cfg_path, "r") as f:
@@ -85,7 +93,7 @@ def train(cfg_path="./configs/simulation_0.yaml", device="cpu"):
     env = TransformedEnv(
         base_env,
         ObservationNorm(
-            in_keys=["observation"],
+            in_keys=["observation_flat"],
             loc=0.0,
             scale=1.0,
             standard_normal=True,
@@ -94,31 +102,12 @@ def train(cfg_path="./configs/simulation_0.yaml", device="cpu"):
     obs_size = env.n_edges * env.obs_dim
     action_dim = env.action_dim
 
-    # Flatten obs inside tensordict: (n_edges, obs_dim) -> (obs_size,)
-    def add_obs_flat_td(td):
-        obs = td["observation"]  
-        # obs: [B, n_edges, obs_dim]
-
-        B = obs.shape[0]
-        obs_flat = obs.reshape(B, -1)  # ✅ keep batch dim
-
-        td.set("observation_flat", obs_flat)
-
-        if "next" in td.keys(True, True):
-            nxt_obs = td["next", "observation"]
-            td.set(
-                ("next", "observation_flat"),
-                nxt_obs.reshape(nxt_obs.shape[0], -1)
-            )
-
-        return td
-
-    actor_net = ActorNet(env.obs_dim).to(device)
-    critic_net = CriticNet(env.obs_dim).to(device)
+    actor_net = ActorNet(obs_size).to(device)
+    critic_net = CriticNet(obs_size).to(device)
 
     actor_module = TensorDictModule(
         actor_net,
-        in_keys=["observation"],
+        in_keys=["observation_flat"],
         out_keys=["logits"],
     )
 
@@ -132,31 +121,28 @@ def train(cfg_path="./configs/simulation_0.yaml", device="cpu"):
         # default_interaction_type=InteractionType.RANDOM,
     )
     def policy(td: TensorDict) -> TensorDict:
-        # Build a clean TD for the actor
-        obs = td["observation"]
         td_in = TensorDict(
-            {"observation": obs},
+            {"observation_flat": td["observation_flat"]},
             batch_size=td.batch_size,
             device=td.device,
         )
 
         td_out = actor(td_in)
 
-        # IMPORTANT: use set(), not set_()
         td.set("action", td_out["action"])
         td.set("action_log_prob", td_out["action_log_prob"])
-        td.set("logits", td_out["logits"])  # optional, for debugging
+        td.set("logits", td_out["logits"])
 
         return td
     
     value_module = TensorDictModule(
         critic_net,
-        in_keys=["observation"],
+        in_keys=["observation_flat"],
         out_keys=["state_value"],
     )
     value = ValueOperator(value_module)
     
-    adv = GAE(gamma=0.995, lmbda=0.95, value_network=value)
+    adv = GAE(gamma=0.95, lmbda=0.95, value_network=value)
     adv.set_keys(
         value="state_value",
         advantage="advantage",
@@ -210,7 +196,6 @@ def train(cfg_path="./configs/simulation_0.yaml", device="cpu"):
     env.reset()
 
     for it, batch in enumerate(collector):
-        batch = add_obs_flat_td(batch)
         # print("logits[0]:", batch["logits"][:5].detach().cpu())
         # print("action:", batch["action"][:5])
         # safety checks
@@ -260,20 +245,20 @@ def train(cfg_path="./configs/simulation_0.yaml", device="cpu"):
                 # after training update
                 qoe_score = float(batch["next", "reward"].mean().item())  # or your qoe_mean if you prefer
 
-                # periodic
-                if (it + 1) % ckpt_every == 0:
-                    save_ckpt(
-                        ckpt_dir / f"ckpt_iter_{it+1:06d}.pt",
-                        actor_net, critic_net, optim, cfg, it + 1, device, env,
-                    )
+        # periodic
+        if (it + 1) % ckpt_every == 0:
+            save_ckpt(
+                ckpt_dir / f"ckpt_iter_{it+1:06d}.pt",
+                actor_net, critic_net, optim, cfg, it + 1, device, env,
+            )
 
-                # best
-                if qoe_score > best_qoe:
-                    best_qoe = qoe_score
-                    save_ckpt(
-                        ckpt_dir / "ckpt_best.pt",
-                        actor_net, critic_net, optim, cfg, it + 1, device, env,
-                    )                
+        # best
+        if qoe_score > best_qoe:
+            best_qoe = qoe_score
+            save_ckpt(
+                ckpt_dir / "ckpt_best.pt",
+                actor_net, critic_net, optim, cfg, it + 1, device, env,
+            )                
         print(
             f"Iteration={it} "
             f"reward_mean={batch['next', 'reward'].mean().item():.4f}"
@@ -291,27 +276,37 @@ def train(cfg_path="./configs/simulation_0.yaml", device="cpu"):
         if done.ndim == 3: done = done[:, 0]
 
         T, E, D = obs.shape
-        base = it * T
+        DI = base_env.decision_interval
         qoe_hist = base_env.env.last_history
-        for t in range(T):
-            done_t = bool(done[t].squeeze(-1).item())
 
-            # skip terminal / reset transition
-            if done_t:
+        if not qoe_hist:
+            return  # or continue outer loop
+
+        base = it * T
+
+        for t in range(T):
+            if bool(done[t].squeeze(-1).item()):
                 continue
 
             ts_step = base + t
             a = int(act[t].item())
-            qoe_block = qoe_hist[(t * E):((t + 1) * E)]
+
+            start = t * DI * E
+            end = (t + 1) * DI * E
+
+            if end > len(qoe_hist):
+                break
+
+            qoe_block = qoe_hist[start:end]
+
             qoe_mean = float(np.mean([m.qoe_mean for m in qoe_block]))
-            
+
             log_dict = {
                 "ts_step": ts_step,
                 "ts/action": a,
                 "ts/qoe": qoe_mean,
             }
 
-            # log obs per edge per key (always together)
             for e in range(E):
                 for j, k in enumerate(base_env.obs_keys):
                     log_dict[f"ts/edge_{e}/{k}"] = float(obs[t, e, j].item())

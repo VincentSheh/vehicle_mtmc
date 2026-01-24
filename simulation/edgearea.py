@@ -161,6 +161,7 @@ class EdgeArea:
         self.pipeline = pipeline
 
         self.cpu_to_ids_ratio = 0.9375
+        # self.cpu_to_ids_ratio = 0.5
 
         self._last_action: Optional[Tuple[str, int]] = None
 

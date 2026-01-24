@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -373,22 +372,23 @@ class TorchRLEnvWrapper(EnvBase):
         self.area_ids = [e.area_id for e in self.env.edge_areas]
         self.episode_id = 0
         self.base_seed = seed
-
         self.decision_interval = int(decision_interval)
         # self._step_count = 0
 
         self.obs_keys = [
-            # "local_num_objects",
-            "local_gt_num_objects",
+            "local_num_objects",
+            # "local_gt_num_objects",
             "attack_drop_rate",
+            # "attack_in_rate",
             "cpu_to_ids_ratio",
-            # "va_cpu_utilization",
-            # "ids_cpu_utilization",
+            "va_cpu_utilization",
+            "ids_cpu_utilization",
             "bw_utilization",
             # "I_net",
         ]
         
         self.obs_dim = len(self.obs_keys)
+        self.obs_size = self.n_edges * self.obs_dim
 
         self.action_dim = self.n_edges
         self._last_action = torch.zeros(self.action_dim, device=self.device, dtype=torch.float32)
@@ -419,12 +419,18 @@ class TorchRLEnvWrapper(EnvBase):
                 shape=(self.n_edges, self.obs_dim),
                 dtype=torch.float32,
                 device=self.device,
-            )
+            ),
+            observation_flat=UnboundedContinuousTensorSpec(
+                shape=(self.obs_size,),
+                dtype=torch.float32,
+                device=self.device,
+            ),
         )
 
         self.action_spec = CompositeSpec(
             action=DiscreteTensorSpec(
                 n=3,   # {-1, 0, +1}
+                # shape=(self.n_edges,),
                 device=self.device,
             )
         )
@@ -475,10 +481,12 @@ class TorchRLEnvWrapper(EnvBase):
             edge.reset(seed=episode_seed + i)
 
         obs = self._build_observation().to(self.device)
+        obs_flat = obs.reshape(-1)
 
         return TensorDict(
             {
                 "observation": obs,
+                "observation_flat": obs_flat,
                 "done": torch.zeros(1, dtype=torch.bool, device=self.device),
                 "terminated": torch.zeros(1, dtype=torch.bool, device=self.device),
                 "truncated": torch.zeros(1, dtype=torch.bool, device=self.device),
@@ -521,6 +529,7 @@ class TorchRLEnvWrapper(EnvBase):
             self.ids_cpu[0] + delta * self.scale_step,
             min=self.ids_cpu_min,
             max=edge.budget.cpu - 0.5,
+            # max=edge.budget.cpu / 2.0,
         )
         ids_cpu = self.ids_cpu.clone()
         print(action, delta, ids_cpu)
@@ -543,6 +552,7 @@ class TorchRLEnvWrapper(EnvBase):
 
         # 3) Build aggregated outputs
         obs = self._build_observation().to(self.device)
+        obs_flat = obs.reshape(-1)
 
         reward = torch.tensor(
             [total_reward / self.decision_interval], dtype=torch.float32, device=self.device
@@ -554,9 +564,11 @@ class TorchRLEnvWrapper(EnvBase):
         truncated = torch.zeros(1, dtype=torch.bool, device=self.device)
         done = terminated | truncated
 
+
         return TensorDict(
             {
                 "observation": obs,
+                "observation_flat": obs_flat,
                 "reward": reward,
                 "done": done,
                 "terminated": terminated,
@@ -600,7 +612,7 @@ class TorchRLEnvWrapper(EnvBase):
         qoes = [float(m.qoe_mean) for m in last_block]
 
         mean_qoe = float(np.mean(qoes))
-        reward = mean_qoe # if mean_qoe >= 0.1 else -1
+        reward = mean_qoe # if mean_qoe >= 0.2 else mean_qoe - 0.6
 
         return torch.tensor(
             [reward],
