@@ -194,8 +194,8 @@ class Environment:
             offload_states.append(state)
             local_cache[edge.area_id] = cache
 
-        # 2) Cooperative OT offloading (global)
-        offload_states, _, I_net = self.cooperative_offload_ot(offload_states)
+        # # 2) Cooperative OT offloading (global)
+        # offload_states, _, I_net = self.cooperative_offload_ot(offload_states)
 
         # 3) Final QoE computation per edge
         for edge in self.edge_areas:
@@ -221,7 +221,7 @@ class Environment:
 
             ids_out = cache["ids_out"]
             local_gt_num_objects = cache["local_gt_num_object"]
-            I_net_e = I_net[state.idx]
+            # I_net_e = I_net[state.idx]
             self.history.append(
                 StepMetrics(
                     t=self.t,
@@ -244,7 +244,7 @@ class Environment:
                     va_cpu_utilization = (od_cycles + ot_cycles) / (state.va_avail_cycles_per_ms * edge.slot_ms),
                     ids_cpu_utilization = ids_out["ids_cpu_util"],
                     bw_utilization = state.uplink_util,
-                    I_net = I_net_e,
+                    # I_net = I_net_e,
                 )
             )
 

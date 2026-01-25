@@ -3,6 +3,7 @@ import pandas as pd
 
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Any
+import math
 
 
 from service import IDS, VideoPipeline
@@ -236,7 +237,7 @@ class EdgeArea:
         Returns IDS output stats using the current cpu_to_ids_ratio.
         """
         attack_df = self._attack_df_at(t)
-        user_rate = float(len(self.users))
+        user_rate = float(sum(u.num_requests_at(t) for u in self.users))
 
         return self.ids.classify_rates(
             attack_df=attack_df,
@@ -272,8 +273,8 @@ class EdgeArea:
     def build_offload_state(
         self,
         t: int,
-        proc_action: Tuple[str, int],
-        q_obj: int,
+        od_plan: Tuple[str, int],
+        n_req: int,
         va_avail_cycles_per_ms: float,
         avail_cycles_aft_atk_per_ms: float,
         uplink_available:float,
@@ -291,7 +292,7 @@ class EdgeArea:
         if proc_action is None:
             return OffloadState(
                 area_id=self.area_id,
-                local_q_obj=0,
+                n_req=0,
                 recv_q_obj=0,
                 va_avail_cycles_per_ms=float(va_avail_cycles_per_ms),
                 avail_cycles_aft_atk_per_ms=avail_cycles_aft_atk_per_ms,
@@ -321,7 +322,7 @@ class EdgeArea:
 
         return OffloadState(
             area_id=self.area_id,
-            local_q_obj=int(q_obj),   # all local initially
+            n_req=int(n_req),   # all local initially
             recv_q_obj=0,             # nothing received yet
             va_avail_cycles_per_ms=float(va_avail_cycles_per_ms),
             avail_cycles_aft_atk_per_ms=float(avail_cycles_aft_atk_per_ms),
@@ -331,34 +332,132 @@ class EdgeArea:
             uplink_util=uplink_util,
             idx=-1,
         )
-                
-    def step_local(
+    def allocate_detectors(
         self,
-        t: int,
-    ) -> Tuple[OffloadState, Dict[str, float]]:
+        det_costs: dict,            # {det: cycles_per_req}
+        det_quality: dict | None,   # {det: score}, optional
+        N: int,
+        C: float,                   # cycle budget in this slot (cycles)
+        mu_cycles_per_ms: float,    # avail_cycles_aft_atk_per_ms
+        D_Max: float,
+        gamma: float = 0.0,         # latency penalty strength (0 = no penalty)
+    ):
         """
-        Local decision step.
-        No knowledge of other edges.
+        Feasible detector mixing under a hard per-slot cycle budget, plus QoE.
+
         Returns:
-        - OffloadState (pre-offloading)
-        - cache dict for QoE finalization
+        plan: {det: n_req}
+        feasible_all: bool
+        dropped: int
+        used_cycles: float
+        mean_latency_ms: float
+        qoe: float  (average QoE over the original N requests, dropped contribute 0)
         """
+        if N <= 0:
+            return {}, True, 0, 0.0, 0.0, 0.0
+
+        # sort detectors by quality (desc), if missing then by cost (desc)
+        dets = list(det_costs.keys())
+        if det_quality is not None:
+            dets.sort(key=lambda d: float(det_quality[d]), reverse=True)
+            qmax = max(1e-12, max(float(det_quality[d]) for d in dets))
+            qnorm = {d: float(det_quality[d]) / qmax for d in dets}  # 0..1
+        else:
+            dets.sort(key=lambda d: float(det_costs[d]), reverse=True)
+            qnorm = {d: 1.0 for d in dets}
+
+        # lightest (cheapest) detector as feasibility backstop
+        det_light = min(dets, key=lambda d: float(det_costs[d]))
+        cL = float(det_costs[det_light])
+
+        # helper to compute QoE after plan is built
+        def _qoe_from_plan(plan: dict, dropped: int, used_cycles: float) -> tuple[float, float]:
+            served = int(sum(plan.values()))
+            mean_latency = used_cycles / max(1e-9, mu_cycles_per_ms) if served > 0 else float("inf")
+
+            if mean_latency <= D_Max:
+                lat_pen = 1.0
+            else:
+                lat_pen = math.exp(-gamma * (mean_latency - D_Max)) if gamma > 0 else 0.0
+
+            quality_sum = 0.0
+            for det, n in plan.items():
+                quality_sum += float(n) * float(qnorm.get(det, 0.0))
+
+            # average over original N, dropped contributes 0
+            qoe = (quality_sum / float(N)) * float(lat_pen) if N > 0 else 0.0
+            return float(qoe), float(mean_latency)
+
+        # if even all-light doesn't fit, serve as many as possible with lightest and drop rest
+        if N * cL > C + 1e-9:
+            served = int(C // cL) if cL > 0 else 0
+            served = max(0, min(N, served))
+            plan = {det_light: served} if served > 0 else {}
+            used = served * cL
+            dropped = N - served
+            qoe, mean_lat = _qoe_from_plan(plan, dropped, used)
+            return plan, False, dropped, float(used), float(mean_lat), float(qoe)
+
+        plan = {d: 0 for d in dets}
+        B = float(C)
+        R = int(N)
+
+        # allocate from best to worse, but never break feasibility for the remainder via lightest
+        for det in dets:
+            if det == det_light:
+                continue
+            if R <= 0:
+                break
+
+            ck = float(det_costs[det])
+            if ck <= cL + 1e-12:
+                continue
+
+            numer = B - R * cL
+            denom = ck - cL
+            n_max = math.floor(numer / denom + 1e-12) if denom > 0 else 0
+            n = max(0, min(R, int(n_max)))
+
+            if n > 0:
+                plan[det] += n
+                B -= n * ck
+                R -= n
+
+        # assign remaining to lightest
+        if R > 0:
+            plan[det_light] += R
+            B -= R * cL
+            R = 0
+
+        used_cycles = C - B
+        assert sum(plan.values()) == N
+        assert used_cycles <= C + 1e-6
+
+        qoe, mean_lat = _qoe_from_plan(plan, 0, used_cycles)
+        return plan, True, 0, float(used_cycles), float(mean_lat), float(qoe)
+
+
+    def step_local(self, t: int):
+        """
+        Request-based, OD-only, one fixed upload resolution.
+        If uplink bandwidth is not enough, drop user requests to fit uplink,
+        then allocate detector mix under compute, QoE computed inside allocate_detectors().
+        """
+
+        # 0) total user requests arriving this step
+        total_req_in = float(sum(u.num_requests_at(t) for u in self.users))
+        local_num_request = int(np.floor(total_req_in))
 
         # 1) IDS filtering
         ids_out = self.aggregate_load_after_ids(t)
+        user_pass_rate = float(ids_out.get("user_pass_rate", total_req_in))
+        passed_req_pre_uplink = int(np.floor(max(0.0, user_pass_rate)))
 
-        total_users = float(len(self.users))
-        user_pass_rate = float(ids_out.get("user_pass_rate", total_users))
-        user_pass_frac = (
-            user_pass_rate / max(1e-6, total_users) if total_users > 0 else 0.0
-        )
-
-        # 2) uplink after attacks
+        # 2) uplink after attacks (fixed upload resolution)
         attack_df = self._attack_df_at(t)
         atk_in = float(ids_out.get("attack_in_rate", 0.0))
         atk_pass = float(ids_out.get("attack_pass_rate", 0.0))
         atk_pass_frac = atk_pass / atk_in if atk_in > 0 else 0.0
-        
 
         if "uplink_mbps" in attack_df.columns and not attack_df.empty:
             attack_uplink_in = float(attack_df["uplink_mbps"].sum())
@@ -369,171 +468,129 @@ class EdgeArea:
                 else 0.0
             )
 
-        uplink_available = max(
-            0.0, self.budget.uplink / (1000.0/self.slot_ms) - attack_uplink_in * atk_pass_frac
-        )
+        uplink_total = self.budget.uplink / (1000.0 / self.slot_ms)
 
-        # 3) choose upload resolution
-        upload_candidates = sorted({h for (_, h) in self.pipeline.all_actions()})
+        UPLOAD_H = 416
 
         def uplink_mbps_for_h(h: int) -> float:
-            ASPECT_W = 16
-            ASPECT_H = 9
-            w = h * 16 / 9
-            size_kb = 0.5*(w * h * 3) / 1024.0
-            return size_kb / 1024.0
+            w = h
+            size_kb = 0.5 * (w * h * 3) / 1024.0
+            return size_kb / 1024.0  # keep your existing convention
 
-        feasible_uploads = [
-            h
-            for h in upload_candidates
-            if user_pass_frac * total_users * uplink_mbps_for_h(h)
-            <= uplink_available + 1e-9
-        ]
-        upload_h = max(feasible_uploads) if feasible_uploads else min(upload_candidates)        
-
-        uplink_total = self.budget.uplink / (1000.0 / self.slot_ms)
-        uplink_user_used = (user_pass_frac * total_users * uplink_mbps_for_h(upload_h))
+        per_req_uplink = uplink_mbps_for_h(UPLOAD_H)
         uplink_attack_used = attack_uplink_in * atk_pass_frac
-        uplink_used = uplink_user_used + uplink_attack_used
-        uplink_util = min(1.0, uplink_used / max(1e-9, uplink_total))      
 
-        # 4) VA compute supply (after attacks)    
+        # remaining uplink after passed attacks
+        uplink_available = max(0.0, uplink_total - uplink_attack_used)
+
+        # drop user requests if uplink is not enough
+        max_req_uplink = int(uplink_available // max(1e-12, per_req_uplink)) if per_req_uplink > 0 else 0
+        served_req_uplink = min(passed_req_pre_uplink, max_req_uplink)
+        dropped_uplink = max(0, passed_req_pre_uplink - served_req_uplink)
+
+        uplink_user_used = served_req_uplink * per_req_uplink
+        uplink_used = uplink_user_used + uplink_attack_used
+        uplink_util = min(1.0, uplink_used / max(1e-9, uplink_total))
+
+        # 3) VA compute supply (after attacks)
         total_cycles_per_ms = self.cpu_cycle_per_ms * self.budget.cpu
         avail_cycles_per_ms = total_cycles_per_ms * (1.0 - self.cpu_to_ids_ratio)
-        
+
         attack_cycles_per_ms = 0.0
-
-        # IDS pass fraction
-        atk_in = float(ids_out.get("attack_in_rate", 0.0))
-        atk_pass = float(ids_out.get("attack_pass_rate", 0.0))
-        atk_pass_frac = atk_pass / atk_in if atk_in > 0 else 0.0
-
         for _, row in attack_df.iterrows():
             attacker_id = row.get("attacker_id")
+            attacker = next(a for a in self.attackers if a.attacker_id == attacker_id)
 
-            # find the attacker object
-            attacker = next(
-                a for a in self.attackers if a.attacker_id == attacker_id
-            )
-
-            flows_i = float(row["flows_per_sec"])          # flows/sec for this attacker
-            cpu_per_flow = attacker.cpu_usage_const         # cycles/flow
-
-            attack_cycles_per_ms += (
-                flows_i * cpu_per_flow * atk_pass_frac / 1000.0
-            )
+            flows_i = float(row["flows_per_sec"])
+            cpu_per_flow = attacker.cpu_usage_const
+            attack_cycles_per_ms += flows_i * cpu_per_flow * atk_pass_frac / 1000.0
 
         avail_cycles_aft_atk_per_ms = max(0.0, avail_cycles_per_ms - attack_cycles_per_ms)
-        
-        local_gt_num_object = 0
-        for u in self.users:
-            local_gt_num_object += int(u.get_num_objects(t - 1, "yolo11x", 736))
 
-        # apply IDS pass fraction for consistency with local_num_objects
-        local_gt_num_object = int(np.floor(local_gt_num_object * user_pass_frac))          
-
-        if not feasible_uploads:
-            # no feasible uplink → service outage
-            state = self.build_offload_state(
-                t=t,
-                proc_action=None,
-                q_obj=0,
-                avail_cycles_aft_atk_per_ms=avail_cycles_aft_atk_per_ms,
-                uplink_available=uplink_available,
-                uplink_util = uplink_util,       
-                va_avail_cycles_per_ms=avail_cycles_per_ms         
-            )
-
+        # If nothing survives uplink or no compute, return outage-ish state
+        if served_req_uplink <= 0 or avail_cycles_aft_atk_per_ms <= 1e-12:
+            # state = self.build_offload_state(
+            #     t=t,
+            #     proc_action=None,
+            #     q_obj=0,
+            #     va_avail_cycles_per_ms=avail_cycles_per_ms,
+            #     avail_cycles_aft_atk_per_ms=avail_cycles_aft_atk_per_ms,
+            #     uplink_available=uplink_available,
+            #     uplink_util=uplink_util,
+            # )
             cache = {
-                "best_od_cycles": 0.0,
-                "best_mean_mota": 0.0,
                 "ids_out": ids_out,
-                "local_gt_num_object": local_gt_num_object,
-                "force_zero_qoe": True,   # explicit flag
+                "upload_h": UPLOAD_H,
+                "local_num_request": local_num_request,
+                "served_req": 0,
+                "dropped_uplink": int(dropped_uplink),
+                "dropped_compute": int(served_req_uplink),
+                "dropped_total": int(dropped_uplink + served_req_uplink),
+                "od_plan": {},
+                "used_cycles": 0.0,
+                "mean_latency_ms": float("inf"),
+                "qoe": 0.0,
+                "force_zero_qoe": True,
             }
+            return cache
 
-            return state, cache     
+        # 4) allocate detector mix under compute budget and compute QoE inside allocate_detectors
+        D_Max = float(self.constraints["D_Max"])
+        gamma = float(self.constraints.get("Gamma", 0.0))
 
-        # 5) choose VA configuration locally
-        D_Max = self.constraints["D_Max"]
-        MOTA_min = self.constraints["MOTA_min"]
-        gamma = self.constraints["Gamma"]
+        # cycle budget implied by latency constraint
+        C_budget = D_Max * avail_cycles_aft_atk_per_ms
 
-        best_q = -np.inf
-        best_action = None
-        best_mean_mota = 0.0
-        best_od_cycles = 0.0
-        demand_cycles = 0.0
-        
-        for det, proc_h in self.pipeline.all_actions():
-            if proc_h > upload_h:
-                continue
+        # derive detector list
+        dets = []
+        for a in self.pipeline.all_actions():
+            det = a[0] if isinstance(a, tuple) else a
+            dets.append(det)
+        dets = sorted(set(dets))
 
-            demand_cycles = 0.0
-            motas = []
+        # cost per request for each detector
+        det_costs = {det: float(self.pipeline.detection_cycles(det)) for det in dets}
 
-            for u in self.users:
-                nobj = u.get_num_objects(t - 1, det, proc_h)
+        # optional quality
+        det_quality = None
+        if hasattr(self.pipeline, "det_quality"):
+            det_quality = {det: float(self.pipeline.det_quality(det)) for det in dets}
 
-                # total VA cost for this user in cycles
-                user_cycles = self.pipeline.total_cycles(
-                    detector=det,
-                    base_resolution_h=proc_h,
-                    num_objects=nobj,
-                )
-
-                demand_cycles += user_cycles
-                motas.append(u.get_mota(det, proc_h))
-
-            demand_cycles *= user_pass_frac
-            mean_latency = (
-                demand_cycles / max(1e-9, avail_cycles_aft_atk_per_ms)
-                if avail_cycles_aft_atk_per_ms > 0
-                else float("inf")
-            )
-            mean_mota = float(np.mean(motas)) if motas else 0.0
-
-            # q = (mean_mota - MOTA_min) * np.exp(-gamma * (mean_latency - D_Max))
-            q = mean_mota if mean_latency <= D_Max else 0
-            if q > best_q:
-                best_q = q
-                best_action = (det, proc_h)
-                od_cycles = self.pipeline.detection_cycles(det, proc_h) * len(self.users)
-                best_od_cycles = od_cycles
-                best_mean_mota = mean_mota
-
-        if best_action is None:
-            best_action = min(
-                self.pipeline.all_actions(),
-                key=lambda a: self.pipeline.detection_cycles(a[0], a[1]),
-            )
-
-        self._last_action = best_action
-
-        # 6) object queue for OT
-        q_obj = sum(
-            int(u.get_num_objects(t - 1, best_action[0], best_action[1]))
-            for u in self.users
+        od_plan, feasible_all, dropped_compute, used_cycles, mean_latency_ms, qoe = self.allocate_detectors(
+            det_costs=det_costs,
+            det_quality=det_quality,
+            N=int(served_req_uplink),
+            C=float(C_budget),
+            mu_cycles_per_ms=float(avail_cycles_aft_atk_per_ms),
+            D_Max=float(D_Max),
+            gamma=float(gamma),
         )
-        q_obj = int(np.floor(q_obj * user_pass_frac))
-        
-      
-  
-        state = self.build_offload_state(
-            t=t,
-            proc_action=best_action,
-            q_obj=q_obj,
-            va_avail_cycles_per_ms = avail_cycles_per_ms,
-            avail_cycles_aft_atk_per_ms=avail_cycles_aft_atk_per_ms,
-            uplink_available = uplink_available,
-            uplink_util = uplink_util,
-        )
+
+        served_compute = int(sum(od_plan.values()))
+        assert served_compute + int(dropped_compute) == int(served_req_uplink)
+
+
+        # 5) build offload state (reuse q_obj as served requests locally)
+        # state = self.build_offload_state(
+        #     t=t,
+        #     od_plan=od_plan,
+        #     q_obj=served_compute,
+        #     va_avail_cycles_per_ms=avail_cycles_per_ms,
+        #     avail_cycles_aft_atk_per_ms=avail_cycles_aft_atk_per_ms,
+        #     uplink_available=uplink_available,
+        #     uplink_util=uplink_util,
+        # )
 
         cache = {
-            "best_od_cycles": best_od_cycles,
-            "best_mean_mota": best_mean_mota,
             "ids_out": ids_out,
-            "local_gt_num_object": local_gt_num_object,
+            "local_num_request": local_num_request,
+            "dropped_uplink": int(dropped_uplink),
+            "od_plan": od_plan,  # {det: n_req}
+            "served_req": int(served_compute),
+            "dropped_compute": int(dropped_compute),
+            "va_cpu_utilization": float(used_cycles),
+            "uplink_util": uplink_util,
+            "mean_latency_ms": float(mean_latency_ms),
+            "qoe": float(qoe),
         }
-
-        return state, cache
+        return cache

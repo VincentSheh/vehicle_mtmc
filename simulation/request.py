@@ -123,6 +123,120 @@ def _parse_detector_res_from_filename(p: Path) -> Tuple[str, int]:
     return det, h
 
 
+class User:
+    """
+    User request arrival time series.
+
+    Input df (ts_df) is assumed to be indexed by "seconds" (one row per second),
+    similar to Attacker.
+
+    Behavior:
+      - Converts req_per_sec to num_requests_per_step using slot_ms and scaling
+      - If trace is longer than the episode horizon (t_max), randomly slices a contiguous
+        window of length (t_max / steps_per_sec) seconds on each init/reset
+      - Also samples a random start offset inside the episode so the trace segment can
+        appear at different times within [0, t_max)
+    """
+    def __init__(
+        self,
+        user_id: Union[str, int],
+        ts_df: pd.DataFrame,
+        slot_ms: float,
+        t_max: int,
+        scaling: float = 1.0,
+        seed: int = 0,
+    ):
+        self.user_id = str(user_id)
+        self.slot_ms = float(slot_ms)
+        self.t_max = int(t_max)
+        self.scaling = float(scaling)
+        self.base_seed = int(seed)
+        self.rng = np.random.default_rng(self.base_seed)
+
+        self.arrival_col = "req_per_sec"
+
+        # prepare df
+        self._full_df = ts_df.reset_index(drop=True).copy()
+        if self.arrival_col not in self._full_df.columns:
+            raise ValueError(
+                f"User trace missing column '{self.arrival_col}'. "
+                f"Got columns: {list(self._full_df.columns)}"
+            )
+        self._full_df[self.arrival_col] = pd.to_numeric(
+            self._full_df[self.arrival_col], errors="coerce"
+        ).fillna(0.0)
+
+        self.steps_per_sec = int(1000 // self.slot_ms)
+        if self.steps_per_sec <= 0:
+            raise ValueError(f"Invalid slot_ms={self.slot_ms}, must be <= 1000 and > 0")
+
+        self.step_scale = self.slot_ms / 1000.0  # seconds per step
+
+        # build first episode slice + start
+        self._slice_trace_and_set_start()
+
+    def _slice_trace_and_set_start(self):
+        """
+        Slice a contiguous chunk for this episode and set its start time in the episode.
+        """
+        trace_len_sec = len(self._full_df)
+        if trace_len_sec <= 0:
+            raise ValueError("Empty request trace")
+
+        # how many seconds of trace do we need to cover t_max steps?
+        ep_len_sec = int(np.ceil(self.t_max / self.steps_per_sec))
+        ep_len_sec = max(1, ep_len_sec)
+
+        if trace_len_sec <= ep_len_sec:
+            sec_start = 0
+            df_slice = self._full_df.copy()
+        else:
+            max_sec_start = trace_len_sec - ep_len_sec
+            sec_start = int(self.rng.integers(0, max_sec_start + 1))
+            df_slice = self._full_df.iloc[sec_start : sec_start + ep_len_sec].copy()
+
+        df_slice["user_id"] = self.user_id
+        df_slice["num_requests_per_step"] = (
+            df_slice[self.arrival_col] * self.step_scale * self.scaling
+        )
+
+        self.df = df_slice.reset_index(drop=True)
+
+        # map slice length in steps then pick a random placement start inside episode
+        trace_len_steps = len(self.df) * self.steps_per_sec
+        max_start = self.t_max - trace_len_steps
+        self.start = int(self.rng.integers(0, max_start + 1)) if max_start > 0 else 0
+
+    def reset(self, seed: int | None = None):
+        if seed is not None:
+            self.base_seed = int(seed)
+            self.rng = np.random.default_rng(self.base_seed)
+        self._slice_trace_and_set_start()
+
+    def load_at(self, t: int) -> pd.DataFrame:
+        """
+        Map step t -> second index in the sliced request trace.
+        Returns a 1-row dataframe (same schema as self.df) or empty df if out of range.
+        """
+        local_step = int(t) - int(self.start)
+        if local_step < 0:
+            return pd.DataFrame(columns=self.df.columns.tolist())
+
+        sec_idx = local_step // self.steps_per_sec
+        if sec_idx >= len(self.df):
+            return pd.DataFrame(columns=self.df.columns.tolist())
+
+        return self.df.iloc[[sec_idx]].copy()
+
+    def num_requests_at(self, t: int) -> float:
+        """
+        Returns expected number of requests per step at time t (float).
+        """
+        row = self.load_at(t)
+        if row.empty:
+            return 0.0
+        return float(row["num_requests_per_step"].iloc[0])
+
 class UserCamera:
     def __init__(
         self,

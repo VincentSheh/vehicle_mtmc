@@ -5,7 +5,7 @@ class OffloadState:
     area_id: str
 
     # local objects that REMAIN after offloading
-    local_q_obj: int
+    n_req: int
 
     # objects received from other edges
     recv_q_obj: int

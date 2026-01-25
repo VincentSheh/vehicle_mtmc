@@ -245,7 +245,12 @@ def run_episode(
         "cpu_to_ids_ratio": np.array(cpu_to_ids_ratio_ts),
     }
         
-def plot_ts_continuous(results, key, outpath, ylabel):
+def plot_ts_continuous(results, outpath, slo_qoe_min: float = 0.0):
+    """
+    Plots 4 panels and annotates legend (QoE panel) with:
+      - avg QoE
+      - avg SLO violation rate (QoE < slo_qoe_min)
+    """
     fig, axes = plt.subplots(4, 1, figsize=(9, 9), sharex=True)
 
     panels = [
@@ -255,13 +260,26 @@ def plot_ts_continuous(results, key, outpath, ylabel):
         ("cpu_to_ids_ratio", "CPU→IDS Ratio"),
     ]
 
-    for ax, (key, ylabel) in zip(axes, panels):
+    for ax, (k, ylabel) in zip(axes, panels):
         for method, series in results.items():
-            y = series.get(key, None)
+            y = series.get(k, None)
             if y is None or y.size == 0:
                 continue
+
             x = np.arange(len(y))
-            ax.plot(x, y, label=method)
+
+            # annotate only in QoE panel
+            if k == "qoe":
+                y_valid = y[np.isfinite(y)]
+                avg_qoe = float(np.nanmean(y_valid)) if y_valid.size else 0.0
+                vio = (y_valid < float(slo_qoe_min)).astype(np.float32)
+                vio_rate = float(np.nanmean(vio)) if y_valid.size else 0.0
+                label = f"{method} (avg={avg_qoe:.3f}, vio={vio_rate:.2%})"
+            else:
+                label = method
+
+            ax.plot(x, y, label=label)
+
         ax.set_ylabel(ylabel)
         ax.grid(True, alpha=0.3)
 
@@ -288,7 +306,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cfg", type=str, required=True)
     ap.add_argument("--outdir", type=str, default="eval_out")
-    ap.add_argument("--episodes", type=int, default=10)
+    ap.add_argument("--episodes", type=int, default=1)
     ap.add_argument("--decision_interval", type=int, default=500)
     ap.add_argument("--scale_step", type=float, default=0.5)
     ap.add_argument("--ids_cpu_min", type=float, default=0.5)
@@ -325,8 +343,8 @@ def main():
             greedy=args.rl_greedy,
         )
 
-    # methods = ["rl", "random", "constant", "reactive"]
-    methods = ["constant", "reactive"]
+    methods = ["rl", "random", "constant", "reactive"]
+    # methods = ["constant", "reactive"]
     results: Dict[str, Dict[str, np.ndarray]] = {
         m: {
             "qoe": np.array([], dtype=np.float32),
