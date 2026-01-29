@@ -20,14 +20,14 @@ globals:
     atk_01:
       type: drdos_dns
       ts_path: output/cicddos2019_1/DrDoS_DNS.csv
-      cpu_usage_const: 0.30
+      latency_per_flow: 0.6 #in ms
       non_defendable_bw_const: 0.15
       scaling: 1.0
 
     atk_02:
       type: udp_lag
       ts_path: output/cicddos2019_1/UDPLag.csv
-      cpu_usage_const: 0.45
+      latency_per_flow: 0.45
       non_defendable_bw_const: 0.25
       scaling: 0.1
 
@@ -35,76 +35,48 @@ globals:
     reid_latency: 20 #! Should consider batch processing
 
     configs:
-      # ---------- YOLO11M ----------
-      - detector: yolo11m
-        base_resolution_h: 736
+      # ---------- NanoDet-m ----------
+      - detector: nanoDet-m-320
+        map: 0.206
         latency_ms:
-          detection: 140.53692
+          detection: 4.05
         cycles:
           detection: 0
 
-      - detector: yolo11m
-        base_resolution_h: 544
+      # ---------- NanoDet-Plus-m ----------
+      - detector: nanodet-plus-m_320
+        map: 0.27
         latency_ms:
-          detection: 100.13525
+          detection: 4.39
         cycles:
           detection: 0
 
-      - detector: yolo11m
-        base_resolution_h: 384
+      - detector: nanodet-plus-m_416
+        map: 0.34
         latency_ms:
-          detection: 47.44823
+          detection: 8.55
         cycles:
           detection: 0
 
-      # ---------- YOLO11S ----------
-      - detector: yolo11s
-        base_resolution_h: 736
+      # ---------- NanoDet-Plus-m-1.5x ----------
+      - detector: nanodet-plus-m-1.5x_320
+        map: 0.304
         latency_ms:
-          detection: 89.95332
+          detection: 5.97
         cycles:
           detection: 0
 
-      - detector: yolo11s
-        base_resolution_h: 544
+      - detector: nanodet-plus-m-1.5x_416
+        map: 0.4
         latency_ms:
-          detection: 55.19455
+          detection: 10.17
         cycles:
           detection: 0
-
-      - detector: yolo11s
-        base_resolution_h: 384
-        latency_ms:
-          detection: 24.90750
-        cycles:
-          detection:   0        
-
-      # ---------- YOLO11N ----------
-      - detector: yolo11n
-        base_resolution_h: 736
-        latency_ms:
-          detection: 31.38791
-        cycles:
-          detection: 954.20          
-
-      - detector: yolo11n
-        base_resolution_h: 544
-        latency_ms:
-          detection: 20.79534
-        cycles:
-          detection: 632.17         
-
-      - detector: yolo11n
-        base_resolution_h: 384
-        latency_ms:
-          detection: 15.06442
-        cycles:
-          detection: 458.0
 
 edge_areas:
   - area_id: "E1"
     cpu_cycle_per_ms: 3.8 #3.8GHz #3.8E6 / ms
-    budget: { cpu: 8.0, mem: 8.0, uplink: 12.5 } #100Mbps
+    budget: { cpu: 8.0, mem: 8.0, uplink: 1000 } #100Mbps
     constraints:
       D_Max: 250.0
       MOTA_min: 0.1  
@@ -117,7 +89,7 @@ edge_areas:
 
     users:
       - user_id: "cam_001"
-        input_dir: "input/bellevue_150th_eastgate_full/"
+        input_path: "input/bellevue_150th_eastgate_full/frame_stats_yolo11x_736.csv"
       # - user_id: "cam_002"
       #   obj_pred_ts: "data/users/cam_002_obj_pred.csv"
       #   mota_table: "data/mota_table/bellevue_150th_eastgate.csv"

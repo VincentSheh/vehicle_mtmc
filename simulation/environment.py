@@ -21,7 +21,7 @@ import pandas as pd
 
 from service import IDS, VideoPipeline
 
-from request import UserCamera, Attacker
+from request import User, Attacker
 
 from edgearea import ResourceBudget, EdgeArea
 
@@ -38,22 +38,31 @@ class GlobalConfig:
 class StepMetrics:
     t: int
     area_id: str
+
+    # QoE
     qoe_mean: float
-    qoe_min: float
-    uplink_available: float
-    mean_mota: float
-    local_num_objects: int
-    local_gt_num_objects: int
-    num_objects: int
+
+    # Requests (OD-only pipeline)
+    local_num_req: int                  # served (after IDS + uplink + compute)
+    local_gt_num_req: int           # total incoming requests (pre-IDS)
+
+    # IDS / attack
     ids_coverage: float
     attack_in_rate: float
     attack_drop_rate: float
     user_drop_rate: float
     cpu_to_ids_ratio: float
-    va_cpu_utilization: float
     ids_cpu_utilization: float
+
+    # VA / BW
+    va_cpu_utilization: float
     bw_utilization: float
-    I_net: float
+
+    # Per-step plan (detector mixing)
+    od_plan: Dict[str, int] = field(default_factory=dict)
+
+    # Optional network impact metric
+    I_net: float = 0.0
 
     
 def load_globals(cfg: dict) -> GlobalConfig:
@@ -190,8 +199,8 @@ class Environment:
                 ai = float(ai.detach().item())
             edge.cpu_to_ids_ratio =  ai / edge.budget.cpu
 
-            state, cache = edge.step_local(self.t)
-            offload_states.append(state)
+            cache = edge.step_local(self.t)
+            # offload_states.append(state)
             local_cache[edge.area_id] = cache
 
         # # 2) Cooperative OT offloading (global)
@@ -200,51 +209,50 @@ class Environment:
         # 3) Final QoE computation per edge
         for edge in self.edge_areas:
             cache = local_cache[edge.area_id]
-            state = next(s for s in offload_states if s.area_id == edge.area_id)
             
-            od_cycles = cache["best_od_cycles"]
-            od_latency = od_cycles / max(1e-9, state.avail_cycles_aft_atk_per_ms)
+            # state = next(s for s in offload_states if s.area_id == edge.area_id)
+            
+            # od_cycles = cache["best_od_cycles"]
+            # od_latency = od_cycles / max(1e-9, state.avail_cycles_aft_atk_per_ms)
 
-            ot_cycles = state.local_q_obj * state.track_cycles_per_obj
-            ot_latency = ot_cycles / max(1e-9, state.avail_cycles_aft_atk_per_ms)
+            # ot_cycles = state.local_q_obj * state.track_cycles_per_obj
+            # ot_latency = ot_cycles / max(1e-9, state.avail_cycles_aft_atk_per_ms)
 
-            final_latency = od_latency + ot_latency
+            # final_latency = od_latency + ot_latency
 
             D_Max = edge.constraints["D_Max"]
-            MOTA_min = edge.constraints["MOTA_min"]
-            gamma = edge.constraints["Gamma"]
+            # MOTA_min = edge.constraints["MOTA_min"]
+            # gamma = edge.constraints["Gamma"]
 
             # final_q = (cache["best_mean_mota"] - MOTA_min) * np.exp(
             #     -gamma * (final_latency - D_Max)
             # )
-            final_q = cache["best_mean_mota"] if final_latency <= D_Max else 0
+            # final_q = cache["best_mean_mota"] if final_latency <= D_Max else 0
 
+            # local_gt_num_objects = cache["local_gt_num_object"]
             ids_out = cache["ids_out"]
-            local_gt_num_objects = cache["local_gt_num_object"]
             # I_net_e = I_net[state.idx]
             self.history.append(
                 StepMetrics(
                     t=self.t,
                     area_id=edge.area_id,
-                    qoe_mean=float(final_q),
-                    qoe_min=float(final_q),
-                    uplink_available=float(state.uplink_available),
-                    mean_mota=float(cache["best_mean_mota"]),
+                    qoe_mean=float(cache["qoe"]),
                     
-                    num_objects = state.total_q(),
                     ids_coverage=float(ids_out.get("coverage", 0.0)),
                     attack_in_rate=float(ids_out.get("attack_in_rate", 0.0)),
                     user_drop_rate=float(ids_out.get("user_drop_rate", 0.0)),
+                    od_plan = cache["od_plan"],
                     
                     # RL Observation
-                    local_num_objects = state.local_q_obj,
-                    local_gt_num_objects = local_gt_num_objects,
+                    local_num_req = cache["local_num_request"],
+                    local_gt_num_req = cache["local_gt_num_request"],
                     attack_drop_rate=float(ids_out.get("attack_drop_rate", 0.0)),
                     cpu_to_ids_ratio = edge.cpu_to_ids_ratio,
-                    va_cpu_utilization = (od_cycles + ot_cycles) / (state.va_avail_cycles_per_ms * edge.slot_ms),
+                    va_cpu_utilization = cache["va_cpu_utilization"],
                     ids_cpu_utilization = ids_out["ids_cpu_util"],
-                    bw_utilization = state.uplink_util,
+                    bw_utilization = cache["uplink_util"],
                     # I_net = I_net_e,
+                    # od_plan = od_plan,
                 )
             )
 
@@ -286,11 +294,13 @@ def build_env_base(cfg_path: str):
         users = []
         for u in area_cfg.get("users", []):
             users.append(
-                UserCamera(
+                User(
                     user_id=u["user_id"],
-                    input_dir=u["input_dir"],
+                    input_path=u["input_path"],
+                    slot_ms=globals_cfg.slot_ms,
                     t_max=cfg["run"]["t_max"],
-                    seed=cfg["run"]["seed"]
+                    seed=cfg["run"]["seed"],
+                    scaling=2.0,
                 )
             )
 
@@ -309,12 +319,14 @@ def build_env_base(cfg_path: str):
                     attacker_id=atk_type,
                     attack_type=atk_cfg["type"],
                     ts_df=pd.read_csv(atk_cfg["ts_path"]),
-                    cpu_usage_const=atk_cfg["cpu_usage_const"],
+                    latency_per_flow=atk_cfg["latency_per_flow"],
                     non_defendable_bw_const=atk_cfg["non_defendable_bw_const"],
                     slot_ms=globals_cfg.slot_ms,
                     t_max=cfg["run"]["t_max"],
-                    scaling=atk_cfg["scaling"],
-                    seed=cfg["run"]["seed"]
+                    scaling=1.0,
+                    seed=cfg["run"]["seed"],
+                    cpu_cycle_per_ms=globals_cfg.cpu_cycle_per_ms,
+                    cpu_cores=globals_cfg.cpu_cores,                      
                 )
             )
 
@@ -376,14 +388,14 @@ class TorchRLEnvWrapper(EnvBase):
         # self._step_count = 0
 
         self.obs_keys = [
-            "local_num_objects",
-            # "local_gt_num_objects",
+            "local_num_req",
+            # "local_gt_num_req",
             "attack_drop_rate",
             # "attack_in_rate",
             "cpu_to_ids_ratio",
-            "va_cpu_utilization",
+            # "va_cpu_utilization",
             "ids_cpu_utilization",
-            "bw_utilization",
+            # "bw_utilization",
             # "I_net",
         ]
         
@@ -505,7 +517,7 @@ class TorchRLEnvWrapper(EnvBase):
         utils = []
         for area_id in self.area_ids:
             g = df[df["area_id"] == area_id]
-            if g.empty or "ids_cpu_utilization" not in g:
+            if g.empty or "ids_cpu_utilization" not in g.columns:
                 continue
             utils.append(float(np.clip(np.mean(g["ids_cpu_utilization"].values), 0.0, 1.0)))
         return float(max(utils)) if utils else 0.0
@@ -532,6 +544,7 @@ class TorchRLEnvWrapper(EnvBase):
             # max=edge.budget.cpu / 2.0,
         )
         ids_cpu = self.ids_cpu.clone()
+        # ids_cpu = [1.5]
         print(action, delta, ids_cpu)
 
         total_reward = 0.0
@@ -624,7 +637,7 @@ def test_environment_run(cfg_path: str, plot=False):
     env = build_env_base(cfg_path)
     env.reset()
     for _ in range(env.t_max): 
-        env.step([3.5])
+        env.step([0.5])
 
     df = pd.DataFrame([m.__dict__ for m in env.history])
 
@@ -646,18 +659,17 @@ def test_environment_run(cfg_path: str, plot=False):
 
     # Latency over time
     (
-        df.pivot(index="t", columns="area_id", values="uplink_available")
-        .plot(figsize=(10, 4), title="Available uplink over time")
+        df.pivot(index="t", columns="area_id", values="bw_utilization")
+        .plot(figsize=(10, 4), title="Utilized uplink over time")
         .get_figure()
-        .savefig(f"{out_dir}/uplink_available.png", bbox_inches="tight")
+        .savefig(f"{out_dir}/uplink_utilization.png", bbox_inches="tight")
     )
 
-    # Executed objects (post-offload)
     (
-        df.pivot(index="t", columns="area_id", values="num_objects")
-        .plot(figsize=(10, 4), title="Post-offload tracking load")
+        df.pivot(index="t", columns="area_id", values="local_gt_num_req")
+        .plot(figsize=(10, 4), title="Num Request")
         .get_figure()
-        .savefig(f"{out_dir}/num_objects.png", bbox_inches="tight")
+        .savefig(f"{out_dir}/local_num_req.png", bbox_inches="tight")
     )
 
     # IDS coverage
