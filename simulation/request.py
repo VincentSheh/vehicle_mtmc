@@ -3,6 +3,8 @@ import pandas as pd
 from pathlib import Path
 from typing import Dict, Tuple, Union
 import re
+from dataclasses import dataclass
+from typing import Optional, Union
 
 class Attacker:
     """
@@ -18,16 +20,21 @@ class Attacker:
         attacker_id,
         attack_type,
         ts_df,
-        cpu_usage_const,
+        latency_per_flow,
+        bw_per_flow,
         non_defendable_bw_const,
         scaling,
         slot_ms,
         t_max,
         seed,
+        cpu_cycle_per_ms: float,
+        cpu_cores: int,        
     ):
         self.attacker_id = attacker_id
         self.attack_type = attack_type
-        self.cpu_usage_const = cpu_usage_const
+        self.latency_per_flow = latency_per_flow
+        self.cycle_per_flow = latency_per_flow * float(cpu_cycle_per_ms) * int(cpu_cores)
+        self.bw_per_flow = bw_per_flow
         self.non_defendable_bw_const = non_defendable_bw_const
         self.slot_ms = slot_ms
         self.t_max=t_max
@@ -38,7 +45,8 @@ class Attacker:
         self.df = ts_df.reset_index(drop=True).copy()
         self.df["attack_type"] = attack_type 
         self.df["attacker_id"] = attacker_id 
-        self.df["forward_bytes_per_sec"] = self.df["forward_bytes_per_sec"] / (1024*1024)
+        self.df["forward_bytes_per_sec"] = self.df["forward_bytes_per_sec"] / (1024*1024) * scaling
+        self.df["flows_per_sec"] = self.df["flows_per_sec"] * scaling
 
         required = {
             "forward_packets_per_sec",
@@ -103,48 +111,22 @@ class Attacker:
         return self.df.iloc[[sec_idx]].copy()
 
 
-def _parse_detector_res_from_filename(p: Path) -> Tuple[str, int]:
-    """
-    Expected patterns like:
-      frame_stats_yolo11l_384.csv
-      frame_stats_yolo11x-720.csv
-      obj_pred_yolo11s_736.csv
-
-    Returns: (detector, base_resolution_h)
-    """
-    stem = p.stem.lower()
-    # find yolo11? token and a following integer
-    import re
-    m = re.search(r"(yolo11[a-z])[_\-]?(\d+)", stem)
-    if not m:
-        raise ValueError(f"Cannot parse (detector, h) from filename: {p.name}")
-    det = m.group(1)
-    h = int(m.group(2))
-    return det, h
-
 
 class User:
     """
     User request arrival time series.
-
-    Input df (ts_df) is assumed to be indexed by "seconds" (one row per second),
-    similar to Attacker.
-
-    Behavior:
-      - Converts req_per_sec to num_requests_per_step using slot_ms and scaling
-      - If trace is longer than the episode horizon (t_max), randomly slices a contiguous
-        window of length (t_max / steps_per_sec) seconds on each init/reset
-      - Also samples a random start offset inside the episode so the trace segment can
-        appear at different times within [0, t_max)
+    Input CSV is one row per second.
     """
+
     def __init__(
         self,
         user_id: Union[str, int],
-        ts_df: pd.DataFrame,
         slot_ms: float,
         t_max: int,
-        scaling: float = 1.0,
         seed: int = 0,
+        scaling: float = 1.0,
+        arrival_col: str = "num_objects",   # rename later if you want
+        synth_cfg=None,
     ):
         self.user_id = str(user_id)
         self.slot_ms = float(slot_ms)
@@ -153,249 +135,112 @@ class User:
         self.base_seed = int(seed)
         self.rng = np.random.default_rng(self.base_seed)
 
-        self.arrival_col = "req_per_sec"
+        self.arrival_col = str(arrival_col)
+        
+        self.synth_cfg = synth_cfg
+        self._init_from_synthetic()        
 
-        # prepare df
-        self._full_df = ts_df.reset_index(drop=True).copy()
-        if self.arrival_col not in self._full_df.columns:
-            raise ValueError(
-                f"User trace missing column '{self.arrival_col}'. "
-                f"Got columns: {list(self._full_df.columns)}"
-            )
-        self._full_df[self.arrival_col] = pd.to_numeric(
-            self._full_df[self.arrival_col], errors="coerce"
-        ).fillna(0.0)
-
-        self.steps_per_sec = int(1000 // self.slot_ms)
+    def _init_from_synthetic(self):
+        cfg = self.synth_cfg
+        self.steps_per_sec = int(round(1000.0 / self.slot_ms))
         if self.steps_per_sec <= 0:
-            raise ValueError(f"Invalid slot_ms={self.slot_ms}, must be <= 1000 and > 0")
+            raise ValueError(f"Invalid slot_ms={self.slot_ms}")
 
-        self.step_scale = self.slot_ms / 1000.0  # seconds per step
-
-        # build first episode slice + start
-        self._slice_trace_and_set_start()
-
-    def _slice_trace_and_set_start(self):
-        """
-        Slice a contiguous chunk for this episode and set its start time in the episode.
-        """
-        trace_len_sec = len(self._full_df)
-        if trace_len_sec <= 0:
-            raise ValueError("Empty request trace")
-
-        # how many seconds of trace do we need to cover t_max steps?
-        ep_len_sec = int(np.ceil(self.t_max / self.steps_per_sec))
-        ep_len_sec = max(1, ep_len_sec)
-
-        if trace_len_sec <= ep_len_sec:
-            sec_start = 0
-            df_slice = self._full_df.copy()
-        else:
-            max_sec_start = trace_len_sec - ep_len_sec
-            sec_start = int(self.rng.integers(0, max_sec_start + 1))
-            df_slice = self._full_df.iloc[sec_start : sec_start + ep_len_sec].copy()
-
-        df_slice["user_id"] = self.user_id
-        df_slice["num_requests_per_step"] = (
-            df_slice[self.arrival_col] * self.step_scale * self.scaling
+        df = self.generate_req_trace(
+            t_steps=self.t_max,
+            slot_ms=self.slot_ms,
+            rng=self.rng,                # key: uses User rng so reset controls mu0
+            rw_sigma_per_sqrt_sec=cfg["rw_sigma_per_sqrt_sec"],
+            mu_min=cfg["mu_min"],
+            mu_max=cfg["mu_max"],
+            kappa=cfg["kappa"],
+            sigma=cfg["sigma"],
         )
 
-        self.df = df_slice.reset_index(drop=True)
+        per_step = np.maximum(df["num_requests_per_step"].to_numpy(dtype=float) * self.scaling, 0.0)
 
-        # map slice length in steps then pick a random placement start inside episode
-        trace_len_steps = len(self.df) * self.steps_per_sec
-        max_start = self.t_max - trace_len_steps
-        self.start = int(self.rng.integers(0, max_start + 1)) if max_start > 0 else 0
+        self.df = pd.DataFrame(
+            {
+                "t": np.arange(self.t_max, dtype=int),
+                "user_id": self.user_id,
+                "num_requests_per_step": per_step,
+                "mu0": df["mu0"].to_numpy(dtype=float),
+                "mu_t": df["mu_t"].to_numpy(dtype=float),
+                "req_per_sec": df["req_per_sec"].to_numpy(dtype=float),
+                "req_per_step_expected": df["req_per_step_expected"].to_numpy(dtype=float) * self.scaling,
+            }
+        )
+
+    def generate_req_trace(
+        self,
+        t_steps: int,
+        slot_ms: float,
+        rng: np.random.Generator,
+
+        # random-walk mean params
+        rw_sigma_per_sqrt_sec: float = 0.8,
+        mu_min: float = 5.0,
+        mu_max: float = 40.0,
+
+        # OU-like arrival params
+        kappa: float = 0.02,
+        sigma: float = 0.9,
+    ):
+        dt = slot_ms / 1000.0
+
+        # 1) randomize mu0
+        mu0 = float(rng.uniform(mu_min, mu_max))
+
+        # 2) make mu random walk
+        mu_series = np.empty(t_steps, dtype=float)
+        mu_series[0] = mu0
+        for t in range(1, t_steps):
+            step =  rw_sigma_per_sqrt_sec * np.sqrt(dt) * rng.standard_normal()
+            mu_series[t] = np.clip(mu_series[t - 1] + step, mu_min, mu_max)
+
+        # 3) generate arrival rate with mean-reverting dynamics toward mu_t
+        x = float(mu_series[0])
+        req_per_sec = np.zeros(t_steps, dtype=float)
+
+        for t in range(t_steps):
+            mu_t = float(mu_series[t])
+            x = x + kappa * (mu_t - x) + sigma * rng.standard_normal()
+            x = max(0.0, x)
+            req_per_sec[t] = x
+
+        # convert per-second rate to per-step expectation
+        req_per_step_expected = req_per_sec * dt
+        req_per_step = np.maximum(req_per_step_expected, 0.0)
+
+        df = pd.DataFrame(
+            {
+                "t": np.arange(t_steps, dtype=int),
+                "mu0": mu0,
+                "mu_t": mu_series,
+                "req_per_sec": req_per_sec,
+                "req_per_step_expected": req_per_step_expected,
+                "num_requests_per_step": req_per_step,
+            }
+        )
+        return df        
+
 
     def reset(self, seed: int | None = None):
         if seed is not None:
             self.base_seed = int(seed)
             self.rng = np.random.default_rng(self.base_seed)
-        self._slice_trace_and_set_start()
+        self._init_from_synthetic()
 
     def load_at(self, t: int) -> pd.DataFrame:
-        """
-        Map step t -> second index in the sliced request trace.
-        Returns a 1-row dataframe (same schema as self.df) or empty df if out of range.
-        """
-        local_step = int(t) - int(self.start)
+        local_step = int(t)
         if local_step < 0:
             return pd.DataFrame(columns=self.df.columns.tolist())
 
-        sec_idx = local_step // self.steps_per_sec
-        if sec_idx >= len(self.df):
-            return pd.DataFrame(columns=self.df.columns.tolist())
-
-        return self.df.iloc[[sec_idx]].copy()
+        return self.df.iloc[[local_step]].copy()
 
     def num_requests_at(self, t: int) -> float:
-        """
-        Returns expected number of requests per step at time t (float).
-        """
-        row = self.load_at(t)
-        if row.empty:
+        # direct per-step lookup
+        if t < 0 or t >= len(self.df):
             return 0.0
-        return float(row["num_requests_per_step"].iloc[0])
+        return float(self.df.iloc[int(t)]["num_requests_per_step"])
 
-class UserCamera:
-    def __init__(
-        self,
-        user_id: str,
-        input_dir: str | Path,
-        t_max: int,
-        seed: int,
-    ):
-        self.user_id = str(user_id)
-        self.input_dir = Path(input_dir)
-        self.t_max = int(t_max)
-
-        if not self.input_dir.is_dir():
-            raise ValueError(f"input_dir must be a directory: {self.input_dir}")
-
-        self.base_seed = int(seed)
-        self.rng = np.random.default_rng(self.base_seed)
-
-        self._obj_lookup: Dict[Tuple[str, int], Dict[int, float]] = {}
-        self._mota_lookup: Dict[Tuple[str, int], float] = {}
-
-        self._load_mota_table()
-        self._build_obj_lookup()
-        self._set_start()
-        
-    def _load_mota_table(self):
-        """
-        Load MOTA lookup table.
-
-        Expected CSV format:
-        - detector (str)
-        - base_resolution_h (int)
-        - MOTA (float)
-
-        Builds:
-        self._mota_lookup[(detector, base_resolution_h)] -> MOTA
-        """
-        mota_path = self.input_dir / "mota_table.csv"
-        if not mota_path.exists():
-            raise ValueError(f"Missing mota_table.csv in {self.input_dir}")
-
-        mota_df = pd.read_csv(mota_path)
-
-        required = {"detector", "base_resolution_h", "MOTA"}
-        if not required.issubset(mota_df.columns):
-            raise ValueError(
-                f"mota_table.csv must contain columns {required}, "
-                f"got {set(mota_df.columns)}"
-            )
-
-        # clean + type normalize
-        mota_df = mota_df[["detector", "base_resolution_h", "MOTA"]].dropna()
-        mota_df["detector"] = mota_df["detector"].astype(str)
-        mota_df["base_resolution_h"] = mota_df["base_resolution_h"].astype(int)
-        mota_df["MOTA"] = mota_df["MOTA"].astype(float)
-
-        # ensure uniqueness
-        if mota_df.duplicated(subset=["detector", "base_resolution_h"]).any():
-            dups = mota_df[mota_df.duplicated(
-                subset=["detector", "base_resolution_h"], keep=False
-            )]
-            raise ValueError(
-                "Duplicate (detector, base_resolution_h) entries in mota_table.csv:\n"
-                f"{dups}"
-            )
-
-        self._mota_lookup = {
-            (row.detector, row.base_resolution_h): row.MOTA
-            for row in mota_df.itertuples(index=False)
-        }        
-        
-    def _build_obj_lookup(self):
-        """
-        Build object count lookup for each (detector, resolution).
-        Randomly selects a contiguous window of length t_max
-        using the instance RNG.
-        """
-        self._obj_lookup.clear()
-
-        obj_files = sorted(self.input_dir.glob("frame_stats_*.csv"))
-        if not obj_files:
-            raise ValueError(f"No frame_stats_*.csv found in {self.input_dir}")
-
-        for csv_path in obj_files:
-            detector, h = self._parse_detector_res(csv_path.name)
-
-            df = pd.read_csv(csv_path)
-            if not {"frame", "num_objects"}.issubset(df.columns):
-                raise ValueError(
-                    f"{csv_path.name} must contain columns: frame, num_objects"
-                )
-
-            df = (
-                df[["frame", "num_objects"]]
-                .dropna()
-                .sort_values("frame")
-                .reset_index(drop=True)
-            )
-
-            if len(df) <= self.t_max:
-                start = 0
-                df_slice = df
-            else:
-                max_start = len(df) - self.t_max
-                start = int(self.rng.integers(0, max_start + 1))
-                df_slice = df.iloc[start : start + self.t_max]
-
-            df_slice = df_slice.copy()
-            df_slice["frame"] = np.arange(len(df_slice))  # reindex 0..t_max-1
-
-            self._obj_lookup[(detector, h)] = {
-                int(r.frame): float(r.num_objects)
-                for r in df_slice.itertuples(index=False)
-            }
-    def _set_start(self):
-        """
-        Random start offset for this user within an episode.
-        """
-        if self.t_max <= 0:
-            self.start = 0
-            return
-
-        max_start = self.t_max
-        self.start = int(self.rng.integers(0, max_start))
-        
-    def reset(self, seed: int | None = None):
-        """
-        Reset user randomness for a new episode.
-        """
-        if seed is not None:
-            self.base_seed = int(seed)
-            self.rng = np.random.default_rng(self.base_seed)
-
-        self._build_obj_lookup()
-        self._set_start()                    
-    # =================================================
-    # Public API
-    # =================================================
-
-    def get_num_objects(self, t: int, detector: str, base_resolution_h: int) -> float:
-        return self._obj_lookup.get(
-            (str(detector), int(base_resolution_h)), {}
-        ).get(int(t), 0.0)
-
-    def get_mota(self, detector: str, base_resolution_h: int) -> float:
-        return self._mota_lookup.get((str(detector), int(base_resolution_h)), 0.0)
-
-    # =================================================
-    # Helpers
-    # =================================================
-
-    @staticmethod
-    def _parse_detector_res(filename: str) -> Tuple[str, int]:
-        """
-        Extract (detector, resolution_h) from filename.
-        """
-        m = re.search(r"(yolo11[a-z])[_\-]?(\d+)", filename.lower())
-        if not m:
-            raise ValueError(
-                f"Cannot parse detector & resolution from filename: {filename}"
-            )
-        return m.group(1), int(m.group(2))

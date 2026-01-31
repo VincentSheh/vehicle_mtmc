@@ -59,7 +59,7 @@ class IDS:
         total_in = float(user_rate + total_attack) #! TODO: Change User rate to Packet
 
         speed = self.effective_speed_pkt_per_step(cpu_ratio_to_ids)
-        coverage = float(min(1.0, speed / total_in)) if total_in > 0 else 0.0 #! TODO: Offloadinfg and add delay to the request
+        coverage = float(min(1.0, speed / total_in)) if total_in > 0 else 1.0 #! TODO: Offloadinfg and add delay to the request
 
         attack_by_type = (
             attack_df.groupby("attack_type")["flows_per_sec"].sum().to_dict()
@@ -95,14 +95,14 @@ class VideoPipeline:
     """
     Global video analytics pipeline (cycle-based).
 
-    All latencies are converted to CPU cycles during initialization.
-    Runtime operates purely in cycles.
+    New config supports per-detector accuracy by upload resolution:
+      res_to_acc: [{base_resolution_h: int, map: float}, ...]
 
-    Keys:
-      (detector, base_resolution_h) -> detection_cycles
-
-    Also holds:
-      reid_cycles_per_object
+    Stored:
+      - det_cycles[det] = cycles per request (independent of upload size, since resized)
+      - det_quality[det] = "best" map (fallback, usually highest resolution)
+      - res_to_acc[(det, h)] = map for that (detector, base_resolution_h)
+      - supported_resolutions[det] = sorted list of base_resolution_h
     """
 
     def __init__(
@@ -112,44 +112,57 @@ class VideoPipeline:
         cpu_cycle_per_ms: float,
         cpu_cores: int,
     ):
-        # Convert ReID latency to cycles once
         self.reid_cycles_per_object: float = (
-            float(reid_latency_ms_per_object)
-            * float(cpu_cycle_per_ms)
-            * int(cpu_cores)
+            float(reid_latency_ms_per_object) * float(cpu_cycle_per_ms) * int(cpu_cores)
         )
 
-        # Detection cycles lookup
-        self.det_cycles: Dict[Tuple[str, int], float] = {}
+        self.det_cycles: Dict[str, float] = {}
+        self.det_quality: Dict[str, float] = {}
+        self.res_to_acc: Dict[Tuple[str, int], float] = {}
+        self.supported_resolutions: Dict[str, List[int]] = {}
 
         for c in configs:
             det = str(c["detector"])
-            h = int(c["base_resolution_h"])
 
-            # Prefer explicit cycle annotation if provided
-            if c.get("cycles", {}).get("detection", 0) > 0:
+            # cycles per request (latency is same across res because input is resized)
+            cycles = 0.0
+            if c.get("cycles", {}).get("detection", 0) and float(c["cycles"]["detection"]) > 0:
                 cycles = float(c["cycles"]["detection"])
             else:
-                # Convert latency → cycles once
                 lat_ms = float(c["latency_ms"]["detection"])
-                cycles = lat_ms * cpu_cycle_per_ms * cpu_cores
+                cycles = lat_ms * float(cpu_cycle_per_ms) * int(cpu_cores)
+            self.det_cycles[det] = float(cycles)
 
-            self.det_cycles[(det, h)] = float(cycles)
+            # per-resolution accuracy table
+            res_rows = c.get("res_to_acc", None)
+            if res_rows:
+                hs: List[int] = []
+                best_map = -1e9
+                for r in res_rows:
+                    h = int(r["base_resolution_h"])
+                    m = float(r["map"])
+                    self.res_to_acc[(det, h)] = m
+                    hs.append(h)
+                    if m > best_map:
+                        best_map = m
+                self.supported_resolutions[det] = sorted(set(hs))
+                self.det_quality[det] = float(best_map)
+            else:
+                # backward-compatible fallback: single "map"
+                m = float(c.get("map", 0.0))
+                self.det_quality[det] = m
+                self.supported_resolutions[det] = []
 
-        # Safety check
         if not self.det_cycles:
             raise ValueError("VideoPipeline initialized with no detection configs")
 
-    # -------------------------------------------------
-    # Cycle-based API (used everywhere in simulation)
-    # -------------------------------------------------
 
-    def detection_cycles(self, detector: str, base_resolution_h: int) -> float:
+    def detection_cycles(self, detector: str) -> float:
         """
         Detection cost in cycles for one frame, one camera.
         """
         return float(
-            self.det_cycles.get((detector, int(base_resolution_h)), float("inf"))
+            self.det_cycles.get((detector), float("inf"))
         )
 
     def tracking_cycles_per_object(self) -> float:

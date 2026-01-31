@@ -114,7 +114,7 @@ def decision_cpu_util(env, decision_interval: int) -> float:
 
     utils = []
     attack_in_rate_ts = []
-    local_gt_num_objects_ts = []    
+    local_gt_num_req_ts = []    
     for area_id in [e.area_id for e in env.edge_areas]:
         g = df[df["area_id"] == area_id]
         if g.empty or "ids_cpu_utilization" not in g:
@@ -123,7 +123,7 @@ def decision_cpu_util(env, decision_interval: int) -> float:
         ids_util = float(np.mean(g["ids_cpu_utilization"].values))
         utils.append(float(np.clip(ids_util, 0.0, 1.0)))
         attack_in_rate_ts.append(float(df["attack_in_rate"].mean()) if "attack_in_rate" in df else 0.0)
-        local_gt_num_objects_ts.append(float(df["local_gt_num_objects"].mean()) if "local_gt_num_objects" in df else 0.0)        
+        local_gt_num_req_ts.append(float(df["local_gt_num_req"].mean()) if "local_gt_num_req" in df else 0.0)        
 
     return float(max(utils)) if utils else 0.0
 
@@ -181,7 +181,7 @@ def run_episode(
     local_gt_num_obj_ts = []
     attack_in_rate_ts = []
 
-    for _k in tqdm(range(decisions)):
+    for _k in range(decisions):
         if env.t >= env.t_max:
             break
 
@@ -189,7 +189,13 @@ def run_episode(
         cpu_util = decision_cpu_util(env, decision_interval)
 
         # ---------- policy ----------
-        if method == "constant":
+        if method.startswith("constant_"):
+            try:
+                constant_cpu = float(method.split("_", 1)[1])
+            except ValueError:
+                raise ValueError(f"Invalid constant method format: {method}")
+
+            ids_cpu = constant_cpu
             delta = np.zeros(n_edges, dtype=np.int64)
         elif method == "random":
             delta = rng.integers(-1, 2, size=n_edges, dtype=np.int64)
@@ -222,12 +228,12 @@ def run_episode(
 
         qoe_ts.append(qoe)
         cpu_util_ts.append(cpu_util)
-        local_num_obj_ts.append(df["local_num_objects"].mean())
+        local_num_obj_ts.append(df["local_num_req"].mean())
         cpu_to_ids_ratio_ts.append(df["cpu_to_ids_ratio"].mean())
 
         # new metrics
-        if "local_gt_num_objects" in df.columns:
-            local_gt_num_obj_ts.append(df["local_gt_num_objects"].mean())
+        if "local_gt_num_req" in df.columns:
+            local_gt_num_obj_ts.append(df["local_gt_num_req"].mean())
         else:
             local_gt_num_obj_ts.append(0.0)
 
@@ -239,8 +245,8 @@ def run_episode(
     return {
         "qoe": np.array(qoe_ts),
         "cpu_util": np.array(cpu_util_ts),
-        "local_num_objects": np.array(local_num_obj_ts),
-        "local_gt_num_objects": np.array(local_gt_num_obj_ts),
+        "local_num_req": np.array(local_num_obj_ts),
+        "local_gt_num_req": np.array(local_gt_num_obj_ts),
         "attack_in_rate": np.array(attack_in_rate_ts),
         "cpu_to_ids_ratio": np.array(cpu_to_ids_ratio_ts),
     }
@@ -255,7 +261,7 @@ def plot_ts_continuous(results, outpath, slo_qoe_min: float = 0.0):
 
     panels = [
         ("qoe", "QoE"),
-        ("local_gt_num_objects", "Local GT #Objects"),
+        ("local_gt_num_req", "Local GT #Objects"),
         ("attack_in_rate", "Attack in rate"),
         ("cpu_to_ids_ratio", "CPU→IDS Ratio"),
     ]
@@ -306,7 +312,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cfg", type=str, required=True)
     ap.add_argument("--outdir", type=str, default="eval_out")
-    ap.add_argument("--episodes", type=int, default=1)
+    ap.add_argument("--episodes", type=int, default=2)
     ap.add_argument("--decision_interval", type=int, default=500)
     ap.add_argument("--scale_step", type=float, default=0.5)
     ap.add_argument("--ids_cpu_min", type=float, default=0.5)
@@ -327,7 +333,7 @@ def main():
     outdir.mkdir(parents=True, exist_ok=True)
 
     obs_keys = [
-        "local_num_objects",
+        "local_num_req",
         "attack_drop_rate",
         "cpu_to_ids_ratio",
         "bw_utilization",
@@ -343,21 +349,22 @@ def main():
             greedy=args.rl_greedy,
         )
 
-    methods = ["rl", "random", "constant", "reactive"]
-    # methods = ["constant", "reactive"]
+    # methods = ["rl", "random", "constant", "reactive"]
+    methods = ["constant_0.5", "constant_1.5", "constant_2.5", "constant_4.0", "constant_6.0"]
+    # methods = ["constant_0.5"]
     results: Dict[str, Dict[str, np.ndarray]] = {
         m: {
             "qoe": np.array([], dtype=np.float32),
             "cpu_util": np.array([], dtype=np.float32),
-            "local_num_objects": np.array([], dtype=np.float32),
-            "local_gt_num_objects": np.array([], dtype=np.float32),
+            "local_num_req": np.array([], dtype=np.float32),
+            "local_gt_num_req": np.array([], dtype=np.float32),
             "attack_in_rate": np.array([], dtype=np.float32),
             "cpu_to_ids_ratio": np.array([], dtype=np.float32),
         }
         for m in methods
     }
 
-    for ep in range(args.episodes):
+    for ep in tqdm(range(args.episodes)):
         ep_seed = base_seed + ep * 1000
         for m in methods:
             if m == "rl" and rl_policy is None:
@@ -379,10 +386,7 @@ def main():
                 results[m][k] = np.concatenate([results[m][k], q[k]])
 
 
-    plot_ts_continuous(results, "qoe", outdir / "qoe_ts.png", "QoE")
-    plot_ts_continuous(results, "cpu_util", outdir / "cpu_util_ts.png", "CPU Utilization")
-    plot_ts_continuous(results, "local_num_objects", outdir / "local_num_objects_ts.png", "Local #Objects")
-    plot_ts_continuous(results, "cpu_to_ids_ratio", outdir / "cpu_to_ids_ratio_ts.png", "CPU→IDS Ratio")
+    plot_ts_continuous(results, outdir / "qoe_ts.png")
 
 
 if __name__ == "__main__":
