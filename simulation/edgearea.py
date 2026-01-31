@@ -694,6 +694,8 @@ class EdgeArea:
         
         va_cpu_utilization = used_cycles / (avail_cycles_per_ms * self.slot_ms)
 
+        va_cpu_utilization = used_cycles / (avail_cycles_per_ms * self.slot_ms)
+
         served_compute = int(sum(od_plan.values()))
         assert served_compute + int(dropped_compute) == int(served_req_uplink)
 
