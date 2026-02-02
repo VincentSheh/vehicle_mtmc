@@ -12,7 +12,7 @@ from torchrl.objectives import ClipPPOLoss
 from torchrl.objectives.value import GAE
 from torch.distributions import Categorical, Independent
 from environment import TorchRLEnvWrapper
-from torchrl.envs.transforms import ObservationNorm, TransformedEnv
+from torchrl.envs.transforms import ObservationNorm, VecNorm, TransformedEnv
 from logger import *
 
 
@@ -47,6 +47,8 @@ class ActorNet(nn.Module):
             nn.Tanh(),
             nn.Linear(hidden, hidden),
             nn.Tanh(),
+            nn.Linear(hidden, hidden),
+            nn.Tanh(),
             nn.Linear(hidden, n_actions),
         )
         self.apply(lambda m: orthogonal_init(m, gain=nn.init.calculate_gain("tanh")))
@@ -60,6 +62,8 @@ class CriticNet(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(obs_dim, hidden),
+            nn.Tanh(),
+            nn.Linear(hidden, hidden),
             nn.Tanh(),
             nn.Linear(hidden, hidden),
             nn.Tanh(),
@@ -90,15 +94,27 @@ def train(cfg_path="./configs/simulation_0.yaml", device="cpu"):
         decision_interval=decision_interval
     )
 
+    # env = TransformedEnv(
+    #     base_env,
+    #     VecNorm(
+    #         in_keys=["observation_flat"],
+    #         decay=0.99,
+    #         eps=1e-6,
+    #     ),        
+    # )
+    
     env = TransformedEnv(
         base_env,
-        ObservationNorm(
-            in_keys=["observation_flat"],
-            loc=0.0,
-            scale=1.0,
-            standard_normal=True,
-        ),
+        ObservationNorm(in_keys=["observation_flat"], standard_normal=True),
     )
+    # populate mean/std from rollouts
+    env.transform.init_stats(
+        num_iter=1000,     # bump if needed
+        reduce_dim=0,
+        cat_dim=0,
+    )
+
+    env.transform.eval()   # freeze normalization constants for training
     obs_size = env.n_edges * env.obs_dim
     action_dim = env.action_dim
 
@@ -142,7 +158,7 @@ def train(cfg_path="./configs/simulation_0.yaml", device="cpu"):
     )
     value = ValueOperator(value_module)
     
-    adv = GAE(gamma=0.95, lmbda=0.95, value_network=value)
+    adv = GAE(gamma=0.995, lmbda=0.95, value_network=value)
     adv.set_keys(
         value="state_value",
         advantage="advantage",
@@ -157,7 +173,7 @@ def train(cfg_path="./configs/simulation_0.yaml", device="cpu"):
         critic_network=value,
         clip_epsilon=0.2,
         entropy_bonus=True,
-        entropy_coef=1e-2,
+        entropy_coef=1e-3,
         critic_coef=1.0,
         loss_critic_type="smooth_l1",
     )
@@ -179,7 +195,7 @@ def train(cfg_path="./configs/simulation_0.yaml", device="cpu"):
 
     optim = torch.optim.Adam(
         list(actor_net.parameters()) + list(critic_net.parameters()),
-        lr=3e-4,
+        lr=1e-4,
     )
 
     ppo_epochs = 4
@@ -196,9 +212,9 @@ def train(cfg_path="./configs/simulation_0.yaml", device="cpu"):
     env.reset()
 
     for it, batch in enumerate(collector):
-        # print("logits[0]:", batch["logits"][:5].detach().cpu())
-        # print("action:", batch["action"][:5])
-        # safety checks
+        env.transform.eval() 
+        x = batch["observation_flat"]
+        print("obs_flat mean/std/min/max:", float(x.mean()), float(x.std()), float(x.min()), float(x.max()))
         assert_finite(batch, "BATCH")
         assert_finite(batch["next"], "NEXT")
 
@@ -243,7 +259,7 @@ def train(cfg_path="./configs/simulation_0.yaml", device="cpu"):
                 )
                 optim.step()
                 # after training update
-                qoe_score = float(batch["next", "reward"].mean().item())  # or your qoe_mean if you prefer
+            qoe_score = float(batch["next", "reward"].mean().item())  # or your qoe_mean if you prefer
 
         # periodic
         if (it + 1) % ckpt_every == 0:
@@ -322,7 +338,7 @@ def train(cfg_path="./configs/simulation_0.yaml", device="cpu"):
                 "loss/entropy": float(out.get("loss_entropy", torch.tensor(0.0, device=device)).detach().item()),
             },
         )
-
+        env.transform.train() 
         # stop once episode is finished
         if batch["done"].any():
             continue

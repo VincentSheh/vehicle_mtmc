@@ -44,7 +44,7 @@ class StepMetrics:
 
     # Requests (OD-only pipeline)
     local_num_req: int                  # served (after IDS + uplink + compute)
-    local_gt_num_req: int           # total incoming requests (pre-IDS)
+    ema_mom: float
 
     # IDS / attack
     ids_coverage: float
@@ -202,36 +202,14 @@ class Environment:
             edge.cpu_to_ids_ratio =  ai / edge.budget.cpu
 
             cache = edge.step_local(self.t)
-            # offload_states.append(state)
             local_cache[edge.area_id] = cache
-
-        # # 2) Cooperative OT offloading (global)
-        # offload_states, _, I_net = self.cooperative_offload_ot(offload_states)
 
         # 3) Final QoE computation per edge
         for edge in self.edge_areas:
             cache = local_cache[edge.area_id]
             
-            # state = next(s for s in offload_states if s.area_id == edge.area_id)
-            
-            # od_cycles = cache["best_od_cycles"]
-            # od_latency = od_cycles / max(1e-9, state.avail_cycles_aft_atk_per_ms)
-
-            # ot_cycles = state.local_q_obj * state.track_cycles_per_obj
-            # ot_latency = ot_cycles / max(1e-9, state.avail_cycles_aft_atk_per_ms)
-
-            # final_latency = od_latency + ot_latency
-
             D_Max = edge.constraints["D_Max"]
-            # MOTA_min = edge.constraints["MOTA_min"]
-            # gamma = edge.constraints["Gamma"]
-
-            # final_q = (cache["best_mean_mota"] - MOTA_min) * np.exp(
-            #     -gamma * (final_latency - D_Max)
-            # )
-            # final_q = cache["best_mean_mota"] if final_latency <= D_Max else 0
-
-            # local_gt_num_objects = cache["local_gt_num_object"]
+ 
             ids_out = cache["ids_out"]
             # I_net_e = I_net[state.idx]
             self.history.append(
@@ -247,7 +225,7 @@ class Environment:
                     
                     # RL Observation
                     local_num_req = cache["local_num_request"],
-                    local_gt_num_req = cache["local_gt_num_request"],
+                    ema_mom = cache["ema_mom"],
                     attack_drop_rate=float(ids_out.get("attack_drop_rate", 0.0)),
                     cpu_to_ids_ratio = edge.cpu_to_ids_ratio,
                     va_cpu_utilization = cache["va_cpu_utilization"],
@@ -301,7 +279,6 @@ def build_env_base(cfg_path: str):
                     slot_ms=globals_cfg.slot_ms,
                     t_max=cfg["run"]["t_max"],
                     seed=cfg["run"]["seed"],
-                    scaling=2.0,
                     synth_cfg=u["synthetic"],
                 )
             )
@@ -394,9 +371,9 @@ class TorchRLEnvWrapper(EnvBase):
 
         self.obs_keys = [
             "local_num_req",
-            # "local_gt_num_req",
-            "attack_drop_rate",
-            # "attack_in_rate",
+            # "attack_drop_rate",
+            "attack_in_rate",
+            "ema_mom",
             "cpu_to_ids_ratio",
             # "va_cpu_utilization",
             "ids_cpu_utilization",
@@ -549,7 +526,7 @@ class TorchRLEnvWrapper(EnvBase):
         )
         ids_cpu = self.ids_cpu.clone()
         # ids_cpu = [1.5]
-        print(action, delta, ids_cpu)
+        # print(action, delta, ids_cpu)
 
         total_reward = 0.0
         terminated_flag = False
@@ -628,8 +605,21 @@ class TorchRLEnvWrapper(EnvBase):
         last_block = self.env.history[-self.n_edges:]
         qoes = [float(m.qoe_mean) for m in last_block]
 
-        mean_qoe = float(np.mean(qoes))
-        reward = mean_qoe # if mean_qoe >= 0.2 else mean_qoe - 0.6
+        qoes = np.asarray(qoes, dtype=np.float32)
+
+        threshold = 0.2
+        alpha = 0.6  # max penalty strength
+
+        penalty = alpha * np.maximum(0.0, 1.0 - qoes / threshold)
+        qoes_adj = qoes - penalty
+
+        reward = float(qoes_adj.mean())
+
+        # qoes = np.array(qoes, dtype=float)
+        # qoes[qoes < 0.2] -= 0.6
+
+        # mean_qoe = float(qoes.mean())
+        # reward = mean_qoe
 
         return torch.tensor(
             [reward],
@@ -669,7 +659,7 @@ def test_environment_run(cfg_path: str, plot=False):
     )
 
     (
-        df.pivot(index="t", columns="area_id", values="local_gt_num_req")
+        df.pivot(index="t", columns="area_id", values="local_num_req")
         .plot(figsize=(10, 4), title="Num Request")
         .get_figure()
         .savefig(f"{out_dir}/local_num_req.png", bbox_inches="tight")
@@ -677,10 +667,10 @@ def test_environment_run(cfg_path: str, plot=False):
 
     # IDS coverage
     (
-        df.pivot(index="t", columns="area_id", values="ids_coverage")
-        .plot(figsize=(10, 4), title="IDS coverage")
+        df.pivot(index="t", columns="area_id", values="ema_mom")
+        .plot(figsize=(10, 4), title="EMA Momentum")
         .get_figure()
-        .savefig(f"{out_dir}/ids_coverage.png", bbox_inches="tight")
+        .savefig(f"{out_dir}/ema_mom.png", bbox_inches="tight")
     )
     
     # Attack in 

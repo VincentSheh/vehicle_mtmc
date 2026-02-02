@@ -1,6 +1,6 @@
 run:
   t_max: 15000
-  seed: 20
+  seed: 21
 
 eval:
   episode: 30
@@ -204,14 +204,13 @@ edge_areas:
         synthetic:
           rw_sigma_per_sqrt_sec: 0.8
           mu_min: 5.0
-          mu_max: 40.0
+          mu_max: 60.0
           kappa: 0.02
           sigma: 0.9
-          max_rate: 300.0
 
     attackers:
       - attacker_type: "atk_01"
-      - attacker_type: "atk_04"
+      # - attacker_type: "atk_04"
 
   # - area_id: "E2"
   #   cpu_cycle_per_ms: 3.8 #3.8GHz #3.8E6 / ms
