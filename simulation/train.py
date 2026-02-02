@@ -159,7 +159,7 @@ def train(cfg_path="./configs/simulation_0.yaml", device="cpu"):
     )
     value = ValueOperator(value_module)
     
-    adv = GAE(gamma=0.95, lmbda=0.95, value_network=value)
+    adv = GAE(gamma=0.995, lmbda=0.95, value_network=value)
     adv.set_keys(
         value="state_value",
         advantage="advantage",

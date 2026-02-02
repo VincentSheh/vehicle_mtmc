@@ -1,42 +1,42 @@
-# evaluate.py
-from __future__ import annotations
+# # evaluate.py
+# from __future__ import annotations
 
-import argparse
-import math
-from pathlib import Path
-from typing import Dict, List, Optional
+# import argparse
+# import math
+# from pathlib import Path
+# from typing import Dict, List, Optional
 
-import yaml
-import numpy as np
-import pandas as pd
-import torch
-import torch.nn as nn
-import matplotlib.pyplot as plt
+# import yaml
+# import numpy as np
+# import pandas as pd
+# import torch
+# import torch.nn as nn
+# import matplotlib.pyplot as plt
 
-from environment import build_env_base  # your project
-from train import ActorNet
-from tqdm import tqdm
+# from environment import build_env_base  # your project
+# from train import ActorNet
+# from tqdm import tqdm
 
 
-class RLPolicy:
-    def __init__(self, ckpt_path: str, obs_dim: int, device: str = "cpu", greedy: bool = True):
-        self.device = torch.device(device)
-        self.greedy = greedy
-        self.net = ActorNet(obs_dim=obs_dim, n_actions=3).to(self.device)
+# class RLPolicy:
+#     def __init__(self, ckpt_path: str, obs_dim: int, device: str = "cpu", greedy: bool = True):
+#         self.device = torch.device(device)
+#         self.greedy = greedy
+#         self.net = ActorNet(obs_dim=obs_dim, n_actions=3).to(self.device)
         
 
-        state = torch.load(ckpt_path, map_location=self.device)
-        self.obsnorm = state["obsnorm"]
-        if isinstance(state, dict) and "actor_net" in state:
-            self.net.load_state_dict(state["actor_net"])
-        elif isinstance(state, dict) and "state_dict" in state:
-            self.net.load_state_dict(state["state_dict"])
-        elif isinstance(state, dict):
-            self.net.load_state_dict(state)
-        else:
-            raise ValueError("Unsupported checkpoint format for RL actor.")
+#         state = torch.load(ckpt_path, map_location=self.device)
+#         self.obsnorm = state["obsnorm"]
+#         if isinstance(state, dict) and "actor_net" in state:
+#             self.net.load_state_dict(state["actor_net"])
+#         elif isinstance(state, dict) and "state_dict" in state:
+#             self.net.load_state_dict(state["state_dict"])
+#         elif isinstance(state, dict):
+#             self.net.load_state_dict(state)
+#         else:
+#             raise ValueError("Unsupported checkpoint format for RL actor.")
 
-        self.net.eval()
+#         self.net.eval()
         
     def normalize_obs(self, obs: np.ndarray) -> np.ndarray:
         if self.obsnorm is None:
@@ -251,49 +251,49 @@ def run_episode(
         "cpu_to_ids_ratio": np.array(cpu_to_ids_ratio_ts),
     }
         
-def plot_ts_continuous(results, outpath, slo_qoe_min: float = 0.0):
-    """
-    Plots 4 panels and annotates legend (QoE panel) with:
-      - avg QoE
-      - avg SLO violation rate (QoE < slo_qoe_min)
-    """
-    fig, axes = plt.subplots(4, 1, figsize=(9, 9), sharex=True)
+# def plot_ts_continuous(results, outpath, slo_qoe_min: float = 0.0):
+#     """
+#     Plots 4 panels and annotates legend (QoE panel) with:
+#       - avg QoE
+#       - avg SLO violation rate (QoE < slo_qoe_min)
+#     """
+#     fig, axes = plt.subplots(4, 1, figsize=(9, 9), sharex=True)
 
-    panels = [
-        ("qoe", "QoE"),
-        ("local_gt_num_req", "Local GT #Objects"),
-        ("attack_in_rate", "Attack in rate"),
-        ("cpu_to_ids_ratio", "CPU→IDS Ratio"),
-    ]
+#     panels = [
+#         ("qoe", "QoE"),
+#         ("local_gt_num_req", "Local GT #Objects"),
+#         ("attack_in_rate", "Attack in rate"),
+#         ("cpu_to_ids_ratio", "CPU→IDS Ratio"),
+#     ]
 
-    for ax, (k, ylabel) in zip(axes, panels):
-        for method, series in results.items():
-            y = series.get(k, None)
-            if y is None or y.size == 0:
-                continue
+#     for ax, (k, ylabel) in zip(axes, panels):
+#         for method, series in results.items():
+#             y = series.get(k, None)
+#             if y is None or y.size == 0:
+#                 continue
 
-            x = np.arange(len(y))
+#             x = np.arange(len(y))
 
-            # annotate only in QoE panel
-            if k == "qoe":
-                y_valid = y[np.isfinite(y)]
-                avg_qoe = float(np.nanmean(y_valid)) if y_valid.size else 0.0
-                vio = (y_valid < float(slo_qoe_min)).astype(np.float32)
-                vio_rate = float(np.nanmean(vio)) if y_valid.size else 0.0
-                label = f"{method} (avg={avg_qoe:.3f}, vio={vio_rate:.2%})"
-            else:
-                label = method
+#             # annotate only in QoE panel
+#             if k == "qoe":
+#                 y_valid = y[np.isfinite(y)]
+#                 avg_qoe = float(np.nanmean(y_valid)) if y_valid.size else 0.0
+#                 vio = (y_valid < float(slo_qoe_min)).astype(np.float32)
+#                 vio_rate = float(np.nanmean(vio)) if y_valid.size else 0.0
+#                 label = f"{method} (avg={avg_qoe:.3f}, vio={vio_rate:.2%})"
+#             else:
+#                 label = method
 
-            ax.plot(x, y, label=label)
+#             ax.plot(x, y, label=label)
 
-        ax.set_ylabel(ylabel)
-        ax.grid(True, alpha=0.3)
+#         ax.set_ylabel(ylabel)
+#         ax.grid(True, alpha=0.3)
 
-    axes[-1].set_xlabel("decision step")
-    axes[0].legend(loc="upper right")
-    plt.tight_layout()
-    plt.savefig(outpath, dpi=200)
-    plt.close()
+#     axes[-1].set_xlabel("decision step")
+#     axes[0].legend(loc="upper right")
+#     plt.tight_layout()
+#     plt.savefig(outpath, dpi=200)
+#     plt.close()
     
 # ----------------------------
 # Plot helper
