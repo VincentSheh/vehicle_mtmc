@@ -224,16 +224,13 @@ class EdgeArea:
     # --------------------------
 
     def _attack_df_at(self, t: int) -> pd.DataFrame:
-        atk_rows = [
-            atk.load_at(t)
-            for atk in self.cur_attacker
-            if not atk.load_at(t).empty
-        ]
+        rows = []
+        for atk in self.cur_attacker:
+            r = atk.load_at(t)  # dict or None
+            if r:
+                rows.append(r)
 
-        if not atk_rows:
-            return pd.DataFrame()
-
-        return pd.concat(atk_rows, ignore_index=True)
+        return pd.DataFrame.from_records(rows) if rows else pd.DataFrame()
 
     def aggregate_load_after_ids(self, t: int) -> Dict[str, float]:
         """
@@ -617,6 +614,7 @@ class EdgeArea:
         
         attack_uplink_in = 0.0
         attack_cycles_per_ms = 0.0
+        attack_mom = 0.0
         for _, row in attack_df.iterrows():
             attacker_id = row.get("attacker_id")
             attacker = next(a for a in self.cur_attacker if a.attacker_id == attacker_id)
@@ -626,6 +624,7 @@ class EdgeArea:
             attack_uplink_in += flows_i * bw_per_flow * atk_pass_frac
             cpu_per_flow = attacker.cycle_per_flow
             attack_cycles_per_ms += flows_i * cpu_per_flow * atk_pass_frac / 1000.0            
+            attack_mom = row["flows_per_sec_ema_mom"]
 
         uplink_total_mb = self.budget.uplink / (1000.0 / self.slot_ms)
 
@@ -643,7 +642,7 @@ class EdgeArea:
             cache = {
                 "ids_out": ids_out,
                 "local_num_request": local_num_request,
-                "local_gt_num_request": local_num_request,
+                "ema_mom": attack_mom,
                 "dropped_uplink": int(total_req_in),
                 "od_plan": {},
                 "served_req": 0,
@@ -703,11 +702,10 @@ class EdgeArea:
             qoe = 1.0
         else:
             qoe =  qoe * (served_compute / total_req_in)
-            
         cache = {
             "ids_out": ids_out,
             "local_num_request": local_num_request,
-            "local_gt_num_request": local_num_request,
+            "ema_mom": attack_mom,
             "dropped_uplink": int(dropped_uplink),
             "od_plan": od_plan,  # {det: n_req}
             "served_req": int(served_compute),

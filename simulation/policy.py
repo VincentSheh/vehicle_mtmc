@@ -153,7 +153,7 @@ def run_episode(
     env = build_env_base(cfg_path)
 
     # per-episode randomness
-    env.reset()
+    env.reset(seed)
     for i, edge in enumerate(env.edge_areas):
         edge.cpu_to_ids_ratio = 0.5
         if hasattr(edge, "reset"):
@@ -318,7 +318,8 @@ def main():
     ap.add_argument("--ids_cpu_min", type=float, default=0.5)
     ap.add_argument("--constant_ids_cpu", type=float, default=0.5)
 
-    ap.add_argument("--rl_ckpt", type=str, default="checkpoints/ppo_simulation_0/ckpt_baseline_000800.pt")
+    # ap.add_argument("--rl_ckpt", type=str, default="checkpoints/ppo_simulation_0/ckpt_baseline_000800.pt")
+    ap.add_argument("--rl_ckpt", type=str, default="checkpoints/ppo_simulation_0/ckpt_ema_000900.pt")
     ap.add_argument("--rl_device", type=str, default="cuda")
     ap.add_argument("--rl_greedy", action="store_true")
 
@@ -334,9 +335,14 @@ def main():
 
     obs_keys = [
         "local_num_req",
-        "attack_drop_rate",
+        # "attack_drop_rate",
+        "attack_in_rate",
+        "ema_mom",
         "cpu_to_ids_ratio",
-        "bw_utilization",
+        # "va_cpu_utilization",
+        "ids_cpu_utilization",
+        # "bw_utilization",
+        # "I_net",
     ]
     obs_dim = len(obs_keys)
 
@@ -349,8 +355,8 @@ def main():
             greedy=args.rl_greedy,
         )
 
-    # methods = ["rl", "random", "constant", "reactive"]
-    methods = ["constant_0.5", "constant_1.5", "constant_2.5", "constant_4.0", "constant_6.0"]
+    methods = ["rl", "random", "constant_0.5", "reactive"]
+    # methods = ["constant_0.5", "constant_1.5", "constant_2.5", "constant_4.0", "constant_6.0"]
     # methods = ["constant_0.5"]
     results: Dict[str, Dict[str, np.ndarray]] = {
         m: {

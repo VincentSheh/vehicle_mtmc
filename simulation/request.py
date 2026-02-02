@@ -5,6 +5,7 @@ from typing import Dict, Tuple, Union
 import re
 from dataclasses import dataclass
 from typing import Optional, Union
+import math
 
 class Attacker:
     """
@@ -83,9 +84,29 @@ class Attacker:
                 f"Attack trace longer than episode: "
                 f"{trace_len_steps} > {t_max}"
             )     
+            
+        # -----------------------------
+        # Precompute EMA and momentum on the trace timeline
+        # -----------------------------
+        hl = float(50.0)
+        ema_col = "flows_per_sec"
+        if hl <= 0:
+            # degenerate: EMA = signal, momentum = diff(signal)
+            ema = self.df[ema_col].astype(float)
+        else:
+            alpha = 1.0 - math.exp(math.log(0.5) / hl)
+            ema = self.df[ema_col].astype(float).ewm(alpha=alpha, adjust=False).mean()
+
+        self.df[f"{ema_col}_ema"] = ema
+        self.df[f"{ema_col}_ema_mom"] = self.df[f"{ema_col}_ema"].diff().fillna(0.0)            
+        
+        self._flows = self.df["flows_per_sec"].to_numpy(dtype=np.float32)
+        self._flows_ema_mom = self.df["flows_per_sec_ema_mom"].to_numpy(dtype=np.float32)
+                
         self.base_seed = seed
         self.rng = np.random.default_rng(seed)
         self._init_start()
+        
     def _init_start(self):
         trace_len_steps = len(self.df) * self.steps_per_sec
         max_start = self.t_max - trace_len_steps
@@ -96,20 +117,22 @@ class Attacker:
             self.rng = np.random.default_rng(seed)
         self._init_start()        
 
-    def load_at(self, t: int) -> pd.DataFrame:
-        """
-        Map step t → second index in attack trace.
-        """
+
+    def load_at(self, t: int):
         local_step = t - self.start
         if local_step < 0:
-            return pd.DataFrame(columns=self.df.columns)
-
+            return None
         sec_idx = local_step // self.steps_per_sec
-        if sec_idx >= len(self.df):
-            return pd.DataFrame(columns=self.df.columns)
+        if sec_idx < 0 or sec_idx >= self._flows.shape[0]:
+            return None
 
-        return self.df.iloc[[sec_idx]].copy()
-
+        # return a compact payload
+        return {
+            "attacker_id": self.attacker_id,
+            "attack_type": self.attack_type,
+            "flows_per_sec": float(self._flows[sec_idx]),
+            "flows_per_sec_ema_mom": float(self._flows_ema_mom[sec_idx]),
+        }
 
 
 class User:
@@ -124,14 +147,12 @@ class User:
         slot_ms: float,
         t_max: int,
         seed: int = 0,
-        scaling: float = 1.0,
         arrival_col: str = "num_objects",   # rename later if you want
         synth_cfg=None,
     ):
         self.user_id = str(user_id)
         self.slot_ms = float(slot_ms)
         self.t_max = int(t_max)
-        self.scaling = float(scaling)
         self.base_seed = int(seed)
         self.rng = np.random.default_rng(self.base_seed)
 
@@ -157,7 +178,7 @@ class User:
             sigma=cfg["sigma"],
         )
 
-        per_step = np.maximum(df["num_requests_per_step"].to_numpy(dtype=float) * self.scaling, 0.0)
+        per_step = np.maximum(df["num_requests_per_step"].to_numpy(dtype=int), 0.0)
 
         self.df = pd.DataFrame(
             {
@@ -166,10 +187,12 @@ class User:
                 "num_requests_per_step": per_step,
                 "mu0": df["mu0"].to_numpy(dtype=float),
                 "mu_t": df["mu_t"].to_numpy(dtype=float),
-                "req_per_sec": df["req_per_sec"].to_numpy(dtype=float),
-                "req_per_step_expected": df["req_per_step_expected"].to_numpy(dtype=float) * self.scaling,
+                "req_per_sec": df["req_per_sec"].to_numpy(dtype=int),
+                "req_per_step_expected": df["req_per_step_expected"].to_numpy(dtype=float),
             }
         )
+        self._req = self.df["num_requests_per_step"].to_numpy(dtype=np.int32)
+        
 
     def generate_req_trace(
         self,
@@ -209,7 +232,7 @@ class User:
             req_per_sec[t] = x
 
         # convert per-second rate to per-step expectation
-        req_per_step_expected = req_per_sec * dt
+        req_per_step_expected = req_per_sec
         req_per_step = np.maximum(req_per_step_expected, 0.0)
 
         df = pd.DataFrame(
@@ -231,16 +254,16 @@ class User:
             self.rng = np.random.default_rng(self.base_seed)
         self._init_from_synthetic()
 
-    def load_at(self, t: int) -> pd.DataFrame:
-        local_step = int(t)
-        if local_step < 0:
-            return pd.DataFrame(columns=self.df.columns.tolist())
+    def load_at(self, t: int):
+        if t < 0 or t >= self._req.shape[0]:
+            return None
+        return {
+            "user_id": self.user_id,
+            "num_requests_per_step": int(self._req[t]),
+        }
 
-        return self.df.iloc[[local_step]].copy()
-
-    def num_requests_at(self, t: int) -> float:
-        # direct per-step lookup
-        if t < 0 or t >= len(self.df):
-            return 0.0
-        return float(self.df.iloc[int(t)]["num_requests_per_step"])
+    def num_requests_at(self, t: int) -> int:
+        if t < 0 or t >= self._req.shape[0]:
+            return 0
+        return int(self._req[t])
 
