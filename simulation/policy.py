@@ -1,71 +1,85 @@
-# # evaluate.py
-# from __future__ import annotations
+# evaluate.py
+from __future__ import annotations
 
-# import argparse
-# import math
-# from pathlib import Path
-# from typing import Dict, List, Optional
+import argparse
+import math
+from pathlib import Path
+from typing import Dict, List, Optional
 
-# import yaml
-# import numpy as np
-# import pandas as pd
-# import torch
-# import torch.nn as nn
-# import matplotlib.pyplot as plt
+import yaml
+import numpy as np
+import pandas as pd
+import torch
+import matplotlib.pyplot as plt
 
-# from environment import build_env_base  # your project
-# from train import ActorNet
-# from tqdm import tqdm
+from environment import build_env_base  # your project
+from train import ActorNet
+from tqdm import tqdm
 
 
-# class RLPolicy:
-#     def __init__(self, ckpt_path: str, obs_dim: int, device: str = "cpu", greedy: bool = True):
-#         self.device = torch.device(device)
-#         self.greedy = greedy
-#         self.net = ActorNet(obs_dim=obs_dim, n_actions=3).to(self.device)
-        
+class RLPolicy:
+    def __init__(self, ckpt_path: str, obs_size: int, device: str = "cpu", greedy: bool = True):
+        self.device = torch.device(device)
+        self.greedy = greedy
 
-#         state = torch.load(ckpt_path, map_location=self.device)
-#         self.obsnorm = state["obsnorm"]
-#         if isinstance(state, dict) and "actor_net" in state:
-#             self.net.load_state_dict(state["actor_net"])
-#         elif isinstance(state, dict) and "state_dict" in state:
-#             self.net.load_state_dict(state["state_dict"])
-#         elif isinstance(state, dict):
-#             self.net.load_state_dict(state)
-#         else:
-#             raise ValueError("Unsupported checkpoint format for RL actor.")
+        # IMPORTANT: obs_size = n_edges * obs_dim (matches training)
+        self.net = ActorNet(obs_dim=obs_size, n_actions=3).to(self.device)
 
-#         self.net.eval()
-        
-    def normalize_obs(self, obs: np.ndarray) -> np.ndarray:
+        state = torch.load(ckpt_path, map_location=self.device)
+        self.obsnorm = state.get("obsnorm", None)
+
+        if isinstance(state, dict) and "actor_net" in state:
+            self.net.load_state_dict(state["actor_net"])
+        elif isinstance(state, dict) and "state_dict" in state:
+            self.net.load_state_dict(state["state_dict"])
+        elif isinstance(state, dict):
+            self.net.load_state_dict(state)
+        else:
+            raise ValueError("Unsupported checkpoint format for RL actor.")
+
+        self.net.eval()
+
+    def normalize_obs_flat(self, obs_flat: np.ndarray) -> np.ndarray:
+        """
+        obs_flat: (obs_size,)
+        """
         if self.obsnorm is None:
-            return obs
+            return obs_flat
+
+        # ObservationNorm state_dict usually contains loc/scale for the in_keys tensor
         loc = self.obsnorm["loc"].detach().cpu().numpy()
         scale = self.obsnorm["scale"].detach().cpu().numpy()
-        return (obs - loc) / (scale + 1e-8)        
+
+        # handle possible extra dims
+        loc = loc.reshape(-1)
+        scale = scale.reshape(-1)
+
+        return (obs_flat - loc) / (scale + 1e-8)
 
     @torch.no_grad()
-    def act(self, obs: np.ndarray) -> np.ndarray:
+    def act_from_obs_flat(self, obs_flat: np.ndarray) -> np.ndarray:
         """
-        obs: (n_edges, obs_dim)
-        returns action per edge in {-1,0,+1} as np.int64
+        obs_flat: (obs_size,)
+        returns delta array shape (n_edges,) in {-1,0,+1}
+        for n_edges=1 it returns shape (1,)
         """
-        x = torch.from_numpy(obs).to(self.device)
-        logits = self.net(x)
+        x = torch.from_numpy(obs_flat.astype(np.float32)).to(self.device)
+        logits = self.net(x)                  # (3,) if obs_flat is (obs_size,)
         probs = torch.softmax(logits, dim=-1)
+
         if self.greedy:
             a = torch.argmax(probs, dim=-1)
         else:
             a = torch.multinomial(probs, num_samples=1).squeeze(-1)
-        delta = (a.to(torch.int64) - 1).detach().cpu().numpy()
-        return delta
+
+        delta = int(a.item()) - 1
+        return np.array([delta], dtype=np.int64)
 
 
-# ----------------------------
-# Observation builder (match your wrapper logic)
-# ----------------------------
 def build_observation_from_history(env, decision_interval: int, obs_keys: List[str]) -> np.ndarray:
+    """
+    Returns obs shaped (n_edges, obs_dim)
+    """
     n_edges = len(env.edge_areas)
     obs_dim = len(obs_keys)
     obs = np.zeros((n_edges, obs_dim), dtype=np.float32)
@@ -82,6 +96,8 @@ def build_observation_from_history(env, decision_interval: int, obs_keys: List[s
         if g.empty:
             continue
         for j, k in enumerate(obs_keys):
+            if k not in g.columns:
+                continue
             vals = g[k].values
             if k == "I_net":
                 obs[i, j] = float(np.sum(vals))
@@ -101,10 +117,6 @@ def decision_qoe_mean(env, decision_interval: int) -> float:
 
 
 def decision_cpu_util(env, decision_interval: int) -> float:
-    """
-    Reactive trigger signal based ONLY on IDS CPU utilization.
-    Take max across edges (worst-case).
-    """
     n_edges = len(env.edge_areas)
     if len(env.history) < decision_interval * n_edges:
         return 0.0
@@ -113,24 +125,18 @@ def decision_cpu_util(env, decision_interval: int) -> float:
     df = pd.DataFrame([m.__dict__ for m in block])
 
     utils = []
-    attack_in_rate_ts = []
-    local_gt_num_req_ts = []    
     for area_id in [e.area_id for e in env.edge_areas]:
         g = df[df["area_id"] == area_id]
-        if g.empty or "ids_cpu_utilization" not in g:
+        if g.empty:
             continue
-
+        if "ids_cpu_utilization" not in g.columns:
+            continue
         ids_util = float(np.mean(g["ids_cpu_utilization"].values))
         utils.append(float(np.clip(ids_util, 0.0, 1.0)))
-        attack_in_rate_ts.append(float(df["attack_in_rate"].mean()) if "attack_in_rate" in df else 0.0)
-        local_gt_num_req_ts.append(float(df["local_gt_num_req"].mean()) if "local_gt_num_req" in df else 0.0)        
 
     return float(max(utils)) if utils else 0.0
 
 
-# ----------------------------
-# Methods
-# ----------------------------
 def apply_delta(ids_cpu: np.ndarray, delta: np.ndarray, scale_step: float, ids_cpu_min: float, ids_cpu_max: np.ndarray) -> np.ndarray:
     out = ids_cpu + delta.astype(np.float32) * float(scale_step)
     out = np.maximum(out, ids_cpu_min)
@@ -146,18 +152,18 @@ def run_episode(
     obs_keys: List[str],
     scale_step: float,
     ids_cpu_min: float,
-    constant_ids_cpu: Optional[float],
     seed: int,
     rl_policy: Optional[RLPolicy],
-) -> np.ndarray:
+) -> Dict[str, np.ndarray]:
     env = build_env_base(cfg_path)
 
-    # per-episode randomness
+    # your Environment.reset(seed) signature
     env.reset(seed)
+
+    # stabilize initial ratio
     for i, edge in enumerate(env.edge_areas):
         edge.cpu_to_ids_ratio = 0.5
-        if hasattr(edge, "reset"):
-            edge.reset(seed=seed + 100 * i)
+        edge.reset(seed=seed + 100 * i)
 
     rng = np.random.default_rng(seed)
 
@@ -168,18 +174,13 @@ def run_episode(
     ids_cpu = np.array([e.cpu_to_ids_ratio * e.budget.cpu for e in env.edge_areas], dtype=np.float32)
     ids_cpu = np.clip(ids_cpu, ids_cpu_min, ids_cpu_max)
 
-    if constant_ids_cpu is not None:
-        ids_cpu = np.clip(np.full(n_edges, float(constant_ids_cpu), dtype=np.float32), ids_cpu_min, ids_cpu_max)
-
     decisions = math.ceil(t_max / decision_interval)
-    qoes: List[float] = []
+
     qoe_ts = []
     cpu_util_ts = []
-    local_num_obj_ts = []
-    cpu_to_ids_ratio_ts = []
-
-    local_gt_num_obj_ts = []
+    local_num_req_ts = []
     attack_in_rate_ts = []
+    cpu_to_ids_ratio_ts = []
 
     for _k in range(decisions):
         if env.t >= env.t_max:
@@ -190,15 +191,13 @@ def run_episode(
 
         # ---------- policy ----------
         if method.startswith("constant_"):
-            try:
-                constant_cpu = float(method.split("_", 1)[1])
-            except ValueError:
-                raise ValueError(f"Invalid constant method format: {method}")
-
-            ids_cpu = constant_cpu
+            constant_cpu = float(method.split("_", 1)[1])
+            ids_cpu = np.clip(np.full(n_edges, constant_cpu, dtype=np.float32), ids_cpu_min, ids_cpu_max)
             delta = np.zeros(n_edges, dtype=np.int64)
+
         elif method == "random":
             delta = rng.integers(-1, 2, size=n_edges, dtype=np.int64)
+
         elif method == "reactive":
             if cpu_util >= 0.80:
                 delta = np.ones(n_edges, dtype=np.int64)
@@ -206,10 +205,17 @@ def run_episode(
                 delta = -np.ones(n_edges, dtype=np.int64)
             else:
                 delta = np.zeros(n_edges, dtype=np.int64)
+
         elif method == "rl":
+            if rl_policy is None:
+                raise ValueError("rl_policy is None but method == 'rl'")
+
+            obs_flat = obs.reshape(-1).astype(np.float32)
             if rl_policy.obsnorm is not None:
-                obs = rl_policy.normalize_obs(obs)            
-            delta = rl_policy.act(obs)
+                obs_flat = rl_policy.normalize_obs_flat(obs_flat)
+
+            delta = rl_policy.act_from_obs_flat(obs_flat)
+
         else:
             raise ValueError(method)
 
@@ -228,95 +234,109 @@ def run_episode(
 
         qoe_ts.append(qoe)
         cpu_util_ts.append(cpu_util)
-        local_num_obj_ts.append(df["local_num_req"].mean())
-        cpu_to_ids_ratio_ts.append(df["cpu_to_ids_ratio"].mean())
 
-        # new metrics
-        if "local_gt_num_req" in df.columns:
-            local_gt_num_obj_ts.append(df["local_gt_num_req"].mean())
-        else:
-            local_gt_num_obj_ts.append(0.0)
-
-        if "attack_in_rate" in df.columns:
-            attack_in_rate_ts.append(df["attack_in_rate"].mean())
-        else:
-            attack_in_rate_ts.append(0.0)
+        local_num_req_ts.append(float(df["local_num_req"].mean()) if "local_num_req" in df.columns else 0.0)
+        attack_in_rate_ts.append(float(df["attack_in_rate"].mean()) if "attack_in_rate" in df.columns else 0.0)
+        cpu_to_ids_ratio_ts.append(float(df["cpu_to_ids_ratio"].mean()) if "cpu_to_ids_ratio" in df.columns else 0.0)
 
     return {
-        "qoe": np.array(qoe_ts),
-        "cpu_util": np.array(cpu_util_ts),
-        "local_num_req": np.array(local_num_obj_ts),
-        "local_gt_num_req": np.array(local_gt_num_obj_ts),
-        "attack_in_rate": np.array(attack_in_rate_ts),
-        "cpu_to_ids_ratio": np.array(cpu_to_ids_ratio_ts),
+        "qoe": np.asarray(qoe_ts, dtype=np.float32),
+        "cpu_util": np.asarray(cpu_util_ts, dtype=np.float32),
+        "local_num_req": np.asarray(local_num_req_ts, dtype=np.float32),
+        "attack_in_rate": np.asarray(attack_in_rate_ts, dtype=np.float32),
+        "cpu_to_ids_ratio": np.asarray(cpu_to_ids_ratio_ts, dtype=np.float32),
     }
-        
-# def plot_ts_continuous(results, outpath, slo_qoe_min: float = 0.0):
-#     """
-#     Plots 4 panels and annotates legend (QoE panel) with:
-#       - avg QoE
-#       - avg SLO violation rate (QoE < slo_qoe_min)
-#     """
-#     fig, axes = plt.subplots(4, 1, figsize=(9, 9), sharex=True)
 
-#     panels = [
-#         ("qoe", "QoE"),
-#         ("local_gt_num_req", "Local GT #Objects"),
-#         ("attack_in_rate", "Attack in rate"),
-#         ("cpu_to_ids_ratio", "CPU→IDS Ratio"),
-#     ]
 
-#     for ax, (k, ylabel) in zip(axes, panels):
-#         for method, series in results.items():
-#             y = series.get(k, None)
-#             if y is None or y.size == 0:
-#                 continue
+def plot_ts_continuous(results: Dict[str, Dict[str, np.ndarray]], outpath: Path, slo_qoe_min: float = 0.2):
+    fig, axes = plt.subplots(4, 1, figsize=(9, 9), sharex=True)
 
-#             x = np.arange(len(y))
+    panels = [
+        ("qoe", "QoE"),
+        ("local_num_req", "Local #Req"),
+        ("attack_in_rate", "Attack in rate"),
+        ("cpu_to_ids_ratio", "CPU→IDS Ratio"),
+    ]
 
-#             # annotate only in QoE panel
-#             if k == "qoe":
-#                 y_valid = y[np.isfinite(y)]
-#                 avg_qoe = float(np.nanmean(y_valid)) if y_valid.size else 0.0
-#                 vio = (y_valid < float(slo_qoe_min)).astype(np.float32)
-#                 vio_rate = float(np.nanmean(vio)) if y_valid.size else 0.0
-#                 label = f"{method} (avg={avg_qoe:.3f}, vio={vio_rate:.2%})"
-#             else:
-#                 label = method
+    for ax, (k, ylabel) in zip(axes, panels):
+        for method, series in results.items():
+            y = series.get(k, None)
+            if y is None or y.size == 0:
+                continue
 
-#             ax.plot(x, y, label=label)
+            x = np.arange(len(y))
 
-#         ax.set_ylabel(ylabel)
-#         ax.grid(True, alpha=0.3)
+            if k == "qoe":
+                y_valid = y[np.isfinite(y)]
+                avg_qoe = float(np.nanmean(y_valid)) if y_valid.size else 0.0
+                vio_rate = float(np.nanmean((y_valid < float(slo_qoe_min)).astype(np.float32))) if y_valid.size else 0.0
+                label = f"{method} (avg={avg_qoe:.3f}, vio={vio_rate:.2%})"
+            else:
+                label = method
 
-#     axes[-1].set_xlabel("decision step")
-#     axes[0].legend(loc="upper right")
-#     plt.tight_layout()
-#     plt.savefig(outpath, dpi=200)
-#     plt.close()
-    
-# ----------------------------
-# Plot helper
-# ----------------------------
-def pad_to_max(arrs: List[np.ndarray]) -> np.ndarray:
-    if not arrs:
-        return np.zeros((0, 0), dtype=np.float32)
-    L = max(a.shape[0] for a in arrs)
-    out = np.full((len(arrs), L), np.nan, dtype=np.float32)
-    for i, a in enumerate(arrs):
-        out[i, : a.shape[0]] = a
-    return out
+            ax.plot(x, y, label=label)
+
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.3)
+
+    axes[-1].set_xlabel("decision step")
+    axes[0].legend(loc="upper right")
+    plt.tight_layout()
+    plt.savefig(outpath, dpi=200)
+    plt.close()
+
+
+def plot_qoe_vio_bars(results: Dict[str, Dict[str, np.ndarray]], outpath: Path, qoe_slo_min: float = 0.2):
+    methods, avg_qoe, vio_rate = [], [], []
+
+    for method, series in results.items():
+        qoe = series.get("qoe", None)
+        if qoe is None or qoe.size == 0:
+            continue
+        q = qoe[np.isfinite(qoe)]
+        methods.append(method)
+        avg_qoe.append(float(np.nanmean(q)) if q.size else 0.0)
+        vio_rate.append(float(np.nanmean((q < qoe_slo_min).astype(np.float32))) if q.size else 0.0)
+
+    x = np.arange(len(methods))
+    width = 0.7
+
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+
+    bars_qoe = axes[0].bar(x, avg_qoe, width)
+    axes[0].set_xticks(x)
+    axes[0].set_xticklabels(methods, rotation=20, ha="right")
+    axes[0].set_ylabel("Average QoE")
+    axes[0].set_title("Average QoE")
+    axes[0].grid(axis="y", alpha=0.3)
+    for bar in bars_qoe:
+        h = float(bar.get_height())
+        axes[0].text(bar.get_x() + bar.get_width() / 2, h, f"{h:.3f}", ha="center", va="bottom", fontsize=9)
+
+    bars_vio = axes[1].bar(x, vio_rate, width)
+    axes[1].set_xticks(x)
+    axes[1].set_xticklabels(methods, rotation=20, ha="right")
+    axes[1].set_ylabel("Violation Rate")
+    axes[1].set_ylim(0.0, 1.0)
+    axes[1].set_title(f"SLO Violations (QoE < {qoe_slo_min})")
+    axes[1].grid(axis="y", alpha=0.3)
+    for bar in bars_vio:
+        h = float(bar.get_height())
+        axes[1].text(bar.get_x() + bar.get_width() / 2, h, f"{h:.1%}", ha="center", va="bottom", fontsize=9)
+
+    plt.tight_layout()
+    plt.savefig(outpath, dpi=200)
+    plt.close()
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cfg", type=str, required=True)
     ap.add_argument("--outdir", type=str, default="eval_out")
-    ap.add_argument("--episodes", type=int, default=2)
+    ap.add_argument("--episodes", type=int, default=10)
     ap.add_argument("--decision_interval", type=int, default=500)
     ap.add_argument("--scale_step", type=float, default=0.5)
     ap.add_argument("--ids_cpu_min", type=float, default=0.5)
-    ap.add_argument("--constant_ids_cpu", type=float, default=0.5)
 
     # ap.add_argument("--rl_ckpt", type=str, default="checkpoints/ppo_simulation_0/ckpt_baseline_000800.pt")
     ap.add_argument("--rl_ckpt", type=str, default="checkpoints/ppo_simulation_0/ckpt_ema_000900.pt")
@@ -335,46 +355,44 @@ def main():
 
     obs_keys = [
         "local_num_req",
-        # "attack_drop_rate",
         "attack_in_rate",
         "ema_mom",
         "cpu_to_ids_ratio",
-        # "va_cpu_utilization",
         "ids_cpu_utilization",
-        # "bw_utilization",
-        # "I_net",
     ]
     obs_dim = len(obs_keys)
 
+    # compute obs_size exactly like training: n_edges * obs_dim
+    tmp_env = build_env_base(args.cfg)
+    n_edges = len(tmp_env.edge_areas)
+    obs_size = n_edges * obs_dim
+
     rl_policy = None
-    if args.rl_ckpt is not None:
+    if args.rl_ckpt:
         rl_policy = RLPolicy(
             ckpt_path=args.rl_ckpt,
-            obs_dim=obs_dim,
+            obs_size=obs_size,
             device=args.rl_device,
             greedy=args.rl_greedy,
         )
 
-    methods = ["rl", "random", "constant_0.5", "reactive"]
-    # methods = ["constant_0.5", "constant_1.5", "constant_2.5", "constant_4.0", "constant_6.0"]
-    # methods = ["constant_0.5"]
-    results: Dict[str, Dict[str, np.ndarray]] = {
-        m: {
+    methods = ["random", "constant_0.5", "reactive"]
+    if rl_policy is not None:
+        methods = ["rl"] + methods
+
+    results: Dict[str, Dict[str, np.ndarray]] = {m: {} for m in methods}
+    for m in methods:
+        results[m] = {
             "qoe": np.array([], dtype=np.float32),
             "cpu_util": np.array([], dtype=np.float32),
             "local_num_req": np.array([], dtype=np.float32),
-            "local_gt_num_req": np.array([], dtype=np.float32),
             "attack_in_rate": np.array([], dtype=np.float32),
             "cpu_to_ids_ratio": np.array([], dtype=np.float32),
         }
-        for m in methods
-    }
 
     for ep in tqdm(range(args.episodes)):
         ep_seed = base_seed + ep * 1000
         for m in methods:
-            if m == "rl" and rl_policy is None:
-                continue
             q = run_episode(
                 cfg=cfg,
                 cfg_path=args.cfg,
@@ -383,16 +401,14 @@ def main():
                 obs_keys=obs_keys,
                 scale_step=args.scale_step,
                 ids_cpu_min=args.ids_cpu_min,
-                constant_ids_cpu=args.constant_ids_cpu,
                 seed=ep_seed,
-                rl_policy=rl_policy,
+                rl_policy=rl_policy if m == "rl" else None,
             )
+            for k, v in q.items():
+                results[m][k] = np.concatenate([results[m][k], v])
 
-            for k in results[m].keys():
-                results[m][k] = np.concatenate([results[m][k], q[k]])
-
-
-    plot_ts_continuous(results, outdir / "qoe_ts.png")
+    plot_ts_continuous(results, outdir / "qoe_ts.png", slo_qoe_min=0.2)
+    plot_qoe_vio_bars(results, outdir / "summary.png", qoe_slo_min=0.2)
 
 
 if __name__ == "__main__":

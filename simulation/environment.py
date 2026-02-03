@@ -543,7 +543,7 @@ class TorchRLEnvWrapper(EnvBase):
 
         reward = torch.tensor([
             total_reward 
-            # / max(1, steps)
+            / max(1, steps)
             ], dtype=torch.float32, device=self.device)
 
         # 3) Build aggregated outputs
@@ -604,7 +604,7 @@ class TorchRLEnvWrapper(EnvBase):
 
         qoes = np.asarray(qoes, dtype=np.float32)
 
-        threshold = 0.2
+        threshold = 0.35
         alpha = 0.6  # max penalty strength
         
         penalty = alpha * (np.maximum(0.0, threshold - qoes) / threshold) ** 2        
