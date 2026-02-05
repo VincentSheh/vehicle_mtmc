@@ -24,7 +24,6 @@ class Attacker:
         latency_per_flow,
         bw_per_flow,
         non_defendable_bw_const,
-        scaling,
         slot_ms,
         t_max,
         seed,
@@ -46,8 +45,8 @@ class Attacker:
         self.df = ts_df.reset_index(drop=True).copy()
         self.df["attack_type"] = attack_type 
         self.df["attacker_id"] = attacker_id 
-        self.df["forward_bytes_per_sec"] = self.df["forward_bytes_per_sec"] / (1024*1024) * scaling
-        self.df["flows_per_sec"] = self.df["flows_per_sec"] * scaling
+        self.df["forward_bytes_per_sec"] = self.df["forward_bytes_per_sec"] / (1024*1024)
+        self.df["flows_per_sec"] = self.df["flows_per_sec"]
 
         required = {
             "forward_packets_per_sec",
@@ -66,7 +65,6 @@ class Attacker:
             "forward_bytes_per_sec",
         ):
             self.df[col] *= step_scale        
-            self.df[col] *= scaling        
 
         # -----------------------------
         # Unit conversions
@@ -84,7 +82,16 @@ class Attacker:
                 f"Attack trace longer than episode: "
                 f"{trace_len_steps} > {t_max}"
             )     
-            
+        pad_sec = 1000
+        pad_df = pd.DataFrame({
+            "flows_per_sec": np.zeros(pad_sec, dtype=np.float32),
+            "forward_packets_per_sec": np.zeros(pad_sec, dtype=np.float32),
+            "forward_bytes_per_sec": np.zeros(pad_sec, dtype=np.float32),
+            "attack_type": self.attack_type,
+            "attacker_id": self.attacker_id,
+        })
+
+        self.df = pd.concat([self.df, pad_df], ignore_index=True)            
         # -----------------------------
         # Precompute EMA and momentum on the trace timeline
         # -----------------------------
@@ -97,11 +104,16 @@ class Attacker:
             alpha = 1.0 - math.exp(math.log(0.5) / hl)
             ema = self.df[ema_col].astype(float).ewm(alpha=alpha, adjust=False).mean()
 
-        self.df[f"{ema_col}_ema"] = ema
-        self.df[f"{ema_col}_ema_mom"] = self.df[f"{ema_col}_ema"].diff().fillna(0.0)            
-        
+        self.df["flows_per_sec_ema"] = ema
+        self.df["flows_per_sec_ema_mom"] = self.df[f"flows_per_sec_ema"].diff().fillna(0.0)
+        # self.df["flows_per_sec_ema_mom"] = self.df[f"flows_per_sec_ema"].diff(hl).fillna(0.0) / (hl)          
+        mom_raw = self.df["flows_per_sec_ema"].diff().fillna(0.0)
+        self.df["flows_per_sec_ema_mom"] = mom_raw.ewm(alpha=alpha, adjust=False).mean()        
+        self.df.to_csv("test.csv")        
         self._flows = self.df["flows_per_sec"].to_numpy(dtype=np.float32)
+        self._flows_ema = self.df["flows_per_sec_ema"].to_numpy(dtype=np.float32)
         self._flows_ema_mom = self.df["flows_per_sec_ema_mom"].to_numpy(dtype=np.float32)
+
                 
         self.base_seed = seed
         self.rng = np.random.default_rng(seed)
@@ -111,6 +123,7 @@ class Attacker:
         trace_len_steps = len(self.df) * self.steps_per_sec
         max_start = self.t_max - trace_len_steps
         self.start = int(self.rng.integers(0, max_start + 1)) if max_start > 0 else 0
+        self.scaling = float(self.rng.uniform(0.2,2.0))
 
     def reset(self, seed=None):
         if seed is not None:
@@ -130,8 +143,9 @@ class Attacker:
         return {
             "attacker_id": self.attacker_id,
             "attack_type": self.attack_type,
-            "flows_per_sec": float(self._flows[sec_idx]),
-            "flows_per_sec_ema_mom": float(self._flows_ema_mom[sec_idx]),
+            "flows_per_sec": float(self._flows[sec_idx]) * self.scaling,
+            "flows_per_sec_ema": float(self._flows_ema[sec_idx]) * self.scaling,
+            "flows_per_sec_ema_mom": float(self._flows_ema_mom[sec_idx]) * self.scaling,
         }
 
 

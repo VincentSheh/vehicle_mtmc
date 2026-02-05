@@ -18,6 +18,7 @@ import yaml
 import os
 import numpy as np
 import pandas as pd
+from matplotlib import pyplot as plt
 
 from service import IDS, VideoPipeline
 
@@ -44,6 +45,7 @@ class StepMetrics:
 
     # Requests (OD-only pipeline)
     local_num_req: int                  # served (after IDS + uplink + compute)
+    ema: float
     ema_mom: float
 
     # IDS / attack
@@ -225,6 +227,7 @@ class Environment:
                     
                     # RL Observation
                     local_num_req = cache["local_num_request"],
+                    ema = cache["ema"],
                     ema_mom = cache["ema_mom"],
                     attack_drop_rate=float(ids_out.get("attack_drop_rate", 0.0)),
                     cpu_to_ids_ratio = edge.cpu_to_ids_ratio,
@@ -303,7 +306,6 @@ def build_env_base(cfg_path: str):
                     non_defendable_bw_const=atk_cfg["non_defendable_bw_const"],
                     slot_ms=globals_cfg.slot_ms,
                     t_max=cfg["run"]["t_max"],
-                    scaling=1.0,
                     seed=cfg["run"]["seed"],
                     cpu_cycle_per_ms=globals_cfg.cpu_cycle_per_ms,
                     cpu_cores=globals_cfg.cpu_cores,                      
@@ -543,7 +545,7 @@ class TorchRLEnvWrapper(EnvBase):
 
         reward = torch.tensor([
             total_reward 
-            # / max(1, steps)
+            / max(1, steps)
             ], dtype=torch.float32, device=self.device)
 
         # 3) Build aggregated outputs
@@ -556,12 +558,22 @@ class TorchRLEnvWrapper(EnvBase):
         truncated = torch.zeros(1, dtype=torch.bool, device=self.device)
         done = terminated | truncated
 
+        t_internal_end = int(self.env.t)  # end-of-window index (exclusive)
+
+        last_block = self.env.history[-self.n_edges:]
+        qoes = [float(m.qoe_mean) for m in last_block]
+        qoe_mean = float(np.mean(qoes))
 
         return TensorDict(
             {
                 "observation": obs,
                 "observation_flat": obs_flat,
                 "reward": reward,
+
+                # logging keys that ParallelEnv can batch safely
+                "qoe_mean": torch.tensor([qoe_mean], dtype=torch.float32, device=self.device),
+                "t_internal": torch.tensor([t_internal_end], dtype=torch.int64, device=self.device),
+
                 "done": done,
                 "terminated": terminated,
                 "truncated": truncated,
@@ -591,6 +603,12 @@ class TorchRLEnvWrapper(EnvBase):
                     obs[i, j] = float(np.sum(vals))
                 elif k == "cpu_to_ids_ratio":
                     obs[i, j] = float(vals[-1])
+                elif k == "ema_mom":
+                    vals_nz = vals[vals != 0.0]
+                    if len(vals_nz) == 0:
+                        obs[i, j] = 0.0
+                        continue
+                    obs[i, j] = float(np.mean(vals_nz))  
                 else:
                     obs[i, j] = float(np.mean(vals))
 
@@ -604,7 +622,7 @@ class TorchRLEnvWrapper(EnvBase):
 
         qoes = np.asarray(qoes, dtype=np.float32)
 
-        threshold = 0.2
+        threshold = 0.35
         alpha = 0.6  # max penalty strength
         
         penalty = alpha * (np.maximum(0.0, threshold - qoes) / threshold) ** 2        
@@ -628,14 +646,23 @@ class TorchRLEnvWrapper(EnvBase):
         
 def test_environment_run(cfg_path: str, plot=False):
     env = build_env_base(cfg_path)
-    for _ in range(env.t_max): 
-        env.step([0.0])
 
-    df = pd.DataFrame([m.__dict__ for m in env.history])
+    dfs = []
+    for i in range(5):
+        env.reset(seed=1000 + i)
 
-    assert not df.empty, "No metrics produced"
-    assert np.isfinite(df["qoe_mean"]).all(), "Invalid QoE values"
-    assert df["ids_coverage"].between(0, 1).all(), "IDS coverage out of range"
+        for _ in range(env.t_max):
+            env.step([0.0])
+
+        df = pd.DataFrame([m.__dict__ for m in env.history])
+        df["episode"] = i
+        df["t"] = i * env.t_max + df["t"]
+        dfs.append(df)
+
+    all_df = pd.concat(dfs, ignore_index=True)
+    assert not all_df.empty, "No metrics produced"
+    assert np.isfinite(all_df["qoe_mean"]).all(), "Invalid QoE values"
+    assert all_df["ids_coverage"].between(0, 1).all(), "IDS coverage out of range"
 
 
     out_dir = "logs/test"
@@ -643,7 +670,7 @@ def test_environment_run(cfg_path: str, plot=False):
 
     # QoE over time
     (
-        df.pivot(index="t", columns="area_id", values="qoe_mean")
+        all_df.pivot(index="t", columns="area_id", values="qoe_mean")
         .plot(figsize=(10, 4), title="QoE over time")
         .get_figure()
         .savefig(f"{out_dir}/qoe_over_time.png", bbox_inches="tight")
@@ -651,22 +678,22 @@ def test_environment_run(cfg_path: str, plot=False):
 
     # Latency over time
     (
-        df.pivot(index="t", columns="area_id", values="bw_utilization")
+        all_df.pivot(index="t", columns="area_id", values="bw_utilization")
         .plot(figsize=(10, 4), title="Utilized uplink over time")
         .get_figure()
         .savefig(f"{out_dir}/uplink_utilization.png", bbox_inches="tight")
     )
 
     (
-        df.pivot(index="t", columns="area_id", values="local_num_req")
+        all_df.pivot(index="t", columns="area_id", values="local_num_req")
         .plot(figsize=(10, 4), title="Num Request")
         .get_figure()
         .savefig(f"{out_dir}/local_num_req.png", bbox_inches="tight")
     )
 
-    # IDS coverage
+    # Ema mom
     (
-        df.pivot(index="t", columns="area_id", values="ema_mom")
+        all_df.pivot(index="t", columns="area_id", values="ema_mom")
         .plot(figsize=(10, 4), title="EMA Momentum")
         .get_figure()
         .savefig(f"{out_dir}/ema_mom.png", bbox_inches="tight")
@@ -674,7 +701,7 @@ def test_environment_run(cfg_path: str, plot=False):
     
     # Attack in 
     (
-        df.pivot(index="t", columns="area_id", values="attack_in_rate")
+        all_df.pivot(index="t", columns="area_id", values=["attack_in_rate", "ema"])
         .plot(figsize=(10, 4), title="Attack In Rate")
         .get_figure()
         .savefig(f"{out_dir}/attack_in_rate.png", bbox_inches="tight")

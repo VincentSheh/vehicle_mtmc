@@ -13,6 +13,8 @@ from torchrl.objectives.value import GAE
 from torch.distributions import Categorical, Independent
 from environment import TorchRLEnvWrapper
 from torchrl.envs.transforms import ObservationNorm, VecNorm, TransformedEnv
+from torchrl.envs import ParallelEnv  # or ParallelEnv if you want multiprocessing
+
 from logger import *
 
 
@@ -107,16 +109,16 @@ def train(cfg_path="./configs/simulation_0.yaml", device="cpu"):
         base_env,
         ObservationNorm(in_keys=["observation_flat"], standard_normal=True),
     )
+    
     # populate mean/std from rollouts
-    env.transform.train() 
+    env.transform.train()
     env.transform.init_stats(
         num_iter=1000,     # bump if needed
         reduce_dim=0,
         cat_dim=0,
     )
-
-    env.transform.eval()   # freeze normalization constants for training
-    obs_size = env.n_edges * env.obs_dim
+    env.transform.eval()
+    obs_size = int(env.observation_spec["observation_flat"].shape[-1])
     action_dim = env.action_dim
 
     actor_net = ActorNet(obs_size).to(device)
@@ -129,7 +131,7 @@ def train(cfg_path="./configs/simulation_0.yaml", device="cpu"):
     )
 
 
-    actor = ProbabilisticActor(
+    policy = ProbabilisticActor(
         module=actor_module,
         in_keys=["logits"],
         out_keys=["action"],
@@ -137,20 +139,6 @@ def train(cfg_path="./configs/simulation_0.yaml", device="cpu"):
         return_log_prob=True,
         # default_interaction_type=InteractionType.RANDOM,
     )
-    def policy(td: TensorDict) -> TensorDict:
-        td_in = TensorDict(
-            {"observation_flat": td["observation_flat"]},
-            batch_size=td.batch_size,
-            device=td.device,
-        )
-
-        td_out = actor(td_in)
-
-        td.set("action", td_out["action"])
-        td.set("action_log_prob", td_out["action_log_prob"])
-        td.set("logits", td_out["logits"])
-
-        return td
     
     value_module = TensorDictModule(
         critic_net,
@@ -159,7 +147,7 @@ def train(cfg_path="./configs/simulation_0.yaml", device="cpu"):
     )
     value = ValueOperator(value_module)
     
-    adv = GAE(gamma=0.995, lmbda=0.95, value_network=value)
+    adv = GAE(gamma=0.98, lmbda=0.95, value_network=value)
     adv.set_keys(
         value="state_value",
         advantage="advantage",
@@ -170,11 +158,11 @@ def train(cfg_path="./configs/simulation_0.yaml", device="cpu"):
     )
 
     loss = ClipPPOLoss(
-        actor_network=actor,
+        actor_network=policy,
         critic_network=value,
         clip_epsilon=0.2,
         entropy_bonus=True,
-        entropy_coef=1e-4,
+        entropy_coef=1e-3,
         critic_coef=1.0,
         loss_critic_type="smooth_l1",
     )
@@ -183,13 +171,15 @@ def train(cfg_path="./configs/simulation_0.yaml", device="cpu"):
         advantage="advantage",
         value_target="value_target",
     )    
+
     
-    
+    frames_per_batch = int(decisions_per_episode)
+    total_frames = int(frames_per_batch * 2000)  # or any multiplier you want
     collector = SyncDataCollector(
         env,
         policy=policy,
-        frames_per_batch=decisions_per_episode,
-        total_frames=decisions_per_episode * 1000,
+        frames_per_batch=frames_per_batch,
+        total_frames=total_frames,
         device=device,
         trust_policy=True,
     )
@@ -199,8 +189,8 @@ def train(cfg_path="./configs/simulation_0.yaml", device="cpu"):
         lr=1e-4,
     )
 
-    ppo_epochs = 4
-    minibatch_size = 1024
+    ppo_epochs = 20
+    minibatch_size = 128
 
     def assert_finite(td, prefix=""):
         for k in td.keys(True, True):
@@ -239,7 +229,7 @@ def train(cfg_path="./configs/simulation_0.yaml", device="cpu"):
         )
 
         flat = traj.flatten(0, -1)
-        B = flat.numel()
+        B = flat.batch_size[0]
         for _ in range(ppo_epochs):
             perm = torch.randperm(B, device=device)
             for start in range(0, B, minibatch_size):

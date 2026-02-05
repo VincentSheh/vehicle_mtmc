@@ -615,6 +615,7 @@ class EdgeArea:
         attack_uplink_in = 0.0
         attack_cycles_per_ms = 0.0
         attack_mom = 0.0
+        attack_ema = 0.0
         for _, row in attack_df.iterrows():
             attacker_id = row.get("attacker_id")
             attacker = next(a for a in self.cur_attacker if a.attacker_id == attacker_id)
@@ -624,6 +625,7 @@ class EdgeArea:
             attack_uplink_in += flows_i * bw_per_flow * atk_pass_frac
             cpu_per_flow = attacker.cycle_per_flow
             attack_cycles_per_ms += flows_i * cpu_per_flow * atk_pass_frac / 1000.0            
+            attack_ema = row["flows_per_sec_ema"]
             attack_mom = row["flows_per_sec_ema_mom"]
 
         uplink_total_mb = self.budget.uplink / (1000.0 / self.slot_ms)
@@ -642,6 +644,7 @@ class EdgeArea:
             cache = {
                 "ids_out": ids_out,
                 "local_num_request": local_num_request,
+                "ema": attack_ema,
                 "ema_mom": attack_mom,
                 "dropped_uplink": int(total_req_in),
                 "od_plan": {},
@@ -705,6 +708,7 @@ class EdgeArea:
         cache = {
             "ids_out": ids_out,
             "local_num_request": local_num_request,
+            "ema": attack_ema,
             "ema_mom": attack_mom,
             "dropped_uplink": int(dropped_uplink),
             "od_plan": od_plan,  # {det: n_req}
