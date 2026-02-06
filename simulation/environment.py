@@ -421,6 +421,20 @@ class TorchRLEnvWrapper(EnvBase):
                 dtype=torch.float32,
                 device=self.device,
             ),
+
+            # add these so they survive rollout collection
+            qoe_mean=UnboundedContinuousTensorSpec(
+                shape=(1,),
+                dtype=torch.float32,
+                device=self.device,
+            ),
+            t_internal=BoundedTensorSpec(
+                low=0,
+                high=max(1, int(self.env.t_max)),   # or env.t_max if already built
+                shape=(1,),
+                dtype=torch.int64,
+                device=self.device,
+            ),
         )
 
         self.action_spec = CompositeSpec(
@@ -482,6 +496,8 @@ class TorchRLEnvWrapper(EnvBase):
             {
                 "observation": obs,
                 "observation_flat": obs_flat,
+                "qoe_mean": torch.zeros(1, dtype=torch.float32, device=self.device),
+                "t_internal": torch.tensor([int(self.env.t)], dtype=torch.int64, device=self.device),                
                 "done": torch.zeros(1, dtype=torch.bool, device=self.device),
                 "terminated": torch.zeros(1, dtype=torch.bool, device=self.device),
                 "truncated": torch.zeros(1, dtype=torch.bool, device=self.device),

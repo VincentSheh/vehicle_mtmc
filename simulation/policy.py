@@ -338,8 +338,8 @@ def main():
     ap.add_argument("--scale_step", type=float, default=0.5)
     ap.add_argument("--ids_cpu_min", type=float, default=0.5)
 
-    # ap.add_argument("--rl_ckpt", type=str, default="checkpoints/ppo_simulation_0/ckpt_iter_000750.pt")
-    ap.add_argument("--rl_ckpt", type=str, default="checkpoints/ppo_simulation_0/ckpt_epoch20.pt")
+    ap.add_argument("--rl_ckpt", type=str, default="checkpoints/ppo_simulation_0/ckpt_iter_000350.pt")
+    # ap.add_argument("--rl_ckpt", type=str, default="checkpoints/ppo_simulation_0/ckpt_epoch20.pt")
     # ap.add_argument("--rl_ckpt", type=str, default="checkpoints/ppo_simulation_0/ckpt_ema_000900.pt")
     ap.add_argument("--rl_device", type=str, default="cuda")
     ap.add_argument("--rl_greedy", action="store_true")

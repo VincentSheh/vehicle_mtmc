@@ -105,16 +105,40 @@ def train(cfg_path="./configs/simulation_0.yaml", device="cpu"):
     #     ),        
     # )
     
+    # env = TransformedEnv(
+    #     base_env,
+    #     ObservationNorm(in_keys=["observation_flat"], standard_normal=True),
+    # )
+
+    def make_env(seed_offset):
+        def _make():
+            return TorchRLEnvWrapper(
+                cfg_path=cfg_path,
+                seed=seed_offset,
+                device=device,
+                decision_interval=decision_interval,
+            )
+        return _make    
+    
+    num_envs = 4  # start small
+
+    penv = ParallelEnv(
+        num_envs,
+        [make_env(1000 + i) for i in range(num_envs)],
+    )    
     env = TransformedEnv(
-        base_env,
-        ObservationNorm(in_keys=["observation_flat"], standard_normal=True),
-    )
+        penv,
+        ObservationNorm(
+            in_keys=["observation_flat"],
+            standard_normal=True,
+        ),
+    )    
     
     # populate mean/std from rollouts
     env.transform.train()
     env.transform.init_stats(
-        num_iter=1000,     # bump if needed
-        reduce_dim=0,
+        num_iter=1000,
+        reduce_dim=(0,1),
         cat_dim=0,
     )
     env.transform.eval()
@@ -173,12 +197,13 @@ def train(cfg_path="./configs/simulation_0.yaml", device="cpu"):
     )    
 
     
-    frames_per_batch = int(decisions_per_episode)
+    frames_per_batch = int(decisions_per_episode*num_envs)
     total_frames = int(frames_per_batch * 2000)  # or any multiplier you want
     collector = SyncDataCollector(
         env,
         policy=policy,
-        frames_per_batch=frames_per_batch,
+        frames_per_batch=frames_per_batch*num_envs,
+        # frames_per_batch=frames_per_batch,
         total_frames=total_frames,
         device=device,
         trust_policy=True,
@@ -270,53 +295,43 @@ def train(cfg_path="./configs/simulation_0.yaml", device="cpu"):
             f"Iteration={it} "
             f"reward_mean={batch['next', 'reward'].mean().item():.4f}"
         )                
+        obs  = batch["next", "observation"].detach()       # [T,B,E,D] or [T,E,D]
+        act  = batch["action"].detach()                    # action taken at time t
+        qoe  = batch["next", "qoe_mean"].detach()
+        tint = batch["next", "t_internal"].detach()
+        done = batch["next", "done"].detach()
 
-        obs = batch["observation"].detach()          # [T, n_edges, obs_dim] or [T, B, n_edges, obs_dim]
-        act = batch["action"].detach()              # [T] or [T, B]
-        rew = batch["next", "reward"].detach()      # [T, 1] or [T, B, 1]
-        done = batch["next", "done"].detach()       # [T, 1] or [T, B, 1]
+        # normalize shapes
+        if obs.ndim == 3:       # [T, E, D] -> add B=1
+            obs = obs[:, None, :, :]
+        if act.ndim == 1:
+            act = act[:, None]
+        if qoe.ndim == 2:
+            qoe = qoe[:, None, :]
+        if tint.ndim == 2:
+            tint = tint[:, None, :]
+        if done.ndim == 2:
+            done = done[:, None, :]
 
-        # squeeze B if B=1
-        if obs.ndim == 4: obs = obs[:, 0]
-        if act.ndim == 2: act = act[:, 0]
-        if rew.ndim == 3: rew = rew[:, 0]
-        if done.ndim == 3: done = done[:, 0]
-
-        T, E, D = obs.shape
-        DI = base_env.decision_interval
-        qoe_hist = base_env.env.last_history
-
-        if not qoe_hist:
-            return  # or continue outer loop
-
-        base = it * T
-
+        T, B, E, D = obs.shape
+        base = it*T
         for t in range(T):
-            if bool(done[t].squeeze(-1).item()):
-                continue
-
-            ts_step = base + t
-            a = int(act[t].item())
-
-            start = t * DI * E
-            end = (t + 1) * DI * E
-
-            if end > len(qoe_hist):
-                break
-
-            qoe_block = qoe_hist[start:end]
-
-            qoe_mean = float(np.mean([m.qoe_mean for m in qoe_block]))
+            ts_step = base+t
+            # for b in range(B):
+            b=0
+            step_id = int(tint[t, b, 0].item())   # your internal timestep marker
+            a = int(act[t, b].item())
+            q = float(qoe[t, b, 0].item())
 
             log_dict = {
-                "ts_step": ts_step,
-                "ts/action": a,
-                "ts/qoe": qoe_mean,
+                f"ts_step": ts_step,
+                f"ts/action": a,
+                f"ts/qoe": q,
             }
 
             for e in range(E):
                 for j, k in enumerate(base_env.obs_keys):
-                    log_dict[f"ts/edge_{e}/{k}"] = float(obs[t, e, j].item())
+                    log_dict[f"ts/edge_{e}/{k}"] = float(obs[t, b, e, j].item())
 
             wandb.log(log_dict, commit=True)
         wandb.log(

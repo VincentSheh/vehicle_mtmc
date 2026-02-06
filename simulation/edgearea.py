@@ -232,11 +232,10 @@ class EdgeArea:
 
         return pd.DataFrame.from_records(rows) if rows else pd.DataFrame()
 
-    def aggregate_load_after_ids(self, t: int) -> Dict[str, float]:
+    def aggregate_load_after_ids(self, t: int, attack_df: pd.DataFrame) -> Dict[str, float]:
         """
         Returns IDS output stats using the current cpu_to_ids_ratio.
         """
-        attack_df = self._attack_df_at(t)
         user_rate = float(sum(u.num_requests_at(t) for u in self.users))
 
         return self.ids.classify_rates(
@@ -600,14 +599,13 @@ class EdgeArea:
         # 0) total user requests arriving this step
         total_req_in = float(sum(u.num_requests_at(t) for u in self.users))
         local_num_request = int(np.floor(total_req_in))
-
+        attack_df = self._attack_df_at(t)
         # 1) IDS filtering
-        ids_out = self.aggregate_load_after_ids(t)
+        ids_out = self.aggregate_load_after_ids(t, attack_df)
         user_pass_rate = float(ids_out.get("user_pass_rate", total_req_in))
         passed_req_pre_uplink = int(np.ceil(max(0.0, user_pass_rate)))
 
         # 2) uplink and cycles after attacks (fixed upload resolution)
-        attack_df = self._attack_df_at(t)
         atk_in = float(ids_out.get("attack_in_rate", 0.0))
         atk_pass = float(ids_out.get("attack_pass_rate", 0.0))
         atk_pass_frac = atk_pass / atk_in if atk_in > 0 else 0.0

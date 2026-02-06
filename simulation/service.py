@@ -61,10 +61,11 @@ class IDS:
         speed = self.effective_speed_pkt_per_step(cpu_ratio_to_ids)
         coverage = float(min(1.0, speed / total_in)) if total_in > 0 else 1.0 #! TODO: Offloadinfg and add delay to the request
 
-        attack_by_type = (
-            attack_df.groupby("attack_type")["flows_per_sec"].sum().to_dict()
-            if not attack_df.empty else {}
-        )
+        attack_by_type = {}
+        if not attack_df.empty:
+            for atk_type, lam in zip(attack_df["attack_type"].values, attack_df["flows_per_sec"].values):
+                atk_type = str(atk_type)
+                attack_by_type[atk_type] = attack_by_type.get(atk_type, 0.0) + float(lam)
 
         # attacks: expected dropped = coverage * TPR * rate
         attack_drop = 0.0
