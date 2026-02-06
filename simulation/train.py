@@ -195,7 +195,7 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
         entropy_coef=train_cfg["loss"]["entropy_coeff"],
         critic_coef=train_cfg["loss"]["critic_coeff"],
         loss_critic_type=train_cfg["loss"]["loss_critic_type"],
-        # normalize_advantage=True, 
+        normalize_advantage=True, 
     )
 
     loss.set_keys(
@@ -280,13 +280,6 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
         B = int(flat.batch_size[0])
         n_mb = _num_minibatches(B)
         total_network_updates = max(1, iters_total * ppo_epochs * n_mb)
-
-        adv_t = traj["advantage"]
-        traj.set(
-            "advantage",
-            (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
-        )
-
 
         # train
         for _ in range(ppo_epochs):
@@ -385,7 +378,7 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
                 "loss/entropy": float(out.get("loss_entropy", torch.tensor(0.0, device=device)).detach().item()),
             },
         )
-        # collector.update_policy_weights_()
+        collector.update_policy_weights_()
         # env.transform.train() 
         # stop once episode is finished
         if batch["done"].any():
