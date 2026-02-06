@@ -243,7 +243,7 @@ class Environment:
         self.t += 1
         
         
-def build_env_base(cfg_path: str):
+def build_env_base(cfg_path: str, seed: int):
     cfg_text = Path(cfg_path).read_text(encoding="utf-8")
     cfg = yaml.safe_load(cfg_text)
 
@@ -364,7 +364,7 @@ class TorchRLEnvWrapper(EnvBase):
     ):
         super().__init__(device=torch.device(device), batch_size=[])
 
-        self.env = build_env_base(cfg_path)
+        self.env = build_env_base(cfg_path, seed)
         self.n_edges = len(self.env.edge_areas)
         self.area_ids = [e.area_id for e in self.env.edge_areas]
         self.episode_id = 0
@@ -662,7 +662,7 @@ class TorchRLEnvWrapper(EnvBase):
         )        
         
 def test_environment_run(cfg_path: str, plot=False):
-    env = build_env_base(cfg_path)
+    env = build_env_base(cfg_path, 21)
 
     dfs = []
     for i in range(5):

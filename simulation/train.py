@@ -351,23 +351,23 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
         base = it*T
         for t in range(T):
             ts_step = base+t
-            # for b in range(B):
-            b=0
-            step_id = int(tint[t, b, 0].item())   # your internal timestep marker
-            a = int(act[t, b].item())
-            q = float(qoe[t, b, 0].item())
+            for b in range(B):
+            # b=0
+                step_id = int(tint[t, b, 0].item())   # your internal timestep marker
+                a = int(act[t, b].item())
+                q = float(qoe[t, b, 0].item())
 
-            log_dict = {
-                f"ts_step": ts_step,
-                f"ts/action": a,
-                f"ts/qoe": q,
-            }
+                log_dict = {
+                    f"ts_step": ts_step,
+                    f"ts/action": a,
+                    f"ts/qoe": q,
+                }
 
-            for e in range(E):
-                for j, k in enumerate(base_env.obs_keys):
-                    log_dict[f"ts/edge_{e}/{k}"] = float(obs[t, b, e, j].item())
+                for e in range(E):
+                    for j, k in enumerate(base_env.obs_keys):
+                        log_dict[f"ts/edge_{e}/{k}"] = float(obs[t, b, e, j].item())
 
-            wandb.log(log_dict, commit=True)
+                wandb.log(log_dict, commit=True)
         wandb.log(
             {
                 "iter": it,
