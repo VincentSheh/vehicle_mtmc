@@ -14,23 +14,24 @@ from torch.distributions import Categorical, Independent
 from environment import TorchRLEnvWrapper
 from torchrl.envs.transforms import ObservationNorm, VecNorm, TransformedEnv
 from torchrl.envs import ParallelEnv  # or ParallelEnv if you want multiprocessing
+from torchrl.modules import LSTMModule
 
 from logger import *
 
 
 from pathlib import Path
 
-def save_ckpt(path: str, actor_net, critic_net, optim, env_cfg, train_cfg, it: int, device: str, env):
+def save_ckpt(path, policy, value, optim, env_cfg, train_cfg, it, device, env):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
-            "actor_net": actor_net.state_dict(),
-            "critic_net": critic_net.state_dict(),
+            "policy": policy.state_dict(),
+            "value": value.state_dict(),
             "optim": optim.state_dict(),
             "iter": int(it),
-            "env_cfg": env_cfg,                 # optional but convenient
-            "train_cfg": train_cfg,                 # optional but convenient
+            "env_cfg": env_cfg,
+            "train_cfg": train_cfg,
             "device": str(device),
             "obsnorm": env.state_dict(),
         },
@@ -41,6 +42,19 @@ def orthogonal_init(m, gain=1.0):
     if isinstance(m, nn.Linear):
         nn.init.orthogonal_(m.weight, gain=gain)
         nn.init.constant_(m.bias, 0.0)
+
+class FeatureNet(nn.Module):
+    def __init__(self, obs_dim, hidden):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim, hidden),
+            nn.Tanh(),
+            nn.Linear(hidden, hidden),
+            nn.Tanh(),
+        )
+
+    def forward(self, x):
+        return self.net(x)
 
 class ActorNet(nn.Module):
     def __init__(self, obs_dim, n_actions=3, hidden=64):
@@ -140,37 +154,49 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
 
     obs_size = int(env.observation_spec["observation_flat"].shape[-1])
 
-    actor_net = ActorNet(
-        obs_size,
-        n_actions=train_cfg["model"]["n_actions"],
-        hidden=train_cfg["model"]["hidden_dim"],
-    ).to(device)
+    feature_dim = train_cfg["model"]["hidden_dim"]
 
-    critic_net = CriticNet(
-        obs_size,
-        hidden=train_cfg["model"]["hidden_dim"],
-    ).to(device)
-
-    actor_module = TensorDictModule(
-        actor_net,
+    feature_module = TensorDictModule(
+        FeatureNet(obs_size, feature_dim),
         in_keys=["observation_flat"],
+        out_keys=["features"],
+    )
+
+    lstm_module = LSTMModule(
+        input_size=feature_dim,
+        hidden_size=feature_dim,
+        in_key="features",
+        out_key="features",
+        device=device,
+    )
+    core = TensorDictSequential(
+        feature_module,
+        lstm_module,
+    )
+
+    actor_head = TensorDictModule(
+        nn.Linear(feature_dim, train_cfg["model"]["n_actions"]),
+        in_keys=["features"],
         out_keys=["logits"],
     )
 
+    critic_head = TensorDictModule(
+        nn.Linear(feature_dim, 1),
+        in_keys=["features"],
+        out_keys=["state_value"],
+    )
+
     policy = ProbabilisticActor(
-        module=actor_module,
+        module=TensorDictSequential(core, actor_head),
         in_keys=["logits"],
         out_keys=["action"],
         distribution_class=Categorical,
         return_log_prob=True,
     )
 
-    value_module = TensorDictModule(
-        critic_net,
-        in_keys=["observation_flat"],
-        out_keys=["state_value"],
+    value = ValueOperator(
+        TensorDictSequential(core, critic_head)
     )
-    value = ValueOperator(value_module)
 
     adv = GAE(
         gamma=train_cfg["loss"]["gamma"],
@@ -204,7 +230,10 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
         value_target="value_target",
     )
 
-    frames_per_batch = train_cfg.get("collector",{}).get("frames_per_batch", None) if not None else decisions_per_episode * num_envs * num_envs
+    frames_per_batch = train_cfg["collector"].get(
+       "frames_per_batch",
+        decisions_per_episode * num_envs * num_envs #Double Intentional
+    )
     total_frames = train_cfg["collector"]["total_frames"]
 
     collector = SyncDataCollector(
@@ -217,7 +246,7 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
     )
 
     optim = torch.optim.Adam(
-        list(actor_net.parameters()) + list(critic_net.parameters()),
+        loss.parameters(),
         lr=train_cfg["optim"]["lr"],
         weight_decay=train_cfg["optim"]["weight_decay"],
         eps=train_cfg["optim"]["eps"],
@@ -261,6 +290,7 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
         # env.transform.eval() 
         x = batch["observation_flat"]
         print("obs_flat mean/std/min/max:", float(x.mean()), float(x.std()), float(x.min()), float(x.max()))
+        print(batch.keys(True, True))
         assert_finite(batch, "BATCH")
         assert_finite(batch["next"], "NEXT")
 
@@ -304,7 +334,7 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
                 optim.zero_grad(set_to_none=True)
                 total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(
-                    list(actor_net.parameters()) + list(critic_net.parameters()),
+                    loss.parameters(),
                     float(train_cfg["optim"]["max_grad_norm"]),
                 )
                 optim.step()
@@ -315,7 +345,7 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
         if (it + 1) % ckpt_every == 0:
             save_ckpt(
                 ckpt_dir / f"ckpt_iter_{it+1:06d}.pt",
-                actor_net, critic_net, optim, env_cfg, train_cfg, it + 1, device, env,
+                policy, value, optim, env_cfg, train_cfg, it + 1, device, env,
             )
 
         # best
@@ -323,7 +353,7 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
             best_qoe = qoe_score
             save_ckpt(
                 ckpt_dir / "ckpt_best.pt",
-                actor_net, critic_net, optim, env_cfg, train_cfg, it + 1, device, env,
+                policy, value, optim, env_cfg, train_cfg, it + 1, device, env,
             )                
         print(
             f"Iteration={it} "
@@ -351,26 +381,27 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
         base = it*T
         for t in range(T):
             ts_step = base+t
-            # for b in range(B):
-            b=0
-            step_id = int(tint[t, b, 0].item())   # your internal timestep marker
-            a = int(act[t, b].item())
-            q = float(qoe[t, b, 0].item())
+            for b in range(B):
+            # b=0
+                step_id = int(tint[t, b, 0].item())   # your internal timestep marker
+                a = int(act[t, b].item())
+                q = float(qoe[t, b, 0].item())
 
-            log_dict = {
-                f"ts_step": ts_step,
-                f"ts/action": a,
-                f"ts/qoe": q,
-            }
+                log_dict = {
+                    f"ts_step": ts_step,
+                    f"ts/action": a,
+                    f"ts/qoe": q,
+                }
 
-            for e in range(E):
-                for j, k in enumerate(base_env.obs_keys):
-                    log_dict[f"ts/edge_{e}/{k}"] = float(obs[t, b, e, j].item())
+                for e in range(E):
+                    for j, k in enumerate(base_env.obs_keys):
+                        log_dict[f"ts/edge_{e}/{k}"] = float(obs[t, b, e, j].item())
 
-            wandb.log(log_dict, commit=True)
+                wandb.log(log_dict, commit=True)
         wandb.log(
             {
                 "iter": it,
+                "qoe/mean": float(batch["next", "qoe_mean"].mean().item()),
                 "reward/mean": float(batch["next", "reward"].mean().item()),
                 "loss/total": float(total_loss.detach().item()),
                 "loss/policy": float(out["loss_objective"].detach().item()),
