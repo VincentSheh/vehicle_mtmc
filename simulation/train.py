@@ -120,7 +120,7 @@ def train(cfg_path="./configs/simulation_0.yaml", device="cpu"):
             )
         return _make    
     
-    num_envs = 4  # start small
+    num_envs = 4
 
     penv = ParallelEnv(
         num_envs,
@@ -198,6 +198,7 @@ def train(cfg_path="./configs/simulation_0.yaml", device="cpu"):
 
     
     frames_per_batch = int(decisions_per_episode*num_envs)
+    frames_per_batch = 4096
     total_frames = int(frames_per_batch * 2000)  # or any multiplier you want
     collector = SyncDataCollector(
         env,
@@ -214,8 +215,8 @@ def train(cfg_path="./configs/simulation_0.yaml", device="cpu"):
         lr=1e-4,
     )
 
-    ppo_epochs = 20
-    minibatch_size = 128
+    ppo_epochs = 4
+    minibatch_size = 256
 
     def assert_finite(td, prefix=""):
         for k in td.keys(True, True):

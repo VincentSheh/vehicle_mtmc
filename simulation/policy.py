@@ -331,7 +331,7 @@ def plot_qoe_vio_bars(results: Dict[str, Dict[str, np.ndarray]], outpath: Path, 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--cfg", type=str, required=True)
+    ap.add_argument("--cfg", type=str, default="./configs/simulation_0.yaml")
     ap.add_argument("--outdir", type=str, default="eval_out")
     ap.add_argument("--episodes", type=int, default=20)
     ap.add_argument("--decision_interval", type=int, default=500)

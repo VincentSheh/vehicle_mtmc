@@ -51,37 +51,43 @@ class IDS:
 
     def classify_rates(
         self,
-        attack_df: pd.DataFrame,
+        attack_dict: Dict[str,Any],
         user_rate: float,
         cpu_ratio_to_ids: float,
     ) -> Dict[str, float]:
-        total_attack = float(attack_df["flows_per_sec"].sum()) if not attack_df.empty else 0.0 #? Or use forward_packets_per_sec || flows_per_sec
-        total_in = float(user_rate + total_attack) #! TODO: Change User rate to Packet
+        total_attack = float(attack_dict["flows"])
+        total_in = float(user_rate + total_attack)
 
         speed = self.effective_speed_pkt_per_step(cpu_ratio_to_ids)
-        coverage = float(min(1.0, speed / total_in)) if total_in > 0 else 1.0 #! TODO: Offloadinfg and add delay to the request
-
-        attack_by_type = {}
-        if not attack_df.empty:
-            for atk_type, lam in zip(attack_df["attack_type"].values, attack_df["flows_per_sec"].values):
-                atk_type = str(atk_type)
-                attack_by_type[atk_type] = attack_by_type.get(atk_type, 0.0) + float(lam)
+        coverage = float(min(1.0, speed / total_in)) if total_in > 0 else 1.0
 
         # attacks: expected dropped = coverage * TPR * rate
         attack_drop = 0.0
-        for atk_type, lam in attack_by_type.items():
-            tpr, _fpr = self.acc_tpr_fpr[str(atk_type)]
-            attack_drop += coverage * tpr * float(lam)
+        by_type = attack_dict.get("by_type", {})
+        if by_type:
+            for atk_type, lam in by_type.items():
+                tpr, _fpr = self.acc_tpr_fpr[str(atk_type)]
+                attack_drop += coverage * tpr * float(lam)
+        else:
+            # if you choose not to track by_type, you need a fallback
+            # simplest: assume average TPR across all types
+            if self.acc_tpr_fpr:
+                avg_tpr = float(np.mean([v[0] for v in self.acc_tpr_fpr.values()]))
+            else:
+                avg_tpr = 0.0
+            attack_drop = coverage * avg_tpr * total_attack
 
         attack_pass = max(0.0, total_attack - attack_drop)
 
-        # users: expected false drops = coverage * avg_fpr * user_rate
+        # users: expected false drops
         avg_fpr = float(np.mean([v[1] for v in self.acc_tpr_fpr.values()])) if self.acc_tpr_fpr else 0.0
         user_drop = coverage * avg_fpr * float(user_rate)
         user_pass = max(0.0, float(user_rate) - user_drop)
+
         ids_cycles_available = self.effective_cycles_per_step(cpu_ratio_to_ids)
         ids_used_cycles = min(total_in * self.cycles_per_packet, ids_cycles_available)
-        ids_cpu_util = min(1.0, ids_used_cycles / (ids_cycles_available+1e-6))
+        ids_cpu_util = min(1.0, ids_used_cycles / (ids_cycles_available + 1e-6))
+
         return {
             "coverage": coverage,
             "attack_in_rate": total_attack,

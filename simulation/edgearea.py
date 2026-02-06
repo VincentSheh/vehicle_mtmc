@@ -223,23 +223,48 @@ class EdgeArea:
     # Load aggregation
     # --------------------------
 
-    def _attack_df_at(self, t: int) -> pd.DataFrame:
-        rows = []
+    def _attack_agg_at(self, t: int) -> dict:
+        # aggregate only what you use later
+        total_flows = 0.0
+        total_bw_in = 0.0          # flows * bw_per_flow
+        total_cycles_per_s = 0.0   # flows * cycle_per_flow
+        ema = 0.0
+        mom = 0.0
+
         for atk in self.cur_attacker:
-            r = atk.load_at(t)  # dict or None
-            if r:
-                rows.append(r)
+            r = atk.load_at(t)
+            if r is None:
+                continue
 
-        return pd.DataFrame.from_records(rows) if rows else pd.DataFrame()
+            flows = float(r["flows_per_sec"])
+            total_flows += flows
+            total_bw_in += flows * float(atk.bw_per_flow)
+            total_cycles_per_s += flows * float(atk.cycle_per_flow)
 
-    def aggregate_load_after_ids(self, t: int, attack_df: pd.DataFrame) -> Dict[str, float]:
+            # if multiple attackers: pick one policy
+            # option A: sum (most consistent if you treat as total intensity)
+            ema += float(r.get("flows_per_sec_ema", 0.0))
+            mom += float(r.get("flows_per_sec_ema_mom", 0.0))
+
+            # option B: max magnitude for mom (if you want “worst burst”)
+            # m = float(r.get("flows_per_sec_ema_mom", 0.0))
+            # if abs(m) > abs(mom): mom = m
+
+        return {
+            "flows": total_flows,
+            "bw_in": total_bw_in,
+            "cycles_per_s": total_cycles_per_s,
+            "ema": ema,
+            "mom": mom,
+        }
+
+    def aggregate_load_after_ids(self, t: int, attack_dict = Dict[str, Any]) -> Dict[str, float]:
         """
         Returns IDS output stats using the current cpu_to_ids_ratio.
         """
         user_rate = float(sum(u.num_requests_at(t) for u in self.users))
-
         return self.ids.classify_rates(
-            attack_df=attack_df,
+            attack_dict=attack_dict,
             user_rate=user_rate,
             cpu_ratio_to_ids=self.cpu_to_ids_ratio,
         )
@@ -599,32 +624,20 @@ class EdgeArea:
         # 0) total user requests arriving this step
         total_req_in = float(sum(u.num_requests_at(t) for u in self.users))
         local_num_request = int(np.floor(total_req_in))
-        attack_df = self._attack_df_at(t)
-        # 1) IDS filtering
-        ids_out = self.aggregate_load_after_ids(t, attack_df)
+        attack_dict = self._attack_agg_at(t)
+
+        ids_out = self.aggregate_load_after_ids(t, attack_dict)  # update signature
         user_pass_rate = float(ids_out.get("user_pass_rate", total_req_in))
         passed_req_pre_uplink = int(np.ceil(max(0.0, user_pass_rate)))
 
-        # 2) uplink and cycles after attacks (fixed upload resolution)
         atk_in = float(ids_out.get("attack_in_rate", 0.0))
         atk_pass = float(ids_out.get("attack_pass_rate", 0.0))
         atk_pass_frac = atk_pass / atk_in if atk_in > 0 else 0.0
-        
-        attack_uplink_in = 0.0
-        attack_cycles_per_ms = 0.0
-        attack_mom = 0.0
-        attack_ema = 0.0
-        for _, row in attack_df.iterrows():
-            attacker_id = row.get("attacker_id")
-            attacker = next(a for a in self.cur_attacker if a.attacker_id == attacker_id)
+        attack_uplink_in = attack_dict["bw_in"] * atk_pass_frac
+        attack_cycles_per_ms = (attack_dict["cycles_per_s"] * atk_pass_frac) / 1000.0
 
-            flows_i = float(row["flows_per_sec"])
-            bw_per_flow = attacker.bw_per_flow
-            attack_uplink_in += flows_i * bw_per_flow * atk_pass_frac
-            cpu_per_flow = attacker.cycle_per_flow
-            attack_cycles_per_ms += flows_i * cpu_per_flow * atk_pass_frac / 1000.0            
-            attack_ema = row["flows_per_sec_ema"]
-            attack_mom = row["flows_per_sec_ema_mom"]
+        attack_ema = attack_dict["ema"]
+        attack_mom = attack_dict["mom"]
 
         uplink_total_mb = self.budget.uplink / (1000.0 / self.slot_ms)
 
