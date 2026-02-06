@@ -14,6 +14,7 @@ from torchrl.data import (
     MultiDiscreteTensorSpec,
 )
 
+from pathlib import Path
 import yaml
 import os
 import numpy as np
@@ -243,8 +244,8 @@ class Environment:
         
         
 def build_env_base(cfg_path: str):
-    with open(cfg_path, "r") as f:
-        cfg = yaml.safe_load(f)
+    cfg_text = Path(cfg_path).read_text(encoding="utf-8")
+    cfg = yaml.safe_load(cfg_text)
 
     globals_cfg = load_globals(cfg)
 

@@ -20,7 +20,7 @@ from logger import *
 
 from pathlib import Path
 
-def save_ckpt(path: str, actor_net, critic_net, optim, cfg, it: int, device: str, env):
+def save_ckpt(path: str, actor_net, critic_net, optim, env_cfg, train_cfg, it: int, device: str, env):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -29,7 +29,8 @@ def save_ckpt(path: str, actor_net, critic_net, optim, cfg, it: int, device: str
             "critic_net": critic_net.state_dict(),
             "optim": optim.state_dict(),
             "iter": int(it),
-            "cfg": cfg,                 # optional but convenient
+            "env_cfg": env_cfg,                 # optional but convenient
+            "train_cfg": train_cfg,                 # optional but convenient
             "device": str(device),
             "obsnorm": env.state_dict(),
         },
@@ -77,76 +78,78 @@ class CriticNet(nn.Module):
     def forward(self, obs):
         return self.net(obs).squeeze(-1)
 
-def train(cfg_path="./configs/simulation_0.yaml", device="cpu"):
-    with open(cfg_path, "r") as f:
-        cfg = yaml.safe_load(f)    
-    run = wandb_init(cfg, cfg_path)    
-    torch.manual_seed(0)
-    np.random.seed(0)
-    decision_interval=500
-    decisions_per_episode = math.ceil(cfg["run"]["t_max"] / decision_interval)
-    ckpt_dir = Path("checkpoints") / run.name  # run.name from wandb_init
-    ckpt_every = 50  # iterations
-    best_qoe = -1e9    
+def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/train.yaml", device="cuda"):
+    with open(env_cfg_path, "r") as f:
+        env_cfg = yaml.safe_load(f)
+    with open(train_cfg_path, "r") as f:
+        train_cfg = yaml.safe_load(f)
+        
+    t_max = env_cfg["run"]["t_max"]
+    run = wandb_init(env_cfg, train_cfg)
+
+    torch.manual_seed(env_cfg["run"]["seed"])
+    np.random.seed(env_cfg["run"]["seed"])
+
+    decision_interval = env_cfg["globals"]["decision_interval"]
+    num_envs = train_cfg["collector"]["num_envs"]
+    
+    decisions_per_episode = math.ceil(t_max / decision_interval)
+
+    ckpt_dir = Path("checkpoints") / run.name
+    ckpt_every = 50
+    best_qoe = -1e9
 
     base_env = TorchRLEnvWrapper(
-        cfg_path=cfg_path,
-        seed=0,
+        cfg_path=env_cfg_path,
+        seed=env_cfg["run"]["seed"],
         device=device,
         decision_interval=decision_interval
     )
 
-    # env = TransformedEnv(
-    #     base_env,
-    #     VecNorm(
-    #         in_keys=["observation_flat"],
-    #         decay=0.99,
-    #         eps=1e-6,
-    #     ),        
-    # )
-    
-    # env = TransformedEnv(
-    #     base_env,
-    #     ObservationNorm(in_keys=["observation_flat"], standard_normal=True),
-    # )
-
     def make_env(seed_offset):
         def _make():
             return TorchRLEnvWrapper(
-                cfg_path=cfg_path,
+                cfg_path=env_cfg_path,
                 seed=seed_offset,
                 device=device,
                 decision_interval=decision_interval,
             )
-        return _make    
-    
-    num_envs = 4
+        return _make
 
     penv = ParallelEnv(
         num_envs,
         [make_env(1000 + i) for i in range(num_envs)],
-    )    
+    )
+
     env = TransformedEnv(
         penv,
         ObservationNorm(
             in_keys=["observation_flat"],
-            standard_normal=True,
+            standard_normal=train_cfg["observation_norm"]["standard_normal"],
         ),
-    )    
-    
+    )
+
     # populate mean/std from rollouts
     env.transform.train()
     env.transform.init_stats(
-        num_iter=1000,
-        reduce_dim=(0,1),
+        num_iter=5,
+        reduce_dim=(0, 1),
         cat_dim=0,
     )
     env.transform.eval()
-    obs_size = int(env.observation_spec["observation_flat"].shape[-1])
-    action_dim = env.action_dim
 
-    actor_net = ActorNet(obs_size).to(device)
-    critic_net = CriticNet(obs_size).to(device)
+    obs_size = int(env.observation_spec["observation_flat"].shape[-1])
+
+    actor_net = ActorNet(
+        obs_size,
+        n_actions=train_cfg["model"]["n_actions"],
+        hidden=train_cfg["model"]["hidden_dim"],
+    ).to(device)
+
+    critic_net = CriticNet(
+        obs_size,
+        hidden=train_cfg["model"]["hidden_dim"],
+    ).to(device)
 
     actor_module = TensorDictModule(
         actor_net,
@@ -154,24 +157,27 @@ def train(cfg_path="./configs/simulation_0.yaml", device="cpu"):
         out_keys=["logits"],
     )
 
-
     policy = ProbabilisticActor(
         module=actor_module,
         in_keys=["logits"],
         out_keys=["action"],
         distribution_class=Categorical,
         return_log_prob=True,
-        # default_interaction_type=InteractionType.RANDOM,
     )
-    
+
     value_module = TensorDictModule(
         critic_net,
         in_keys=["observation_flat"],
         out_keys=["state_value"],
     )
     value = ValueOperator(value_module)
-    
-    adv = GAE(gamma=0.98, lmbda=0.95, value_network=value)
+
+    adv = GAE(
+        gamma=train_cfg["loss"]["gamma"],
+        lmbda=train_cfg["loss"]["gae_lambda"],
+        value_network=value,
+    )
+
     adv.set_keys(
         value="state_value",
         advantage="advantage",
@@ -184,39 +190,41 @@ def train(cfg_path="./configs/simulation_0.yaml", device="cpu"):
     loss = ClipPPOLoss(
         actor_network=policy,
         critic_network=value,
-        clip_epsilon=0.2,
+        clip_epsilon=train_cfg["loss"]["clip_epsilon"],
         entropy_bonus=True,
-        entropy_coef=1e-3,
-        critic_coef=1.0,
-        loss_critic_type="smooth_l1",
+        entropy_coef=train_cfg["loss"]["entropy_coeff"],
+        critic_coef=train_cfg["loss"]["critic_coeff"],
+        loss_critic_type=train_cfg["loss"]["loss_critic_type"],
+        # normalize_advantage=True, 
     )
+
     loss.set_keys(
         value="state_value",
         advantage="advantage",
         value_target="value_target",
-    )    
+    )
 
-    
-    frames_per_batch = int(decisions_per_episode*num_envs)
-    frames_per_batch = 4096
-    total_frames = int(frames_per_batch * 2000)  # or any multiplier you want
+    frames_per_batch = train_cfg.get("collector",{}).get("frames_per_batch", None) if not None else decisions_per_episode * num_envs * num_envs
+    total_frames = train_cfg["collector"]["total_frames"]
+
     collector = SyncDataCollector(
         env,
         policy=policy,
-        frames_per_batch=frames_per_batch*num_envs,
-        # frames_per_batch=frames_per_batch,
+        frames_per_batch=frames_per_batch,
         total_frames=total_frames,
         device=device,
-        trust_policy=True,
+        trust_policy=train_cfg["collector"]["trust_policy"],
     )
 
     optim = torch.optim.Adam(
         list(actor_net.parameters()) + list(critic_net.parameters()),
-        lr=1e-4,
+        lr=train_cfg["optim"]["lr"],
+        weight_decay=train_cfg["optim"]["weight_decay"],
+        eps=train_cfg["optim"]["eps"],
     )
 
-    ppo_epochs = 4
-    minibatch_size = 256
+    ppo_epochs = train_cfg["loss"]["ppo_epochs"]
+    minibatch_size = train_cfg["loss"]["mini_batch_size"]
 
     def assert_finite(td, prefix=""):
         for k in td.keys(True, True):
@@ -225,6 +233,27 @@ def train(cfg_path="./configs/simulation_0.yaml", device="cpu"):
                 bad = v[~torch.isfinite(v)]
                 print(prefix, "NON-FINITE at key:", k, "example:", bad.flatten()[:5])
                 raise RuntimeError(f"NaN/Inf in {k}")
+
+    # -----------------------
+    # Annealing bookkeeping
+    # -----------------------
+    iters_total = max(1, total_frames // frames_per_batch)
+    num_network_updates = 0
+
+    def _num_minibatches(B: int) -> int:
+        return (B + minibatch_size - 1) // minibatch_size
+
+    def _apply_anneal(alpha: float):
+        if bool(train_cfg["optim"]["anneal_lr"]):
+            lr_now = train_cfg["optim"]["lr"] * alpha
+            for g in optim.param_groups:
+                g["lr"] = lr_now
+        if bool(train_cfg["loss"].get("anneal_clip_epsilon", True)):
+            # ClipPPOLoss stores clip_epsilon as a tensor internally
+            if torch.is_tensor(loss.clip_epsilon):
+                loss.clip_epsilon.copy_(torch.as_tensor(train_cfg["loss"]["clip_epsilon"] * alpha, device=device))
+            else:
+                loss.clip_epsilon = train_cfg["loss"]["clip_epsilon"] * alpha  # fallback
 
     env.reset()
 
@@ -247,6 +276,10 @@ def train(cfg_path="./configs/simulation_0.yaml", device="cpu"):
             value(traj)          # writes "state_value" into traj
             value(traj["next"])  # writes "state_value" into traj["next"]
             adv(traj)
+        flat = traj.flatten(0, -1)
+        B = int(flat.batch_size[0])
+        n_mb = _num_minibatches(B)
+        total_network_updates = max(1, iters_total * ppo_epochs * n_mb)
 
         adv_t = traj["advantage"]
         traj.set(
@@ -254,12 +287,19 @@ def train(cfg_path="./configs/simulation_0.yaml", device="cpu"):
             (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
         )
 
-        flat = traj.flatten(0, -1)
-        B = flat.batch_size[0]
+
+        # train
         for _ in range(ppo_epochs):
             perm = torch.randperm(B, device=device)
             for start in range(0, B, minibatch_size):
                 mb = flat[perm[start:start + minibatch_size]]
+
+                # linear schedule over total network updates (Atari)
+                alpha = 1.0 - (num_network_updates / total_network_updates)
+                if alpha < 0.0:
+                    alpha = 0.0
+                _apply_anneal(alpha)
+                num_network_updates += 1
 
                 out = loss(mb)
                 total_loss = (
@@ -272,17 +312,17 @@ def train(cfg_path="./configs/simulation_0.yaml", device="cpu"):
                 total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(
                     list(actor_net.parameters()) + list(critic_net.parameters()),
-                    1.0,
+                    float(train_cfg["optim"]["max_grad_norm"]),
                 )
                 optim.step()
-                # after training update
-            qoe_score = float(batch["next", "reward"].mean().item())  # or your qoe_mean if you prefer
+
+        qoe_score = float(batch["next", "reward"].mean().item())
 
         # periodic
         if (it + 1) % ckpt_every == 0:
             save_ckpt(
                 ckpt_dir / f"ckpt_iter_{it+1:06d}.pt",
-                actor_net, critic_net, optim, cfg, it + 1, device, env,
+                actor_net, critic_net, optim, env_cfg, train_cfg, it + 1, device, env,
             )
 
         # best
@@ -290,7 +330,7 @@ def train(cfg_path="./configs/simulation_0.yaml", device="cpu"):
             best_qoe = qoe_score
             save_ckpt(
                 ckpt_dir / "ckpt_best.pt",
-                actor_net, critic_net, optim, cfg, it + 1, device, env,
+                actor_net, critic_net, optim, env_cfg, train_cfg, it + 1, device, env,
             )                
         print(
             f"Iteration={it} "
@@ -345,6 +385,7 @@ def train(cfg_path="./configs/simulation_0.yaml", device="cpu"):
                 "loss/entropy": float(out.get("loss_entropy", torch.tensor(0.0, device=device)).detach().item()),
             },
         )
+        # collector.update_policy_weights_()
         # env.transform.train() 
         # stop once episode is finished
         if batch["done"].any():
@@ -353,4 +394,4 @@ def train(cfg_path="./configs/simulation_0.yaml", device="cpu"):
     wandb.finish()        
 
 if __name__ == "__main__":
-    train("./configs/simulation_0.yaml", device="cuda")
+    train()

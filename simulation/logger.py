@@ -6,18 +6,60 @@ import torch
 import numpy as np
 
 
-def wandb_init(cfg: dict, cfg_path: str):
+def wandb_init(env_cfg: dict, train_cfg: dict):
+    logger_cfg = train_cfg.get("logger", {}) or {}
+    collector_cfg = train_cfg.get("collector", {}) or {}
+    optim_cfg = train_cfg.get("optim", {}) or {}
+    loss_cfg = train_cfg.get("loss", {}) or {}
+    model_cfg = train_cfg.get("model", {}) or {}
+    obs_norm_cfg = train_cfg.get("observation_norm", {}) or {}
+
+    exp_name = logger_cfg.get("exp_name", None)
+    cfg_path = train_cfg.get("cfg_path", None)
+
+    if exp_name is None:
+        exp_name = f"ppo_{os.path.splitext(os.path.basename(cfg_path))[0]}" if cfg_path else "ppo_run"
+
     run = wandb.init(
-        entity="asture123-national-taiwan-university",
-        project="edgeids",
-        name=f"ppo_{os.path.splitext(os.path.basename(cfg_path))[0]}",
+        entity=logger_cfg.get("entity", "asture123-national-taiwan-university"),
+        project=logger_cfg.get("project_name", "edgeids"),
+        name=exp_name,
         config={
-            "cfg_path": cfg_path,
-            "decision_interval": cfg.get("run", {}).get("decision_interval", None),
-            "t_max": cfg["run"]["t_max"],
-            "seed": cfg["run"]["seed"],
+            # env
+            "env/num_envs": int(collector_cfg.get("num_envs", 1)),
+            "env/decision_interval": env_cfg.get("globals", {}).get("decision_interval", None),
+            "env/seed": env_cfg.get("run", {}).get("seed", None),
+
+            # run
+            "run/t_max": env_cfg.get("run", {}).get("t_max", None),
+
+            # train
+            "optim/lr": optim_cfg.get("lr", None),
+            "optim/eps": optim_cfg.get("eps", None),
+            "optim/weight_decay": optim_cfg.get("weight_decay", None),
+            "optim/max_grad_norm": optim_cfg.get("max_grad_norm", None),
+
+            "loss/gamma": loss_cfg.get("gamma", None),
+            "loss/gae_lambda": loss_cfg.get("gae_lambda", None),
+            "loss/ppo_epochs": loss_cfg.get("ppo_epochs", None),
+            "loss/mini_batch_size": loss_cfg.get("mini_batch_size", None),
+            "loss/clip_epsilon": loss_cfg.get("clip_epsilon", None),
+            "loss/entropy_coeff": loss_cfg.get("entropy_coeff", None),
+            "loss/critic_coeff": loss_cfg.get("critic_coeff", None),
+            "loss/loss_critic_type": loss_cfg.get("loss_critic_type", None),
+
+            "collector/frames_per_batch": collector_cfg.get("frames_per_batch", None),
+            "collector/total_frames": collector_cfg.get("total_frames", None),
+            "collector/trust_policy": collector_cfg.get("trust_policy", None),
+
+            "model/hidden_dim": model_cfg.get("hidden_dim", None),
+            "model/n_actions": model_cfg.get("n_actions", None),
+
+            "observation_norm/enabled": obs_norm_cfg.get("enabled", None),
+            "observation_norm/standard_normal": obs_norm_cfg.get("standard_normal", None),
         },
     )
+
     wandb.define_metric("iter")
     wandb.define_metric("loss/*", step_metric="iter")
     wandb.define_metric("reward/*", step_metric="iter")
@@ -25,6 +67,7 @@ def wandb_init(cfg: dict, cfg_path: str):
     wandb.define_metric("ts_step")
     wandb.define_metric("ts/*", step_metric="ts_step")
     return run
+
 
 def wandb_log_env_block(env, step: int, decision_interval: int):
     # log last decision block metrics aggregated per edge
@@ -71,6 +114,7 @@ def wandb_log_env_block(env, step: int, decision_interval: int):
             step=step,
         )
 
+
 def wandb_save_plots_from_history(env, out_dir="logs/wandb_plots"):
     os.makedirs(out_dir, exist_ok=True)
     if not getattr(env, "history", None):
@@ -106,10 +150,8 @@ def wandb_save_plots_from_history(env, out_dir="logs/wandb_plots"):
     for p in paths:
         art.add_file(p)
     wandb.log_artifact(art)
-    
-    
-    # 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
-    
+
+
 def wandb_log_iteration_timeseries(it: int, batch, obs_ts: dict):
     """
     obs_ts: dict of numpy or torch arrays shaped [T] or [T, n_edges]
@@ -133,8 +175,6 @@ def wandb_log_iteration_timeseries(it: int, batch, obs_ts: dict):
     ])
 
     n_edges = actions.shape[1] if actions.ndim == 2 else 1
-    
-    print(obs_ts)
 
     for t in range(T):
         for e in range(n_edges):
@@ -162,8 +202,9 @@ def wandb_log_iteration_timeseries(it: int, batch, obs_ts: dict):
             ]
             table.add_data(*row)
 
-    wandb.log({"timeseries/step_table": table}, step=it)    
-    
+    wandb.log({"timeseries/step_table": table}, step=it)
+
+
 def wandb_log_batch_transitions(batch, obs_keys, step, tag="batch"):
     # batch keys typically: "observation", "action", ("next","reward"), ("next","done"), ...
     obs = batch["observation"].detach().cpu()          # [T, n_edges, obs_dim] or [T, B, n_edges, obs_dim]
@@ -200,4 +241,4 @@ def wandb_log_batch_transitions(batch, obs_keys, step, tag="batch"):
             row += [float(obs[t, e, j].item()) for j in range(D)]
             table.add_data(*row)
 
-    wandb.log({f"{tag}/transitions": table}, step=step)    
+    wandb.log({f"{tag}/transitions": table}, step=step)

@@ -10,7 +10,7 @@ globals:
   cpu_clock_cycle: 3.8 # Used to convert detection latency to cycle
   cpu_cores: 8
   fps: 5
-  decision_interval: 1000
+  decision_interval: 500
 
   ids:
     latency_ms: 0.0357 #0.357

@@ -1,0 +1,74 @@
+# =========================
+# Collector
+# =========================
+collector:
+  num_envs: 4
+  # frames_per_batch is in *decisions*, not raw env steps
+  # decisions_per_episode = ceil(t_max / decision_interval)
+  # frames_per_batch = decisions_per_episode * num_envs
+  frames_per_batch: 4096   # computed in code
+  total_frames: 20_480_000       # computed as frames_per_batch * 2000
+  trust_policy: true       # matches SyncDataCollector(... trust_policy=True)
+
+# =========================
+# Logger
+# =========================
+# logger
+logger:
+  backend: wandb
+  entity: asture123-national-taiwan-university
+  project_name: edgeids
+  exp_name: penv4*4
+  plots:
+    enabled: true
+    out_dir: logs/wandb_plots
+
+# =========================
+# Optimizer
+# =========================
+optim:
+  lr: 1.0e-4               # matches Adam(lr=1e-4)
+  eps: 1.0e-8              # default Adam eps (you didn't override)
+  weight_decay: 0.0
+  max_grad_norm: 1.0       # matches clip_grad_norm_(..., 1.0)
+  anneal_lr: false         # no LR annealing in your code
+  device: cuda
+
+# =========================
+# PPO / Loss
+# =========================
+loss:
+  gamma: 0.98              # matches GAE(gamma=0.98)
+  gae_lambda: 0.95         # matches lmbda=0.95
+  ppo_epochs: 20           # matches ppo_epochs = 20
+  mini_batch_size: 128     # matches minibatch_size = 128
+  clip_epsilon: 0.2        # matches ClipPPOLoss(clip_epsilon=0.2)
+  anneal_clip_epsilon: false
+  critic_coeff: 1.0
+  entropy_coeff: 1.0e-3    # matches entropy_coef=1e-3
+  loss_critic_type: smooth_l1
+  normalize_advantage: false  # you normalize manually
+
+# =========================
+# Model
+# =========================
+model:
+  hidden_dim: 64           # ActorNet / CriticNet hidden size
+  n_actions: 3             # discrete {scale down, hold, scale up}
+
+# =========================
+# Observation normalization
+# =========================
+observation_norm:
+  enabled: true
+  standard_normal: true    # ObservationNorm(standard_normal=True)
+  decay: null              # not using VecNorm
+  eps: 1.0e-6
+
+# =========================
+# Compile / CUDA graphs
+# =========================
+compile:
+  compile: false
+  compile_mode: null
+  cudagraphs: false
