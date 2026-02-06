@@ -132,7 +132,7 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
     # populate mean/std from rollouts
     env.transform.train()
     env.transform.init_stats(
-        num_iter=5,
+        num_iter=1000,
         reduce_dim=(0, 1),
         cat_dim=0,
     )
@@ -195,7 +195,7 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
         entropy_coef=train_cfg["loss"]["entropy_coeff"],
         critic_coef=train_cfg["loss"]["critic_coeff"],
         loss_critic_type=train_cfg["loss"]["loss_critic_type"],
-        # normalize_advantage=True, 
+        normalize_advantage=True, 
     )
 
     loss.set_keys(
@@ -204,7 +204,7 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
         value_target="value_target",
     )
 
-    frames_per_batch = train_cfg.get("collector",{}).get("frames_per_batch", None) if not None else decisions_per_episode * num_envs * num_envs
+    frames_per_batch = train_cfg.get("collector",{}).get("frames_per_batch", decisions_per_episode * num_envs * num_envs)
     total_frames = train_cfg["collector"]["total_frames"]
 
     collector = SyncDataCollector(
@@ -280,13 +280,6 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
         B = int(flat.batch_size[0])
         n_mb = _num_minibatches(B)
         total_network_updates = max(1, iters_total * ppo_epochs * n_mb)
-
-        adv_t = traj["advantage"]
-        traj.set(
-            "advantage",
-            (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
-        )
-
 
         # train
         for _ in range(ppo_epochs):
@@ -385,7 +378,7 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
                 "loss/entropy": float(out.get("loss_entropy", torch.tensor(0.0, device=device)).detach().item()),
             },
         )
-        # collector.update_policy_weights_()
+        collector.update_policy_weights_()
         # env.transform.train() 
         # stop once episode is finished
         if batch["done"].any():
