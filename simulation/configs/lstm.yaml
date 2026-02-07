@@ -18,7 +18,7 @@ logger:
   backend: wandb
   entity: asture123-national-taiwan-university
   project_name: edgeids
-  exp_name: lstm
+  exp_name: penv4*4
   plots:
     enabled: true
     out_dir: logs/wandb_plots

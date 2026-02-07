@@ -15,7 +15,10 @@ from environment import TorchRLEnvWrapper
 from torchrl.envs.transforms import ObservationNorm, VecNorm, TransformedEnv
 from torchrl.envs import ParallelEnv  # or ParallelEnv if you want multiprocessing
 from torchrl.modules import LSTMModule
-
+from torchrl.envs.transforms import Compose
+from torchrl.envs.transforms import InitTracker
+from torchrl.data import LazyTensorStorage, TensorDictReplayBuffer
+from torchrl.data.replay_buffers.samplers import SliceSampler
 from logger import *
 
 
@@ -137,15 +140,18 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
 
     env = TransformedEnv(
         penv,
-        ObservationNorm(
-            in_keys=["observation_flat"],
-            standard_normal=train_cfg["observation_norm"]["standard_normal"],
+        Compose(
+            InitTracker(),  # provides "is_init" so LSTM can reset hidden state
+            ObservationNorm(
+                in_keys=["observation_flat"],
+                standard_normal=train_cfg["observation_norm"]["standard_normal"],
+            ),
         ),
     )
 
     # populate mean/std from rollouts
     env.transform.train()
-    env.transform.init_stats(
+    env.transform[-1].init_stats(  # ObservationNorm is last in your Compose
         num_iter=5,
         reduce_dim=(0, 1),
         cat_dim=0,
@@ -156,48 +162,57 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
 
     feature_dim = train_cfg["model"]["hidden_dim"]
 
-    feature_module = TensorDictModule(
-        FeatureNet(obs_size, feature_dim),
+    # actor feature + lstm
+    feature_module_actor = TensorDictModule(
+        FeatureNet(obs_size, feature_dim).to(device),
         in_keys=["observation_flat"],
-        out_keys=["features"],
+        out_keys=["features_actor"],
     )
-
-    lstm_module = LSTMModule(
+    lstm_actor = LSTMModule(
         input_size=feature_dim,
         hidden_size=feature_dim,
-        in_key="features",
-        out_key="features",
+        in_key="features_actor",
+        out_key="features_actor",
         device=device,
     )
-    core = TensorDictSequential(
-        feature_module,
-        lstm_module,
-    )
-
     actor_head = TensorDictModule(
-        nn.Linear(feature_dim, train_cfg["model"]["n_actions"]),
-        in_keys=["features"],
+        nn.Linear(feature_dim, train_cfg["model"]["n_actions"]).to(device),
+        in_keys=["features_actor"],
         out_keys=["logits"],
     )
-
-    critic_head = TensorDictModule(
-        nn.Linear(feature_dim, 1),
-        in_keys=["features"],
-        out_keys=["state_value"],
-    )
+    actor_core = TensorDictSequential(feature_module_actor, lstm_actor, actor_head)
 
     policy = ProbabilisticActor(
-        module=TensorDictSequential(core, actor_head),
+        module=actor_core,
         in_keys=["logits"],
         out_keys=["action"],
         distribution_class=Categorical,
         return_log_prob=True,
     )
 
-    value = ValueOperator(
-        TensorDictSequential(core, critic_head)
+    # critic feature + lstm
+    feature_module_critic = TensorDictModule(
+        FeatureNet(obs_size, feature_dim).to(device),
+        in_keys=["observation_flat"],
+        out_keys=["features_critic"],
     )
+    lstm_critic = LSTMModule(
+        input_size=feature_dim,
+        hidden_size=feature_dim,
+        in_key="features_critic",
+        out_key="features_critic",
+        device=device,
+        recurrent_state_key="recurrent_state_critic",  # if your version supports it
+    )
+    critic_head = TensorDictModule(
+        nn.Linear(feature_dim, 1).to(device),
+        in_keys=["features_critic"],
+        out_keys=["state_value"],
+    )
+    critic_core = TensorDictSequential(feature_module_critic, lstm_critic, critic_head)
 
+    value = ValueOperator(critic_core)    
+    seq_len = int(train_cfg["loss"].get("seq_len", 32))  # 16/32/64 common
     adv = GAE(
         gamma=train_cfg["loss"]["gamma"],
         lmbda=train_cfg["loss"]["gae_lambda"],
@@ -290,7 +305,7 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
         # env.transform.eval() 
         x = batch["observation_flat"]
         print("obs_flat mean/std/min/max:", float(x.mean()), float(x.std()), float(x.min()), float(x.max()))
-        print(batch.keys(True, True))
+
         assert_finite(batch, "BATCH")
         assert_finite(batch["next"], "NEXT")
 
@@ -301,23 +316,40 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
         traj.set("done", traj.get(("next", "done")))
         traj.set("terminated", traj.get(("next", "terminated")))
         traj.set("truncated", traj.get(("next", "truncated")))
-        
+
         with torch.no_grad():
             value(traj)          # writes "state_value" into traj
             value(traj["next"])  # writes "state_value" into traj["next"]
             adv(traj)
-        flat = traj.flatten(0, -1)
-        B = int(flat.batch_size[0])
-        n_mb = _num_minibatches(B)
-        total_network_updates = max(1, iters_total * ppo_epochs * n_mb)
+                    
+        data = traj  # [T, B, ...]
 
-        # train
+        sampler = SliceSampler(
+            slice_len=seq_len,
+            end_key="done",          # because you set traj["done"] above
+            cache_values=True,
+            strict_length=False,
+        )
+
+        storage_size = data.numel()  # T * B
+        rb = TensorDictReplayBuffer(
+            storage=LazyTensorStorage(storage_size, device="cpu"),
+            sampler=sampler,
+            batch_size=minibatch_size,          # number of sequences per minibatch
+            transform=lambda td: td.to(device),
+        )
+
+        # IMPORTANT: keep each env contiguous in storage
+        data_for_rb = data.transpose(0, 1).contiguous()   # [B, T, ...]
+        rb.extend(data_for_rb.reshape(-1).cpu())
+        sample = next(iter(rb))
+        print(sample.batch_size)  # should look like [seq_len, minibatch_size]
+        print(sample.keys(True, True))
+        num_sequences = max(1, len(rb))
+        total_network_updates = max(1, iters_total * ppo_epochs * num_sequences)
+
         for _ in range(ppo_epochs):
-            perm = torch.randperm(B, device=device)
-            for start in range(0, B, minibatch_size):
-                mb = flat[perm[start:start + minibatch_size]]
-
-                # linear schedule over total network updates (Atari)
+            for mb in rb:
                 alpha = 1.0 - (num_network_updates / total_network_updates)
                 if alpha < 0.0:
                     alpha = 0.0
@@ -325,10 +357,8 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
                 num_network_updates += 1
 
                 out = loss(mb)
-                total_loss = (
-                    out["loss_objective"]
-                    + out["loss_critic"]
-                    + out.get("loss_entropy", torch.tensor(0.0, device=device))
+                total_loss = out["loss_objective"] + out["loss_critic"] + out.get(
+                    "loss_entropy", torch.tensor(0.0, device=device)
                 )
 
                 optim.zero_grad(set_to_none=True)
