@@ -507,6 +507,31 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
                 },
             )
 
+<<<<<<< HEAD
+=======
+                log_dict = {
+                    f"ts_step": ts_step,
+                    f"ts/action": a,
+                    f"ts/qoe": q,
+                }
+
+                for e in range(E):
+                    for j, k in enumerate(base_env.obs_keys):
+                        log_dict[f"ts/edge_{e}/{k}"] = float(obs[t, b, e, j].item())
+
+                wandb.log(log_dict, commit=True)
+        wandb.log(
+            {
+                "iter": it,
+                "qoe/mean": float(batch["next", "qoe_mean"].mean().item()),
+                "reward/mean": float(batch["next", "reward"].mean().item()),
+                "loss/total": float(total_loss.detach().item()),
+                "loss/policy": float(out["loss_objective"].detach().item()),
+                "loss/critic": float(out["loss_critic"].detach().item()),
+                "loss/entropy": float(out.get("loss_entropy", torch.tensor(0.0, device=device)).detach().item()),
+            },
+        )
+>>>>>>> 3a85424 (Stabilize yaml logging and Atari Params)
         collector.update_policy_weights_()
 if __name__ == "__main__":
     # train(resume_ckpt="checkpoints/atk_yoyo_lin/ckpt_iter_000500.pt")
