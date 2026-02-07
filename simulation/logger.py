@@ -63,6 +63,7 @@ def wandb_init(env_cfg: dict, train_cfg: dict):
     wandb.define_metric("iter")
     wandb.define_metric("loss/*", step_metric="iter")
     wandb.define_metric("reward/*", step_metric="iter")
+    wandb.define_metric("qoe/*", step_metric="iter")
 
     wandb.define_metric("ts_step")
     wandb.define_metric("ts/*", step_metric="ts_step")

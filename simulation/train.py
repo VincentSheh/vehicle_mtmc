@@ -371,6 +371,7 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
         wandb.log(
             {
                 "iter": it,
+                "qoe/mean": float(batch["next", "qoe_mean"].mean().item()),
                 "reward/mean": float(batch["next", "reward"].mean().item()),
                 "loss/total": float(total_loss.detach().item()),
                 "loss/policy": float(out["loss_objective"].detach().item()),
