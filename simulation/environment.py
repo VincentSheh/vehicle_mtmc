@@ -195,19 +195,20 @@ class Environment:
         I_net = I_in - I_out  # shape: (n,)
         return states, decisions, I_net
     
-    def step(self, ids_cpu, scaling=0):
+    def step(self, ids_cpus, overhead=0):
         offload_states = []
         local_cache = {}
-
-        # action expected shape: (n_edges,)
         for i, edge in enumerate(self.edge_areas):
-            ai = ids_cpu[i]
-            if torch.is_tensor(ai):
-                ai = float(ai.detach().item())
-            edge.cpu_to_ids_ratio =  ai / edge.budget.cpu
+            overhead_ids = overhead if overhead > 0.0 else 0.0          # scale-up lag hits IDS
+            overhead_va  = abs(overhead) if overhead < 0.0 else 0.0          # scale-down lag hits VA
+            edge.ids_cpu = ids_cpus[i] - overhead_ids # Only deduct ids_cpu because va is already deducted
+            edge.va_cpu = edge.budget.cpu - ids_cpus[i] - overhead_va
 
             cache = edge.step_local(self.t)
             local_cache[edge.area_id] = cache
+            assert(edge.ids_cpu + edge.va_cpu <= edge.budget.cpu)
+            assert(edge.ids_cpu >= 0.5)
+            assert(edge.va_cpu >= 0.5)
 
         # 3) Final QoE computation per edge
         for edge in self.edge_areas:
@@ -233,7 +234,7 @@ class Environment:
                     ema = cache["ema"],
                     ema_mom = cache["ema_mom"],
                     attack_drop_rate=float(ids_out.get("attack_drop_rate", 0.0)),
-                    cpu_to_ids_ratio = edge.cpu_to_ids_ratio,
+                    cpu_to_ids_ratio = edge.ids_cpu / edge.budget.cpu, #Note this is the target not actual
                     va_cpu_utilization = cache["va_cpu_utilization"],
                     ids_cpu_utilization = ids_out["ids_cpu_util"],
                     bw_utilization = cache["uplink_util"],
@@ -421,7 +422,7 @@ class TorchRLEnvWrapper(EnvBase):
         self.ids_cpu_min = 0.5
 
         self.ids_cpu = torch.tensor(
-            [e.cpu_to_ids_ratio * e.budget.cpu for e in self.env.edge_areas],
+            [e.ids_cpu for e in self.env.edge_areas],
             device=self.device,
             dtype=torch.float32,
         )
@@ -561,27 +562,33 @@ class TorchRLEnvWrapper(EnvBase):
 
     def _step(self, tensordict: TensorDict) -> TensorDict:
         action = tensordict["action"]                       # scalar 0/1/2
-        delta = action.to(self.device).float() - 1.0
-        # delta = self._reactive_delta()  # -1, 0, +1
+        # propose change
+        delta_cmd = (action.to(self.device).float() - 1.0) * self.scale_step
+        # delta_cmd = self._reactive_delta() * self.scale_step  # -1, 0, +1
 
+        prev_ids = self.ids_cpu[0].clone()
         edge = self.env.edge_areas[0]
         self.ids_cpu[0] = torch.clamp(
-            self.ids_cpu[0] + delta * self.scale_step,
+            self.ids_cpu[0] + delta_cmd,
             min=self.ids_cpu_min,
             max=edge.budget.cpu - 0.5,
-            # max=edge.budget.cpu / 2.0,
         )
+        
+        delta_eff = float((self.ids_cpu[0] - prev_ids).item())
         ids_cpu = self.ids_cpu.clone()
+
+        # delta = 0
         # ids_cpu = [1.5]
-        # print(action, delta, ids_cpu)
+        # overhead is nonnegative and charged because you changed allocation
+        overhead = float(self.scale_overhead_coeff * delta_eff)
 
         total_reward = 0.0
         terminated_flag = False
         steps = 0
 
         # 2) Simulate decision_interval internal timesteps
-        for _ in range(self.decision_interval):
-            self.env.step(ids_cpu)
+        for i in range(self.decision_interval):
+            self.env.step(ids_cpu, overhead)
             total_reward += float(self._build_reward())
             steps += 1
             if self.env.t >= self.env.t_max:
@@ -690,7 +697,7 @@ def test_environment_run(cfg_path: str, plot=False):
         env.reset(seed=1000 + i)
 
         for _ in range(env.t_max):
-            env.step([0.0])
+            env.step([0.5])
 
         df = pd.DataFrame([m.__dict__ for m in env.history])
         df["episode"] = i

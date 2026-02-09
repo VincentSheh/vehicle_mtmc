@@ -166,8 +166,8 @@ class EdgeArea:
         
         self.pipeline = pipeline
 
-        self.cpu_to_ids_ratio = 0.9375
-        # self.cpu_to_ids_ratio = 0.5
+        self.ids_cpu = self.budget.cpu - 0.5
+        self.va_cpu = self.budget.cpu - self.ids_cpu
 
         self._last_action: Optional[Tuple[str, int]] = None
 
@@ -198,30 +198,6 @@ class EdgeArea:
             atk.reset(seed=atk_seed)     
         idx = int(self.rng.integers(0, len(self.attackers)))
         self.cur_attacker = [self.attackers[idx]]
-    
-    # --------------------------
-    # Resource model (cycles)
-    # --------------------------
-
-    def split_resources(self) -> ResourceSplit:
-        ids_cpu = self.budget.cpu * self.cpu_to_ids_ratio
-        va_cpu = self.budget.cpu - ids_cpu
-
-        return ResourceSplit(
-            va=ResourceBudget(cpu=va_cpu, mem=self.budget.mem, uplink=self.budget.uplink),
-            ids=ResourceBudget(cpu=ids_cpu, mem=self.budget.mem, uplink=self.budget.uplink),
-        )
-
-    def total_cycles_per_ms(self) -> float:
-        # total parallel cycles per ms
-        return float(self.cpu_cycle_per_ms * self.budget.cpu)
-
-    def avail_cycles_per_ms(self) -> float:
-        # remaining cycles for VA after reserving IDS CPU share
-        return float(self.total_cycles_per_ms() * (1.0 - self.cpu_to_ids_ratio))
-
-    def ids_cycles_per_ms(self) -> float:
-        return float(self.total_cycles_per_ms() * self.cpu_to_ids_ratio)
 
     # --------------------------
     # Load aggregation
@@ -263,14 +239,11 @@ class EdgeArea:
         }
 
     def aggregate_load_after_ids(self, t: int, attack_dict = Dict[str, Any]) -> Dict[str, float]:
-        """
-        Returns IDS output stats using the current cpu_to_ids_ratio.
-        """
         user_rate = float(sum(u.num_requests_at(t) for u in self.users))
         return self.ids.classify_rates(
             attack_dict=attack_dict,
             user_rate=user_rate,
-            cpu_ratio_to_ids=self.cpu_to_ids_ratio,
+            ids_cpu=self.ids_cpu,
         )
 
     def estimate_detection_cycles_this_frame(
@@ -651,7 +624,7 @@ class EdgeArea:
         
         # 3) VA compute supply (after attacks)
         total_cycles_per_ms = self.cpu_cycle_per_ms * self.budget.cpu
-        avail_cycles_per_ms = total_cycles_per_ms * (1.0 - self.cpu_to_ids_ratio)
+        avail_cycles_per_ms = self.cpu_cycle_per_ms * self.va_cpu
 
         avail_cycles_aft_atk_per_ms = max(0.0, avail_cycles_per_ms - attack_cycles_per_ms)
         # If nothing survives uplink or no compute, return outage-ish state

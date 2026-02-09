@@ -10,7 +10,6 @@ class IDS:
       - processing_speed_pkt_per_ms (at full CPU) -> cycles_per_packet
 
     Runtime:
-      - ids_cycles_per_ms = cpu_ratio_to_ids * total_cycles_per_ms_full
       - effective_speed_pkt_per_ms = ids_cycles_per_ms / cycles_per_packet
     """
 
@@ -25,7 +24,7 @@ class IDS:
         if cycles_per_packet <= 0:
             raise ValueError("IDS processing speed must be > 0")
 
-        self.total_cycles_per_ms_full: float = float(cpu_cycle_per_ms) * int(cpu_cores)
+        self.total_cycles_per_ms_per_core: float = cpu_cycle_per_ms
 
         # cycles/packet at full CPU
         self.cycles_per_packet: float = cycles_per_packet
@@ -39,12 +38,11 @@ class IDS:
             tpr = 1.0 - fnr
             self.acc_tpr_fpr[str(atk_type)] = (tpr, fpr)
 
-    def effective_cycles_per_step(self, cpu_ratio_to_ids: float) -> float:
-        cpu_ratio = float(np.clip(cpu_ratio_to_ids, 0.0, 1.0))
-        return cpu_ratio * self.total_cycles_per_ms_full * self.slot_ms
+    def effective_cycles_per_step(self, ids_cpu: float) -> float:
+        return ids_cpu * self.total_cycles_per_ms_per_core * self.slot_ms
 
-    def effective_speed_pkt_per_step(self, cpu_ratio_to_ids: float) -> float:
-        ids_cycles = self.effective_cycles_per_step(cpu_ratio_to_ids)
+    def effective_speed_pkt_per_step(self, ids_cpu: float) -> float:
+        ids_cycles = self.effective_cycles_per_step(ids_cpu)
         if self.cycles_per_packet <= 0:
             return 0.0
         return ids_cycles / self.cycles_per_packet
@@ -53,12 +51,12 @@ class IDS:
         self,
         attack_dict: Dict[str,Any],
         user_rate: float,
-        cpu_ratio_to_ids: float,
+        ids_cpu: float,
     ) -> Dict[str, float]:
         total_attack = float(attack_dict["flows"])
         total_in = float(user_rate + total_attack)
 
-        speed = self.effective_speed_pkt_per_step(cpu_ratio_to_ids)
+        speed = self.effective_speed_pkt_per_step(ids_cpu)
         coverage = float(min(1.0, speed / total_in)) if total_in > 0 else 1.0
 
         # attacks: expected dropped = coverage * TPR * rate
@@ -84,7 +82,7 @@ class IDS:
         user_drop = coverage * avg_fpr * float(user_rate)
         user_pass = max(0.0, float(user_rate) - user_drop)
 
-        ids_cycles_available = self.effective_cycles_per_step(cpu_ratio_to_ids)
+        ids_cycles_available = self.effective_cycles_per_step(ids_cpu)
         ids_used_cycles = min(total_in * self.cycles_per_packet, ids_cycles_available)
         ids_cpu_util = min(1.0, ids_used_cycles / (ids_cycles_available + 1e-6))
 
