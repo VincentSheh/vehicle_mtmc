@@ -13,8 +13,15 @@ import torch
 import matplotlib.pyplot as plt
 
 from environment import build_env_base  # your project
-from train import ActorNet
+from train import ActorNet, FeatureNet
 from tqdm import tqdm
+from torchrl.modules import LSTMModule
+from tensordict.nn import TensorDictModule, TensorDictSequential, InteractionType
+from torchrl.modules import ProbabilisticActor, ValueOperator
+from torch.distributions import Categorical
+import torch.nn as nn
+import numpy as np
+from tensordict import TensorDict
 
 
 class RLPolicy:
@@ -22,59 +29,111 @@ class RLPolicy:
         self.device = torch.device(device)
         self.greedy = greedy
 
-        # IMPORTANT: obs_size = n_edges * obs_dim (matches training)
-        self.net = ActorNet(obs_dim=obs_size, n_actions=3).to(self.device)
-
         state = torch.load(ckpt_path, map_location=self.device)
         self.obsnorm = state.get("obsnorm", None)
+        # ---- rebuild training architecture ----
+        feature_dim = state["train_cfg"]["model"]["hidden_dim"]        
+        n_actions = state["train_cfg"]["model"]["n_actions"]
+        self.h_size = feature_dim
+        self.n_layers = 1 
+        feature_module = TensorDictModule(
+            FeatureNet(obs_size, feature_dim).to(self.device),
+            in_keys=["observation_flat"],
+            out_keys=["features"],
+        )
 
-        if isinstance(state, dict) and "actor_net" in state:
-            self.net.load_state_dict(state["actor_net"])
-        elif isinstance(state, dict) and "state_dict" in state:
-            self.net.load_state_dict(state["state_dict"])
-        elif isinstance(state, dict):
-            self.net.load_state_dict(state)
-        else:
-            raise ValueError("Unsupported checkpoint format for RL actor.")
+        self.lstm = LSTMModule(
+            input_size=feature_dim,
+            hidden_size=feature_dim,
+            in_key="features",
+            out_key="features",
+            device=self.device,
+        )
 
-        self.net.eval()
+        actor_head = TensorDictModule(
+            nn.Linear(feature_dim, n_actions).to(self.device),
+            in_keys=["features"],
+            out_keys=["logits"],
+        )
+
+        self.shared_core = TensorDictSequential(feature_module, self.lstm).to(self.device)
+        self.actor = TensorDictSequential(self.shared_core, actor_head).to(self.device)
+
+        # match training policy wrapper only if you need log_prob etc
+        self.policy = ProbabilisticActor(
+            module=self.actor,
+            in_keys=["logits"],
+            out_keys=["action"],
+            distribution_class=Categorical,
+            return_log_prob=False,
+        ).to(self.device)
+
+        # ---- load weights ----
+        self.policy.load_state_dict(state["policy"])
+
+
+        # keep recurrent state for inference
+        self._h = None
+        self._c = None
+        self.policy.eval()
+        
+        # you saved env.state_dict() under "obsnorm" so it is NOT directly loc/scale
+        self.env_state = state.get("obsnorm", None)
+        
+        self.obs_loc = None
+        self.obs_scale = None
+        if self.env_state is not None:
+            # find loc/scale tensors inside env.state_dict()
+            loc_key = next((k for k in self.env_state.keys() if k.endswith("loc")), None)
+            scale_key = next((k for k in self.env_state.keys() if k.endswith("scale")), None)
+            if loc_key and scale_key:
+                self.obs_loc = self.env_state[loc_key].detach().to(self.device).reshape(-1)
+                self.obs_scale = self.env_state[scale_key].detach().to(self.device).reshape(-1)        
 
     def normalize_obs_flat(self, obs_flat: np.ndarray) -> np.ndarray:
-        """
-        obs_flat: (obs_size,)
-        """
-        if self.obsnorm is None:
+        if self.obs_loc is None or self.obs_scale is None:
             return obs_flat
-
-        # ObservationNorm state_dict usually contains loc/scale for the in_keys tensor
-        loc = self.obsnorm["loc"].detach().cpu().numpy()
-        scale = self.obsnorm["scale"].detach().cpu().numpy()
-
-        # handle possible extra dims
-        loc = loc.reshape(-1)
-        scale = scale.reshape(-1)
-
+        loc = self.obs_loc.detach().cpu().numpy()
+        scale = self.obs_scale.detach().cpu().numpy()
         return (obs_flat - loc) / (scale + 1e-8)
 
     @torch.no_grad()
-    def act_from_obs_flat(self, obs_flat: np.ndarray) -> np.ndarray:
-        """
-        obs_flat: (obs_size,)
-        returns delta array shape (n_edges,) in {-1,0,+1}
-        for n_edges=1 it returns shape (1,)
-        """
-        x = torch.from_numpy(obs_flat.astype(np.float32)).to(self.device)
-        logits = self.net(x)                  # (3,) if obs_flat is (obs_size,)
-        probs = torch.softmax(logits, dim=-1)
+    def act_from_obs_flat(self, obs_flat: np.ndarray) -> int:
+        td = TensorDict(
+            {"observation_flat": torch.tensor(obs_flat, device=self.device).unsqueeze(0)},
+            batch_size=[1],
+            device=self.device,
+        )
+
+        if self._h is None:
+            hs = self.h_size
+            self._h = torch.zeros(self.n_layers, 1, hs, device=self.device)
+            self._c = torch.zeros(self.n_layers, 1, hs, device=self.device)
+
+        td.set("recurrent_state_h", self._h)
+        td.set("recurrent_state_c", self._c)
+        td.set("is_init", torch.zeros(1, 1, device=self.device, dtype=torch.bool))
+
+        td = self.actor(td)                    # writes "logits"
+        logits = td.get("logits").squeeze(0)   # [n_actions]
+
+        # update recurrent state from td (LSTMModule writes back)
+        self._h = td.get("recurrent_state_h")
+        self._c = td.get("recurrent_state_c")
 
         if self.greedy:
-            a = torch.argmax(probs, dim=-1)
+            a = int(torch.argmax(logits, dim=-1).item())
         else:
-            a = torch.multinomial(probs, num_samples=1).squeeze(-1)
-
-        delta = int(a.item()) - 1
+            probs = torch.softmax(logits, dim=-1)
+            a = int(torch.multinomial(probs, 1).item())
+        delta = int(a) - 1
         return np.array([delta], dtype=np.int64)
 
+
+    
+    def reset(self):
+        self._h = None
+        self._c = None    
 
 def build_observation_from_history(env, decision_interval: int, obs_keys: List[str]) -> np.ndarray:
     """
@@ -207,6 +266,7 @@ def run_episode(
                 delta = np.zeros(n_edges, dtype=np.int64)
 
         elif method == "rl":
+            rl_policy.reset()   # call once before decisions loop
             if rl_policy is None:
                 raise ValueError("rl_policy is None but method == 'rl'")
 
@@ -333,12 +393,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cfg", type=str, default="./configs/simulation_0.yaml")
     ap.add_argument("--outdir", type=str, default="eval_out")
-    ap.add_argument("--episodes", type=int, default=20)
+    ap.add_argument("--episodes", type=int, default=10)
     ap.add_argument("--decision_interval", type=int, default=500)
     ap.add_argument("--scale_step", type=float, default=0.5)
     ap.add_argument("--ids_cpu_min", type=float, default=0.5)
 
-    ap.add_argument("--rl_ckpt", type=str, default="checkpoints/ppo_simulation_0/ckpt_iter_000500.pt")
+    # ap.add_argument("--rl_ckpt", type=str, default="checkpoints/penv4*4_anneal/ckpt_iter_000600.pt")
+    # ap.add_argument("--rl_ckpt", type=str, default="checkpoints/atari_cfg/ckpt_iter_000400.pt")
+    ap.add_argument("--rl_ckpt", type=str, default="checkpoints/lstm_epoch_20/ckpt_iter_001500.pt")
     # ap.add_argument("--rl_ckpt", type=str, default="checkpoints/ppo_simulation_0/ckpt_epoch20.pt")
     # ap.add_argument("--rl_ckpt", type=str, default="checkpoints/ppo_simulation_0/ckpt_ema_000900.pt")
     ap.add_argument("--rl_device", type=str, default="cuda")
