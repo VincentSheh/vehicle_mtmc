@@ -337,6 +337,7 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
         # ---- build PPO traj ----
         traj = batch.clone(False)
         traj.set("reward", traj.get(("next", "reward")))
+        traj.set("qoe_mean", traj.get(("next", "qoe_mean")))
         traj.set("done", traj.get(("next", "done")).to(torch.bool))
         traj.set("terminated", traj.get(("next", "terminated")).to(torch.bool))
         traj.set("truncated", traj.get(("next", "truncated")).to(torch.bool))
@@ -483,7 +484,7 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
                 collector_policy, value, optim, env_cfg, train_cfg, it + 1, device, env,
             )
 
-        print(f"Iteration={it} reward_mean={batch['next','reward'].mean().item():.4f}")
+        print(f"Iteration={it} reward_mean={batch['next','reward'].mean().item():.4f} qoe_mean={batch['next','qoe_mean'].mean().item():.4f}")
         print("after norm T,B:", T, B, "done shape:", done.shape, "done_bt shape:", done_bt.shape)
 
         if last_out is not None and last_total_loss is not None:
@@ -496,7 +497,6 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
                     "loss/policy": float(last_out["loss_objective"].detach().item()),
                     "loss/critic": float(last_out["loss_critic"].detach().item()),
                     "loss/entropy": float(last_out.get("loss_entropy", torch.tensor(0.0, device=device)).detach().item()),
-                    "mb/num_sequences": float(num_sequences),
                 },
             )
 

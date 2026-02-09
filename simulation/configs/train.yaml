@@ -18,7 +18,7 @@ logger:
   backend: wandb
   entity: asture123-national-taiwan-university
   project_name: edgeids
-  exp_name: lstm_epoch_20
+  exp_name: lstm_epoch_20_linear
   plots:
     enabled: true
     out_dir: logs/wandb_plots
