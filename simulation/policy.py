@@ -287,18 +287,22 @@ def run_episode(
                 break
 
         # ---------- metrics ----------
-        qoe = decision_qoe_mean(env, decision_interval)
-
+        qoe = decision_qoe_mean(env, decision_interval)    
         block = env.history[-decision_interval * n_edges :]
         df = pd.DataFrame([m.__dict__ for m in block])
 
         qoe_ts.append(qoe)
+         
         cpu_util_ts.append(cpu_util)
 
         local_num_req_ts.append(float(df["local_num_req"].mean()) if "local_num_req" in df.columns else 0.0)
         attack_in_rate_ts.append(float(df["attack_in_rate"].mean()) if "attack_in_rate" in df.columns else 0.0)
         cpu_to_ids_ratio_ts.append(float(df["cpu_to_ids_ratio"].mean()) if "cpu_to_ids_ratio" in df.columns else 0.0)
 
+
+
+
+    # If you want "final QoE with SLO" for this edge:
     return {
         "qoe": np.asarray(qoe_ts, dtype=np.float32),
         "cpu_util": np.asarray(cpu_util_ts, dtype=np.float32),
@@ -330,7 +334,12 @@ def plot_ts_continuous(results: Dict[str, Dict[str, np.ndarray]], outpath: Path,
                 y_valid = y[np.isfinite(y)]
                 avg_qoe = float(np.nanmean(y_valid)) if y_valid.size else 0.0
                 vio_rate = float(np.nanmean((y_valid < float(slo_qoe_min)).astype(np.float32))) if y_valid.size else 0.0
-                label = f"{method} (avg={avg_qoe:.3f}, vio={vio_rate:.2%})"
+                
+                viol = (y_valid < 0.2).astype(np.float32)
+                viol_rate = float(viol.mean()) if len(viol) > 0 else 0.0
+                V_edge = np.exp(-3 * viol_rate)                
+                label = f"{method} (avg={avg_qoe*V_edge:.3f}, vio={vio_rate:.2%})"
+                # violation indicator: 1 if QoE below threshold else 0
             else:
                 label = method
 
@@ -346,19 +355,30 @@ def plot_ts_continuous(results: Dict[str, Dict[str, np.ndarray]], outpath: Path,
     plt.close()
 
 
-def plot_qoe_vio_bars(results: Dict[str, Dict[str, np.ndarray]], outpath: Path, qoe_slo_min: float = 0.2):
+def plot_qoe_vio_bars(results: Dict[str, Dict[str, np.ndarray]],
+                      outpath: Path,
+                      qoe_slo_min: float = 0.2,
+                      beta: float = 3.0):
     methods, avg_qoe, vio_rate = [], [], []
 
     for method, series in results.items():
         qoe = series.get("qoe", None)
-        if qoe is None or qoe.size == 0:
+        if qoe is None:
             continue
-        q = qoe[np.isfinite(qoe)]
-        methods.append(method)
-        avg_qoe.append(float(np.nanmean(q)) if q.size else 0.0)
-        vio_rate.append(float(np.nanmean((q < qoe_slo_min).astype(np.float32))) if q.size else 0.0)
 
-    x = np.arange(len(methods))
+        q = np.asarray(qoe, dtype=np.float32)
+        q = q[np.isfinite(q)]
+        if q.size == 0:
+            continue
+
+        vr = float(np.mean((q < qoe_slo_min).astype(np.float32)))  # scalar
+        v = float(np.exp(-beta * vr))                               # scalar
+
+        methods.append(method)
+        vio_rate.append(vr)
+        avg_qoe.append(float(np.mean(q)) * v)
+
+    x = np.arange(len(methods), dtype=np.int32)
     width = 0.7
 
     fig, axes = plt.subplots(1, 2, figsize=(10, 4))
@@ -371,7 +391,8 @@ def plot_qoe_vio_bars(results: Dict[str, Dict[str, np.ndarray]], outpath: Path, 
     axes[0].grid(axis="y", alpha=0.3)
     for bar in bars_qoe:
         h = float(bar.get_height())
-        axes[0].text(bar.get_x() + bar.get_width() / 2, h, f"{h:.3f}", ha="center", va="bottom", fontsize=9)
+        axes[0].text(bar.get_x() + bar.get_width() / 2, h, f"{h:.3f}",
+                     ha="center", va="bottom", fontsize=9)
 
     bars_vio = axes[1].bar(x, vio_rate, width)
     axes[1].set_xticks(x)
@@ -382,12 +403,12 @@ def plot_qoe_vio_bars(results: Dict[str, Dict[str, np.ndarray]], outpath: Path, 
     axes[1].grid(axis="y", alpha=0.3)
     for bar in bars_vio:
         h = float(bar.get_height())
-        axes[1].text(bar.get_x() + bar.get_width() / 2, h, f"{h:.1%}", ha="center", va="bottom", fontsize=9)
+        axes[1].text(bar.get_x() + bar.get_width() / 2, h, f"{h:.1%}",
+                     ha="center", va="bottom", fontsize=9)
 
     plt.tight_layout()
     plt.savefig(outpath, dpi=200)
     plt.close()
-
 
 def main():
     ap = argparse.ArgumentParser()
@@ -400,7 +421,7 @@ def main():
 
     # ap.add_argument("--rl_ckpt", type=str, default="checkpoints/penv4*4_anneal/ckpt_iter_000600.pt")
     # ap.add_argument("--rl_ckpt", type=str, default="checkpoints/atari_cfg/ckpt_iter_000400.pt")
-    ap.add_argument("--rl_ckpt", type=str, default="checkpoints/lstm_epoch_20/ckpt_iter_001400.pt")
+    ap.add_argument("--rl_ckpt", type=str, default="checkpoints/lstm_epoch_20_linear/ckpt_iter_000650.pt")
     # ap.add_argument("--rl_ckpt", type=str, default="checkpoints/ppo_simulation_0/ckpt_epoch20.pt")
     # ap.add_argument("--rl_ckpt", type=str, default="checkpoints/ppo_simulation_0/ckpt_ema_000900.pt")
     ap.add_argument("--rl_device", type=str, default="cuda")

@@ -198,6 +198,8 @@ class Environment:
     def step(self, ids_cpus, overhead=0):
         offload_states = []
         local_cache = {}
+        if isinstance(ids_cpus, torch.Tensor):
+            ids_cpus = ids_cpus.detach().cpu().tolist() 
         for i, edge in enumerate(self.edge_areas):
             overhead_ids = overhead if overhead > 0.0 else 0.0          # scale-up lag hits IDS
             overhead_va  = abs(overhead) if overhead < 0.0 else 0.0          # scale-down lag hits VA
@@ -577,10 +579,10 @@ class TorchRLEnvWrapper(EnvBase):
         delta_eff = float((self.ids_cpu[0] - prev_ids).item())
         ids_cpu = self.ids_cpu.clone()
 
-        # delta = 0
+        delta = 0
         # ids_cpu = [1.5]
         # overhead is nonnegative and charged because you changed allocation
-        overhead = float(self.scale_overhead_coeff * delta_eff)
+        overhead = delta_eff
 
         total_reward = 0.0
         terminated_flag = False

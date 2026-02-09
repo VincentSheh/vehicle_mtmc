@@ -152,7 +152,7 @@ class EdgeArea:
         self.budget = budget
         self.slot_ms = slot_ms
         self.slo_beta = slo_beta
-        self.slo_threshold = slo_beta
+        self.slo_threshold = slo_threshold
 
         self.constraints = {
             "D_Max": float(constraints.get("D_Max", 1e9)),
@@ -682,8 +682,6 @@ class EdgeArea:
         )
         qoe, od_and_res_plan = self.match_detectors_to_resolutions(upload_plan, od_plan)
         
-        va_cpu_utilization = used_cycles / (avail_cycles_per_ms * self.slot_ms)
-
         va_cpu_utilization = used_cycles / (avail_cycles_per_ms * self.slot_ms)
 
         served_compute = int(sum(od_plan.values()))
