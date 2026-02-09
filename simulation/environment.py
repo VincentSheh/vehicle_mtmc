@@ -101,6 +101,7 @@ class Environment:
         self.t = 0
         self.history: List[StepMetrics] = []
         self.last_history: List[StepMetrics] = []
+        self.final_qoe = 0
 
         np.random.seed(seed)
 
@@ -108,6 +109,7 @@ class Environment:
         self.t = 0
         self.last_history = list(self.history)
         self.history.clear()
+        self.final_qoe = 0
         for i, edge in enumerate(self.edge_areas):
             edge.reset(seed=seed + i)        
 
@@ -193,13 +195,13 @@ class Environment:
         I_net = I_in - I_out  # shape: (n,)
         return states, decisions, I_net
     
-    def step(self, action):
+    def step(self, ids_cpu, scaling=0):
         offload_states = []
         local_cache = {}
 
         # action expected shape: (n_edges,)
         for i, edge in enumerate(self.edge_areas):
-            ai = action[i]
+            ai = ids_cpu[i]
             if torch.is_tensor(ai):
                 ai = float(ai.detach().item())
             edge.cpu_to_ids_ratio =  ai / edge.budget.cpu
@@ -241,6 +243,30 @@ class Environment:
             )
 
         self.t += 1
+        qoe_slo = []
+        if self.t >= self.t_max:
+            # Calculate the QoE with SLO Violation Rate
+            for i,edge in enumerate(self.edge_areas):
+                h = [m for m in self.history if m.area_id == edge.area_id]
+                if len(h) == 0:
+                    continue
+
+                last_block = h[-self.t_max:]  # sliding window at the end
+                qoes = np.asarray([float(m.qoe_mean) for m in last_block], dtype=np.float32)
+
+                # violation indicator: 1 if QoE below threshold else 0
+                viol = (qoes < edge.slo_threshold).astype(np.float32)
+
+                # violation rate in [0,1]
+                viol_rate = float(viol.mean()) if len(viol) > 0 else 0.0
+
+                # SLO term V in (0,1]
+                V_edge = np.exp(-edge.slo_beta * viol_rate)
+
+                # If you want "final QoE with SLO" for this edge:
+                qoe_slo.append(float(qoes.mean()) * V_edge)
+            self.final_qoe = np.mean(qoe_slo)
+                
         
         
 def build_env_base(cfg_path: str):
@@ -317,6 +343,8 @@ def build_env_base(cfg_path: str):
             area_id=area_cfg["area_id"],
             cpu_cycle_per_ms=area_cfg.get("cpu_cycle_per_ms"),
             slot_ms=globals_cfg.slot_ms,
+            slo_beta=area_cfg["slo_beta"],
+            slo_threshold=area_cfg["slo_threshold"],
             budget=ResourceBudget(**area_cfg["budget"]),
             constraints=area_cfg["constraints"],
             ids=ids,
@@ -577,9 +605,7 @@ class TorchRLEnvWrapper(EnvBase):
 
         t_internal_end = int(self.env.t)  # end-of-window index (exclusive)
 
-        last_block = self.env.history[-self.n_edges:]
-        qoes = [float(m.qoe_mean) for m in last_block]
-        qoe_mean = float(np.mean(qoes))
+        qoe_mean = float(self.env.final_qoe)
 
         return TensorDict(
             {
@@ -588,7 +614,7 @@ class TorchRLEnvWrapper(EnvBase):
                 "reward": reward,
 
                 # logging keys that ParallelEnv can batch safely
-                "qoe_mean": torch.tensor([qoe_mean], dtype=torch.float32, device=self.device),
+                "qoe_mean": torch.tensor([qoe_mean*30], dtype=torch.float32, device=self.device),
                 "t_internal": torch.tensor([t_internal_end], dtype=torch.int64, device=self.device),
 
                 "done": done,
@@ -632,6 +658,7 @@ class TorchRLEnvWrapper(EnvBase):
         return obs
 
     def _build_reward(self) -> torch.Tensor:
+        # this is called every internal timestep (500 per decision interval)
         if not self.env.history:
             return torch.zeros(1, dtype=torch.float32, device=self.device)
         last_block = self.env.history[-self.n_edges:]
@@ -648,12 +675,6 @@ class TorchRLEnvWrapper(EnvBase):
         qoes_adj = qoes - penalty
 
         reward = float(qoes_adj.mean())
-
-        # qoes = np.array(qoes, dtype=float)
-        # qoes[qoes < 0.2] -= 0.6
-
-        # mean_qoe = float(qoes.mean())
-        # reward = mean_qoe
 
         return torch.tensor(
             [reward],

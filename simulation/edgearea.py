@@ -138,6 +138,8 @@ class EdgeArea:
         area_id: str,
         cpu_cycle_per_ms: float,
         slot_ms: float,
+        slo_beta: float,
+        slo_threshold: float,
         budget: ResourceBudget,
         constraints: Dict[str, float],
         ids: IDS,
@@ -149,6 +151,8 @@ class EdgeArea:
         self.cpu_cycle_per_ms = float(cpu_cycle_per_ms)
         self.budget = budget
         self.slot_ms = slot_ms
+        self.slo_beta = slo_beta
+        self.slo_threshold = slo_beta
 
         self.constraints = {
             "D_Max": float(constraints.get("D_Max", 1e9)),

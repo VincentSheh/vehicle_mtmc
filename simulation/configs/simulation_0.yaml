@@ -188,6 +188,8 @@ globals:
 edge_areas:
   - area_id: "E1"
     cpu_cycle_per_ms: 3.8 #3.8GHz #3.8E6 / ms
+    slo_beta: 3.0
+    slo_threshold: 0.2
     budget: { cpu: 8.0, mem: 8.0, uplink: 100 } #100Mbps
     constraints:
       D_Max: 250.0
