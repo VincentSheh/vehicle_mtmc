@@ -336,6 +336,7 @@ def build_env_base(cfg_path: str):
                     ts_df=pd.read_csv(atk_cfg["ts_path"]),
                     latency_per_flow=atk_cfg["latency_per_flow"],
                     bw_per_flow=atk_cfg["bw_per_flow"],
+                    base_scaling=atk_cfg["scaling"],
                     non_defendable_bw_const=atk_cfg["non_defendable_bw_const"],
                     slot_ms=globals_cfg.slot_ms,
                     t_max=cfg["run"]["t_max"],
@@ -414,7 +415,7 @@ class TorchRLEnvWrapper(EnvBase):
             "cpu_to_ids_ratio",
             # "va_cpu_utilization",
             "ids_cpu_utilization",
-            # "overhead",
+            "overhead",
             # "bw_utilization",
             # "I_net",
         ]

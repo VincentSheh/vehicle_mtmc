@@ -23,7 +23,7 @@ globals:
       latency_per_flow: 0.0
       bw_per_flow: 0.0371 # 0.0371 #original max_bw when scaling=1.0 is 190mb
       non_defendable_bw_const: 0.0 
-      scaling: 1.0 # base_scaling for flows_per_sec
+      scaling: 1.0 
 
     atk_02:
       type: drdos_snmp
@@ -49,13 +49,13 @@ globals:
       non_defendable_bw_const: 0.0
       scaling: 1.0
 
-    # atk_05:
-    #   type: syn_flood
-    #   ts_path: output/cicddos2019_1_pruned/Syn.csv
-    #   latency_per_flow: 0.5
-    #   bw_per_flow: 0.0 #original max_bw when scaling=1.0 is 0mb
-    #   non_defendable_bw_const: 0.0
-    #   scaling: 2.0
+    atk_05:
+      type: syn_flood
+      ts_path: output/cicddos2019_1_pruned/Syn.csv
+      latency_per_flow: 1.0
+      bw_per_flow: 0.0 #original max_bw when scaling=1.0 is 0mb
+      non_defendable_bw_const: 0.0
+      scaling: 1.0
 
     atk_06:
       type: drdos_ntp
@@ -215,6 +215,7 @@ edge_areas:
       - attacker_type: "atk_02"
       - attacker_type: "atk_03"
       - attacker_type: "atk_04"
+      - attacker_type: "atk_05"
 
   # - area_id: "E2"
   #   cpu_cycle_per_ms: 3.8 #3.8GHz #3.8E6 / ms

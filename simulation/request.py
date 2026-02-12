@@ -23,6 +23,7 @@ class Attacker:
         ts_df,
         latency_per_flow,
         bw_per_flow,
+        base_scaling,
         non_defendable_bw_const,
         slot_ms,
         t_max,
@@ -46,7 +47,7 @@ class Attacker:
         self.df["attack_type"] = attack_type 
         self.df["attacker_id"] = attacker_id 
         self.df["forward_bytes_per_sec"] = self.df["forward_bytes_per_sec"] / (1024*1024)
-        self.df["flows_per_sec"] = self.df["flows_per_sec"]
+        self.df["flows_per_sec"] = self.df["flows_per_sec"] * base_scaling
 
         required = {
             "forward_packets_per_sec",
@@ -109,7 +110,6 @@ class Attacker:
         # self.df["flows_per_sec_ema_mom"] = self.df[f"flows_per_sec_ema"].diff(hl).fillna(0.0) / (hl)          
         mom_raw = self.df["flows_per_sec_ema"].diff().fillna(0.0)
         self.df["flows_per_sec_ema_mom"] = mom_raw.ewm(alpha=alpha, adjust=False).mean()        
-        self.df.to_csv("test.csv")        
         self._flows = self.df["flows_per_sec"].to_numpy(dtype=np.float32)
         self._flows_ema = self.df["flows_per_sec_ema"].to_numpy(dtype=np.float32)
         self._flows_ema_mom = self.df["flows_per_sec_ema_mom"].to_numpy(dtype=np.float32)
