@@ -95,7 +95,7 @@ class CriticNet(nn.Module):
     def forward(self, obs):
         return self.net(obs).squeeze(-1)
 
-def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/train.yaml", device="cuda"):
+def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/train.yaml", resume_ckpt=None, device="cuda"):
     with open(env_cfg_path, "r") as f:
         env_cfg = yaml.safe_load(f)
     with open(train_cfg_path, "r") as f:
@@ -197,14 +197,7 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
         out_keys=["state_value"],
     )
 
-    # policy used by collector: DOES include shared_core
-    collector_policy = ProbabilisticActor(
-        module=TensorDictSequential(shared_core, actor_head),
-        in_keys=["logits"],
-        out_keys=["action"],
-        distribution_class=Categorical,
-        return_log_prob=True,
-    )
+
 
     # actor for loss, head-only
     loss_actor = ProbabilisticActor(
@@ -215,9 +208,31 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
         return_log_prob=True,
     )
 
+
+    # policy used by collector: DOES include shared_core
+    collector_policy = ProbabilisticActor(
+        module=TensorDictSequential(shared_core, actor_head),
+        in_keys=["logits"],
+        out_keys=["action"],
+        distribution_class=Categorical,
+        return_log_prob=True,
+    )
     # critic for loss, head-only
     value = critic_head   # reads "features" -> writes "state_value"
-
+    optim = torch.optim.Adam(
+        list(shared_core.parameters()) +
+        list(actor_head.parameters()) +
+        list(critic_head.parameters()),
+        lr=train_cfg["optim"]["lr"],
+        weight_decay=train_cfg["optim"]["weight_decay"],
+        eps=train_cfg["optim"]["eps"],
+    )
+    if resume_ckpt is not None:
+        print(f"Loading checkpoint: {resume_ckpt}")
+        state = torch.load(resume_ckpt, map_location=device)
+        collector_policy.load_state_dict(state["policy"])
+        value.load_state_dict(state["value"])
+        optim.load_state_dict(state["optim"])    
     adv = GAE(
         gamma=train_cfg["loss"]["gamma"],
         lmbda=train_cfg["loss"]["gae_lambda"],
@@ -261,14 +276,7 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
         split_trajs=False,
     )
 
-    optim = torch.optim.Adam(
-        list(shared_core.parameters()) +
-        list(actor_head.parameters()) +
-        list(critic_head.parameters()),
-        lr=train_cfg["optim"]["lr"],
-        weight_decay=train_cfg["optim"]["weight_decay"],
-        eps=train_cfg["optim"]["eps"],
-    )
+
 
     ppo_epochs = train_cfg["loss"]["ppo_epochs"]
     minibatch_size = train_cfg["loss"]["mini_batch_size"]
@@ -502,4 +510,5 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
 
         collector.update_policy_weights_()
 if __name__ == "__main__":
+    # train(resume_ckpt="checkpoints/lstm_epoch_20_linear/ckpt_iter_000950.pt")
     train()

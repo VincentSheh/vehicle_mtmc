@@ -24,6 +24,7 @@ class Attacker:
         latency_per_flow,
         bw_per_flow,
         base_scaling,
+        mean_rep,
         non_defendable_bw_const,
         slot_ms,
         t_max,
@@ -39,6 +40,9 @@ class Attacker:
         self.non_defendable_bw_const = non_defendable_bw_const
         self.slot_ms = slot_ms
         self.t_max=t_max
+        self.mean_rep = mean_rep
+        self.rep = 1
+        self.scaling = 1
         
         # -----------------------------
         # Prepare dataframe
@@ -92,7 +96,7 @@ class Attacker:
             "attacker_id": self.attacker_id,
         })
 
-        self.df = pd.concat([self.df, pad_df], ignore_index=True)            
+        # self.df = pd.concat([self.df, pad_df], ignore_index=True)            
         # -----------------------------
         # Precompute EMA and momentum on the trace timeline
         # -----------------------------
@@ -121,9 +125,24 @@ class Attacker:
         
     def _init_start(self):
         trace_len_steps = len(self.df) * self.steps_per_sec
-        max_start = self.t_max - trace_len_steps
+
+        # number of repetitions (Poisson around mean_rep)
+        if self.mean_rep != 0:
+            self.rep = max(1, int(self.rng.poisson(lam=self.mean_rep)))
+
+        # random scaling per episode
+        self.scaling = float(self.rng.uniform(0.2, 2.0))
+
+        # random gap duration between repetitions (in steps)
+        self.gap_steps = int(self.rng.integers(
+            low=50 * self.steps_per_sec,      # 5 sec
+            high=100 * self.steps_per_sec     # 30 sec
+        ))
+
+        total_len = self.rep * trace_len_steps + (self.rep - 1) * self.gap_steps
+
+        max_start = self.t_max - total_len
         self.start = int(self.rng.integers(0, max_start + 1)) if max_start > 0 else 0
-        self.scaling = float(self.rng.uniform(0.2,2.0))
 
     def reset(self, seed=None):
         if seed is not None:
@@ -135,11 +154,25 @@ class Attacker:
         local_step = t - self.start
         if local_step < 0:
             return None
-        sec_idx = local_step // self.steps_per_sec
-        if sec_idx < 0 or sec_idx >= self._flows.shape[0]:
+
+        trace_len_steps = len(self.df) * self.steps_per_sec
+        cycle_len = trace_len_steps + self.gap_steps
+
+        rep_idx = local_step // cycle_len
+
+        if rep_idx >= self.rep:
             return None
 
-        # return a compact payload
+        within_cycle = local_step % cycle_len
+        if within_cycle == 0:
+            self.scaling = max(0.2, self.scaling + float(self.rng.uniform(-0.2, 0.2)))
+
+        # inside gap
+        if within_cycle >= trace_len_steps:
+            return None
+
+        sec_idx = within_cycle // self.steps_per_sec
+
         return {
             "attacker_id": self.attacker_id,
             "attack_type": self.attack_type,

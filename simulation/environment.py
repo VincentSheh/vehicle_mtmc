@@ -337,6 +337,7 @@ def build_env_base(cfg_path: str):
                     latency_per_flow=atk_cfg["latency_per_flow"],
                     bw_per_flow=atk_cfg["bw_per_flow"],
                     base_scaling=atk_cfg["scaling"],
+                    mean_rep=atk_cfg["mean_rep"],
                     non_defendable_bw_const=atk_cfg["non_defendable_bw_const"],
                     slot_ms=globals_cfg.slot_ms,
                     t_max=cfg["run"]["t_max"],
