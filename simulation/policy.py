@@ -421,7 +421,7 @@ def main():
 
     # ap.add_argument("--rl_ckpt", type=str, default="checkpoints/penv4*4_anneal/ckpt_iter_000600.pt")
     # ap.add_argument("--rl_ckpt", type=str, default="checkpoints/atari_cfg/ckpt_iter_000400.pt")
-    ap.add_argument("--rl_ckpt", type=str, default="checkpoints/lstm_epoch_20_linear/ckpt_iter_000650.pt")
+    ap.add_argument("--rl_ckpt", type=str, default="checkpoints/lstm_epoch_20_linear/ckpt_iter_001100.pt")
     # ap.add_argument("--rl_ckpt", type=str, default="checkpoints/ppo_simulation_0/ckpt_epoch20.pt")
     # ap.add_argument("--rl_ckpt", type=str, default="checkpoints/ppo_simulation_0/ckpt_ema_000900.pt")
     ap.add_argument("--rl_device", type=str, default="cuda")

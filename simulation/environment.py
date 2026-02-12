@@ -61,6 +61,8 @@ class StepMetrics:
     va_cpu_utilization: float
     bw_utilization: float
 
+    overhead: float
+    
     # Per-step plan (detector mixing)
     od_plan: Dict[str, int] = field(default_factory=dict)
 
@@ -240,6 +242,7 @@ class Environment:
                     va_cpu_utilization = cache["va_cpu_utilization"],
                     ids_cpu_utilization = ids_out["ids_cpu_util"],
                     bw_utilization = cache["uplink_util"],
+                    overhead = overhead,
                     # I_net = I_net_e,
                     # od_plan = od_plan,
                 )
@@ -411,6 +414,7 @@ class TorchRLEnvWrapper(EnvBase):
             "cpu_to_ids_ratio",
             # "va_cpu_utilization",
             "ids_cpu_utilization",
+            # "overhead",
             # "bw_utilization",
             # "I_net",
         ]
@@ -579,7 +583,6 @@ class TorchRLEnvWrapper(EnvBase):
         delta_eff = float((self.ids_cpu[0] - prev_ids).item())
         ids_cpu = self.ids_cpu.clone()
 
-        delta = 0
         # ids_cpu = [1.5]
         # overhead is nonnegative and charged because you changed allocation
         overhead = delta_eff
@@ -653,7 +656,7 @@ class TorchRLEnvWrapper(EnvBase):
                 vals = g[k].values
                 if k == "I_net":
                     obs[i, j] = float(np.sum(vals))
-                elif k == "cpu_to_ids_ratio":
+                elif k == "cpu_to_ids_ratio" or k=="overhead":
                     obs[i, j] = float(vals[-1])
                 elif k == "ema_mom":
                     vals_nz = vals[vals != 0.0]

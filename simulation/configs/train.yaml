@@ -2,11 +2,11 @@
 # Collector
 # =========================
 collector:
-  num_envs: 4
+  num_envs: 8
   # frames_per_batch is in *decisions*, not raw env steps
   # decisions_per_episode = ceil(t_max / decision_interval)
   # frames_per_batch = decisions_per_episode * num_envs
-  frames_per_batch: 1024   # computed in code
+  frames_per_batch: 2048   # computed in code
   total_frames: 20_480_000       # computed as frames_per_batch * 2000
   trust_policy: true       # matches SyncDataCollector(... trust_policy=True)
 
@@ -18,7 +18,7 @@ logger:
   backend: wandb
   entity: asture123-national-taiwan-university
   project_name: edgeids
-  exp_name: lstm_ep_20_so
+  exp_name: lstm_ep_20_so_e8
   plots:
     enabled: true
     out_dir: logs/wandb_plots

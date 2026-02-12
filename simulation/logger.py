@@ -47,6 +47,9 @@ def wandb_init(env_cfg: dict, train_cfg: dict):
             "loss/entropy_coeff": loss_cfg.get("entropy_coeff", None),
             "loss/critic_coeff": loss_cfg.get("critic_coeff", None),
             "loss/loss_critic_type": loss_cfg.get("loss_critic_type", None),
+            "loss/seq_len": loss_cfg.get("seq_len", None),
+            "loss/anneal_clip_epsilon": loss_cfg.get("anneal_clip_epsilon", None),
+            "loss/normalize_advantage": loss_cfg.get("normalize_advantage", None),
 
             "collector/frames_per_batch": collector_cfg.get("frames_per_batch", None),
             "collector/total_frames": collector_cfg.get("total_frames", None),
