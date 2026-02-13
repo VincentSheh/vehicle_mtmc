@@ -27,7 +27,7 @@ from request import User, Attacker
 
 from edgearea import ResourceBudget, EdgeArea
 
-from offload import OffloadDecision, OffloadState
+from offload import OffloadPlan, balance_with_caps_and_prop_filter
 
 @dataclass(frozen=True)
 class GlobalConfig:
@@ -104,6 +104,7 @@ class Environment:
         self.history: List[StepMetrics] = []
         self.last_history: List[StepMetrics] = []
         self.final_qoe = 0
+        self.prop_delay = None
 
         np.random.seed(seed)
 
@@ -113,166 +114,191 @@ class Environment:
         self.history.clear()
         self.final_qoe = 0
         for i, edge in enumerate(self.edge_areas):
-            edge.reset(seed=seed + i)        
+            edge.reset(seed=seed + i*99)        
 
-    def cooperative_offload_ot(
-        self,
-        states: List[OffloadState],
-    ) -> Tuple[List[OffloadState], List[OffloadDecision], np.ndarray]:
-        """
-        Synchronized greedy OT offloading across all edges.
+    def _area_ids(self) -> List[int]:
+        return [e.area_id for e in self.edge_areas]
 
-        Returns:
-        - updated states
-        - list of OffloadDecision
-        - I_net array of shape (n,) where I_net[i] = I_in[i] - I_out[i]
-        """
-        n = len(states)
-        for i, st in enumerate(states):
-            st.idx = i
-
-        decisions: List[OffloadDecision] = []
-
-        # per-slot offload counters
-        I_in = np.zeros(n, dtype=np.int64)
-        I_out = np.zeros(n, dtype=np.int64)
-
-        def finish_time_ms(st: OffloadState) -> float:
-            q = st.total_q()
-            if q <= 0:
-                return 0.0
-            if st.avail_cycles_aft_atk_per_ms <= 0:
-                return float("inf")
-            cycles = q * st.track_cycles_per_obj
-            return cycles / max(1e-9, st.avail_cycles_aft_atk_per_ms)
-
-        TOP = list(range(n))
-        TOP.sort(key=lambda i: finish_time_ms(states[i]))
-
-        changed = True
-        while changed:
-            changed = False
-
-            slow_order = sorted(TOP, key=lambda i: finish_time_ms(states[i]), reverse=True)
-
-            for src in slow_order:
-                src_st = states[src]
-                if src_st.total_q() <= 0:
-                    continue
-
-                local_C = finish_time_ms(src_st)
-
-                for dst in TOP:
-                    if dst == src:
-                        continue
-
-                    dst_st = states[dst]
-
-                    remote_cycles = (dst_st.total_q() + 1) * dst_st.track_cycles_per_obj
-                    remote_C = (
-                        remote_cycles / max(1e-9, dst_st.avail_cycles_aft_atk_per_ms)
-                        + float(self.delay_ms[src, dst])
-                    )
-
-                    # must still meet dst slack window
-                    if remote_C > dst_st.latest_track_finish_ms:
-                        continue
-
-                    # beneficial move
-                    if remote_C < local_C:
-                        # move exactly one object
-                        src_st.local_q_obj -= 1
-                        dst_st.recv_q_obj += 1
-
-                        I_out[src] += 1
-                        I_in[dst] += 1
-
-                        decisions.append(OffloadDecision(src_idx=src, dst_idx=dst, num_obj=1))
-
-                        # resort since workloads changed
-                        TOP.sort(key=lambda i: finish_time_ms(states[i]))
-                        changed = True
-                        break
-
-        I_net = I_in - I_out  # shape: (n,)
-        return states, decisions, I_net
+    def _edge_by_id(self) -> Dict[int, EdgeArea]:
+        return {e.area_id: e for e in self.edge_areas}
     
-    def step(self, ids_cpus, overhead=0):
-        offload_states = []
-        local_cache = {}
+    def _compute_tau_loc(self, W_va: Dict[int, float], c_va: Dict[int, float]) -> Dict[int, float]:
+        # local processing proxy, higher means slower, used as threshold against propagation delay
+        # tau_loc[e] = W_va[e] / c_va[e]
+        out: Dict[int, float] = {}
+        for e, w in W_va.items():
+            out[e] = float(w) / max(float(c_va[e]), 1e-9)
+        return out    
+    
+    def step(self, ids_cpus, overhead: float = 0.0):
+        """
+        Two-stage within one step:
+        A) IDS offload -> execute IDS at executors -> verdicts return to owners
+        B) VA offload computed on admitted users -> execute VA at executors
+        """
         if isinstance(ids_cpus, torch.Tensor):
-            ids_cpus = ids_cpus.detach().cpu().tolist() 
+            ids_cpus = ids_cpus.detach().cpu().tolist()
+
+        # 0) set cpu split on each edge
         for i, edge in enumerate(self.edge_areas):
-            overhead_ids = overhead if overhead > 0.0 else 0.0          # scale-up lag hits IDS
-            overhead_va  = abs(overhead) if overhead < 0.0 else 0.0          # scale-down lag hits VA
-            edge.ids_cpu = ids_cpus[i] - overhead_ids # Only deduct ids_cpu because va is already deducted
-            edge.va_cpu = edge.budget.cpu - ids_cpus[i] - overhead_va
+            overhead_ids = overhead if overhead > 0.0 else 0.0
+            overhead_va  = abs(overhead) if overhead < 0.0 else 0.0
+            edge.ids_cpu = float(ids_cpus[i]) - float(overhead_ids)
+            edge.va_cpu  = float(edge.budget.cpu) - float(ids_cpus[i]) - float(overhead_va)
+            assert edge.ids_cpu + edge.va_cpu <= edge.budget.cpu + 1e-6
+            assert edge.ids_cpu >= 0.5
+            assert edge.va_cpu >= 0.5
 
-            cache = edge.step_local(self.t)
-            local_cache[edge.area_id] = cache
-            assert(edge.ids_cpu + edge.va_cpu <= edge.budget.cpu)
-            assert(edge.ids_cpu >= 0.5)
-            assert(edge.va_cpu >= 0.5)
+        edges = self._edge_by_id()
+        area_ids = self._area_ids()
 
-        # 3) Final QoE computation per edge
+        # 1) observe arrivals at owners (ingress)
+        obs = {eid: edges[eid].observe_arrivals(self.t) for eid in area_ids}
+
+        # -----------------------
+        # A) IDS OFFLOAD + EXECUTE
+        # -----------------------
+        W_def_src = {eid: float(obs[eid]["total_workload_in"]) for eid in area_ids}
+        c_def_dst = {eid: float(edges[eid].ids_cpu) for eid in area_ids}
+
+        plan_def = balance_with_caps_and_prop_filter(
+            area_ids=area_ids,
+            edges=edges,
+            kappa_min=float(self.edge_areas[0].ids.cycles_per_packet),
+            W_src=W_def_src,
+            c_dst=c_def_dst,
+            prop_delay=self.prop_delay,
+            tau_loc=None,
+        )
+        ids_in_dst = plan_def.assigned_dst
+
+        # 2) derive what each EXECUTOR actually receives (split by owner's mix)
+        exec_user_in = {e: 0 for e in area_ids}
+        exec_atk_in  = {e: 0 for e in area_ids}
+
+        for e_owner in area_ids:
+            u = float(obs[e_owner]["user_req_in"])
+            a = float(obs[e_owner]["atk_req_in"])
+            tot = max(u + a, 1.0)
+            u_share = u / tot
+            a_share = a / tot
+
+            for e_exec, n_sent in plan_def.flow.get(e_owner, {}).items():
+                n_sent = float(n_sent)
+                exec_user_in[e_exec] += int(round(n_sent * u_share))
+                exec_atk_in[e_exec]  += int(round(n_sent * a_share))
+
+        # 3) execute IDS at executors using explicit counts
+        ids_out_exec = {}
+        for e_exec in area_ids:
+            edge = edges[e_exec]
+            ids_out_exec[e_exec] = edge.process_ids(
+                t=self.t,
+                user_in=int(exec_user_in[e_exec]),
+                atk_in=int(exec_atk_in[e_exec]),
+                inspect_in=int(exec_user_in[e_exec] + exec_atk_in[e_exec]),
+            )
+
+        # 4) executor verdict fractions (USE COUNTS, not rate fields)
+        user_pass_frac_exec = {}
+        atk_pass_frac_exec  = {}
+
+        for e_exec in area_ids:
+            u_in = max(int(exec_user_in[e_exec]), 0)
+            a_in = max(int(exec_atk_in[e_exec]), 0)
+
+            u_pass = float(ids_out_exec[e_exec].get("user_pass_cnt", u_in))
+            a_pass = float(ids_out_exec[e_exec].get("atk_pass_cnt", 0))
+
+            user_pass_frac_exec[e_exec] = 1.0 if u_in <= 0 else float(np.clip(u_pass / u_in, 0.0, 1.0))
+            atk_pass_frac_exec[e_exec]  = 0.0 if a_in <= 0 else float(np.clip(a_pass / a_in, 0.0, 1.0))
+
+        # 5) owner aggregates returned verdicts back to ingress owners
+        admitted_user_owner = {e: 0 for e in area_ids}
+        admitted_atk_owner  = {e: 0 for e in area_ids}
+
+        for e_owner in area_ids:
+            u = float(obs[e_owner]["user_req_in"])
+            a = float(obs[e_owner]["atk_req_in"])
+            tot = max(u + a, 1.0)
+            u_share = u / tot
+            a_share = a / tot
+
+            for e_exec, n_sent in plan_def.flow.get(e_owner, {}).items():
+                n_sent = float(n_sent)
+                sent_u = n_sent * u_share
+                sent_a = n_sent * a_share
+
+                admitted_user_owner[e_owner] += int(round(sent_u * user_pass_frac_exec.get(e_exec, 1.0)))
+                admitted_atk_owner[e_owner]  += int(round(sent_a * atk_pass_frac_exec.get(e_exec, 0.0)))
+
+        # -----------------------
+        # B) VA OFFLOAD + EXECUTE
+        # -----------------------
+        W_va_src = {eid: float(admitted_user_owner[eid]) for eid in area_ids}
+        c_va_dst = {eid: float(edges[eid].va_cpu) for eid in area_ids}
+        tau_loc  = self._compute_tau_loc(W_va_src, c_va_dst)
+
+        plan_va = balance_with_caps_and_prop_filter(
+            area_ids=area_ids,
+            edges=edges,
+            W_src=W_va_src,
+            c_dst=c_va_dst,
+            kappa_min=float(self.edge_areas[0].pipeline.detection_cycles("nanoDet-m")) * 1000.0,
+            prop_delay=self.prop_delay,
+            tau_loc=tau_loc,
+        )
+        va_in_dst = plan_va.assigned_dst
+
+        # execute VA at each destination edge
+        local_cache = {}
+        for e_exec in area_ids:
+            edge = edges[e_exec]
+            cache = edge.process_va(
+                t=self.t,
+                admitted_user_req_in=int(va_in_dst.get(e_exec, 0)),
+                attack_dict=obs[e_exec]["attack_dict"],   # local attack pressure at executor
+                ids_out=ids_out_exec[e_exec],             # executor IDS summary for attack pass frac etc
+            )
+            local_cache[e_exec] = cache
+
+        # 5) log metrics (same as your original, using cache)
         for edge in self.edge_areas:
             cache = local_cache[edge.area_id]
-            
-            D_Max = edge.constraints["D_Max"]
- 
             ids_out = cache["ids_out"]
-            # I_net_e = I_net[state.idx]
+
             self.history.append(
                 StepMetrics(
                     t=self.t,
                     area_id=edge.area_id,
                     qoe_mean=float(cache["qoe"]),
-                    
                     ids_coverage=float(ids_out.get("coverage", 0.0)),
                     attack_in_rate=float(ids_out.get("attack_in_rate", 0.0)),
                     user_drop_rate=float(ids_out.get("user_drop_rate", 0.0)),
-                    od_plan = cache["od_plan"],
-                    
-                    # RL Observation
-                    local_num_req = cache["local_num_request"],
-                    ema = cache["ema"],
-                    ema_mom = cache["ema_mom"],
+                    od_plan=cache["od_plan"],
+                    local_num_req=cache["local_num_request"],
+                    ema=cache["ema"],
+                    ema_mom=cache["ema_mom"],
                     attack_drop_rate=float(ids_out.get("attack_drop_rate", 0.0)),
-                    cpu_to_ids_ratio = edge.ids_cpu / edge.budget.cpu, #Note this is the target not actual
-                    va_cpu_utilization = cache["va_cpu_utilization"],
-                    ids_cpu_utilization = ids_out["ids_cpu_util"],
-                    bw_utilization = cache["uplink_util"],
-                    overhead = overhead,
-                    # I_net = I_net_e,
-                    # od_plan = od_plan,
+                    cpu_to_ids_ratio=edge.ids_cpu / edge.budget.cpu,
+                    va_cpu_utilization=cache["va_cpu_utilization"],
+                    ids_cpu_utilization=float(ids_out.get("ids_cpu_util", 0.0)),
+                    bw_utilization=cache["uplink_util"],
+                    overhead=overhead,
                 )
             )
 
+        # advance time
         self.t += 1
-        qoe_slo = []
-        if self.t >= self.t_max:
-            # Calculate the QoE with SLO Violation Rate
-            for i,edge in enumerate(self.edge_areas):
-                h = [m for m in self.history if m.area_id == edge.area_id]
-                if len(h) == 0:
-                    continue
 
-                last_block = h[-self.t_max:]  # sliding window at the end
-                qoes = np.asarray([float(m.qoe_mean) for m in last_block], dtype=np.float32)
-
-                # violation indicator: 1 if QoE below threshold else 0
-                viol = (qoes < edge.slo_threshold).astype(np.float32)
-
-                # violation rate in [0,1]
-                viol_rate = float(viol.mean()) if len(viol) > 0 else 0.0
-
-                # SLO term V in (0,1]
-                V_edge = np.exp(-edge.slo_beta * viol_rate)
-
-                # If you want "final QoE with SLO" for this edge:
-                qoe_slo.append(float(qoes.mean()) * V_edge)
-            self.final_qoe = np.mean(qoe_slo)
-                
+        # return caches plus policies if you want to debug
+        return {
+            "cache": local_cache,
+            "X_def_flow": plan_def.flow,
+            "X_va_flow": plan_va.flow,
+            "ids_in_dst": ids_in_dst,
+            "va_in_dst": va_in_dst,
+        }                
         
         
 def build_env_base(cfg_path: str):
@@ -700,11 +726,12 @@ def test_environment_run(cfg_path: str, plot=False):
     env = build_env_base(cfg_path)
 
     dfs = []
-    for i in range(5):
+    for i in range(1):
         env.reset(seed=1000 + i)
 
         for _ in range(env.t_max):
-            env.step([0.5])
+            # env.step([2.5]*len(env.edge_areas))
+            env.step([7.5, 7.5, 0.5])
 
         df = pd.DataFrame([m.__dict__ for m in env.history])
         df["episode"] = i
@@ -738,7 +765,7 @@ def test_environment_run(cfg_path: str, plot=False):
 
     (
         all_df.pivot(index="t", columns="area_id", values="local_num_req")
-        .plot(figsize=(10, 4), title="Num Request")
+        .plot(figsize=(20, 4), title="Num Request")
         .get_figure()
         .savefig(f"{out_dir}/local_num_req.png", bbox_inches="tight")
     )
@@ -753,14 +780,14 @@ def test_environment_run(cfg_path: str, plot=False):
     
     # Attack in 
     (
-        all_df.pivot(index="t", columns="area_id", values=["attack_in_rate", "ema"])
+        all_df.pivot(index="t", columns="area_id", values=["attack_drop_rate", "ema"])
         .plot(figsize=(10, 4), title="Attack In Rate")
         .get_figure()
-        .savefig(f"{out_dir}/attack_in_rate.png", bbox_inches="tight")
+        .savefig(f"{out_dir}/attack_drop_rate.png", bbox_inches="tight")
     )
-    avg_qoe = df["qoe_mean"].mean()
+    avg_qoe = all_df["qoe_mean"].mean()
     print(f"Average QoE (qoe_mean): {avg_qoe:.4f}")
     print(f"Plots saved to {out_dir}/")    
         
 if __name__ == "__main__":
-    test_environment_run("./configs/simulation_0.yaml", plot=True)
+    test_environment_run("./configs/simulation_ma_0.yaml", plot=True)

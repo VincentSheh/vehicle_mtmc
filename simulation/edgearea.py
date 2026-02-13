@@ -10,11 +10,6 @@ from service import IDS, VideoPipeline
 
 from request import User, Attacker
 
-from offload import (
-    OffloadState,
-    OffloadDecision,
-)
-
 @dataclass
 class ResourceBudget:
     cpu: float
@@ -27,94 +22,6 @@ class ResourceSplit:
     """Split an EdgeArea budget into application (VA) and defense (IDS)."""
     va: ResourceBudget
     ids: ResourceBudget
-
-def cooperative_offload_ot(
-    states: List[OffloadState],
-    delay_ms: np.ndarray,
-) -> Tuple[List[OffloadState], List[OffloadDecision]]:
-    """
-    Synchronized greedy OT offloading.
-
-    states: list of OffloadState, one per edge area.
-    delay_ms[i, j]: propagation delay from i to j in ms.
-
-    Returns:
-    - updated states (q_obj redistributed)
-    - list of offload decisions
-    """
-    n = len(states)
-    for i, st in enumerate(states):
-        st.idx = i
-
-    decisions: List[OffloadDecision] = []
-
-    def finish_time_ms(st: OffloadState) -> float:
-        # time to finish OT queue if processed locally at this edge
-        if st.q_obj <= 0:
-            return 0.0
-        cycles = st.q_obj * st.track_cycles_per_obj
-        return cycles / max(1e-9, st.avail_cycles_per_ms)
-
-    # Build TOP by expected finish time (fastest first)
-    TOP = list(range(n))
-    TOP.sort(key=lambda i: finish_time_ms(states[i]))
-
-    changed = True
-    while changed:
-        changed = False
-
-        # process slower edges first (descending finish time)
-        slow_order = sorted(TOP, key=lambda i: finish_time_ms(states[i]), reverse=True)
-
-        for src in slow_order:
-            src_st = states[src]
-            if src_st.q_obj <= 0:
-                continue
-
-            # try offloading objects one by one from the tail of the slowest queue
-            obj_idx = 0
-            while obj_idx < src_st.q_obj:
-                # local completion time for this object if it stays
-                # approximate by completion time of the whole queue (coarse but consistent)
-                local_C = finish_time_ms(src_st)
-
-                moved = False
-                # TO candidates are fastest first
-                fast_order = sorted(TOP, key=lambda i: finish_time_ms(states[i]))
-                for dst in fast_order:
-                    if dst == src:
-                        continue
-                    dst_st = states[dst]
-                    if dst_st.avail_cycles_per_ms <= 0:
-                        continue
-                    # remote completion time if one object is added to dst
-                    remote_cycles = (dst_st.q_obj + 1) * dst_st.track_cycles_per_obj
-                    remote_C = remote_cycles / max(1e-9, dst_st.avail_cycles_per_ms)
-                    remote_C += float(delay_ms[src, dst])
-
-                    # detection-safe constraint at receiver
-                    if remote_C > dst_st.latest_track_finish_ms + 1e-9:
-                        continue
-
-                    # strict improvement
-                    if remote_C + 1e-9 < local_C:
-                        # apply offload
-                        src_st.q_obj -= 1
-                        dst_st.q_obj += 1
-
-                        decisions.append(OffloadDecision(src_idx=src, dst_idx=dst, num_obj=1))
-
-                        # update TOP ordering because finish times changed
-                        TOP.sort(key=lambda i: finish_time_ms(states[i]))
-                        changed = True
-                        moved = True
-                        break
-
-                if not moved:
-                    # cannot move this object beneficially
-                    obj_idx += 1
-
-    return states, decisions        
 
 class EdgeArea:
     """
@@ -183,8 +90,6 @@ class EdgeArea:
         # 1) Reset own RNG
         if seed is not None:
             self.rng = np.random.default_rng(seed)
-        elif not hasattr(self, "rng"):
-            self.rng = np.random.default_rng()
 
 
         # 2) Reset users (independent seeds)
@@ -238,13 +143,97 @@ class EdgeArea:
             "mom": mom,
         }
 
-    def aggregate_load_after_ids(self, t: int, attack_dict = Dict[str, Any]) -> Dict[str, float]:
-        user_rate = float(sum(u.num_requests_at(t) for u in self.users))
-        return self.ids.classify_rates(
+    def aggregate_load_after_ids(
+        self,
+        t: int,
+        user_in: int,
+        atk_in: int,
+        inspect_in: int,
+        attack_dict: Dict[str, Any] | None = None,
+    ) -> Dict[str, float]:
+        """
+        Executor-side IDS outcome based on OFFLOADED COUNTS.
+
+        Assumptions:
+          - IDS does not need to recompute arrivals from self.users here.
+          - IDS capacity is determined by self.ids_cpu.
+          - Pass/drop are computed as counts for this epoch.
+
+        Your existing ids.classify_rates expects rates. We provide both:
+          - *_in_rate are derived from counts / slot_s
+          - *_pass_rate are also rates, but we also return *_pass_cnt for correctness.
+        """
+        slot_s = float(self.slot_ms) / 1000.0
+        slot_s = max(slot_s, 1e-9)
+
+        user_in = max(int(user_in), 0)
+        atk_in = max(int(atk_in), 0)
+        inspect_in = max(int(inspect_in), 0)
+
+        # sanity
+        if inspect_in != user_in + atk_in:
+            inspect_in = user_in + atk_in
+
+        # convert to rates for your existing IDS model
+        user_rate = float(user_in) / slot_s
+        atk_rate = float(atk_in) / slot_s
+
+        # if your IDS model also needs attack_dict (e.g., FPR/FNR depends on attack type),
+        # pass it through, otherwise it can be None
+        attack_dict = attack_dict or {}
+
+        out = self.ids.classify_rates(
             attack_dict=attack_dict,
             user_rate=user_rate,
-            ids_cpu=self.ids_cpu,
+            ids_cpu=float(self.ids_cpu),
         )
+
+        # out is assumed to include (rate-like):
+        #   user_drop_rate (fraction), user_pass_rate (rate or count in your old code),
+        #   attack_in_rate (rate), attack_pass_rate (rate), etc.
+        #
+        # We will standardize to COUNTS for routing math:
+        user_drop_frac = float(out.get("user_drop_rate", 0.0))
+        user_drop_frac = float(np.clip(user_drop_frac, 0.0, 1.0))
+        user_pass_cnt = int(round(user_in * (1.0 - user_drop_frac)))
+
+        # attack: if ids.classify_rates already computes attack pass rate, use it
+        # otherwise, approximate using attack_drop_rate/attack_in_rate if present
+        atk_pass_cnt = 0
+        if atk_in > 0:
+            # prefer explicit pass fraction if available
+            if "attack_in_rate" in out and "attack_pass_rate" in out:
+                atk_in_rate = float(out.get("attack_in_rate", 0.0))
+                atk_pass_rate = float(out.get("attack_pass_rate", 0.0))
+                atk_pass_frac = 0.0 if atk_in_rate <= 0 else float(np.clip(atk_pass_rate / atk_in_rate, 0.0, 1.0))
+                atk_pass_cnt = int(round(atk_in * atk_pass_frac))
+            elif "attack_drop_rate" in out:
+                # if attack_drop_rate is a count-like, treat as count; if fraction, clamp
+                adr = float(out.get("attack_drop_rate", 0.0))
+                if adr <= 1.0:
+                    atk_pass_cnt = int(round(atk_in * (1.0 - float(np.clip(adr, 0.0, 1.0)))))
+                else:
+                    atk_pass_cnt = int(max(0, atk_in - int(round(adr))))
+            else:
+                atk_pass_cnt = 0
+
+        # attach standardized counts and derived rates for convenience
+        out["user_in_cnt"] = float(user_in)
+        out["atk_in_cnt"] = float(atk_in)
+        out["inspect_in_cnt"] = float(inspect_in)
+
+        out["user_pass_cnt"] = float(user_pass_cnt)
+        out["user_drop_cnt"] = float(user_in - user_pass_cnt)
+
+        out["atk_pass_cnt"] = float(atk_pass_cnt)
+        out["atk_drop_cnt"] = float(atk_in - atk_pass_cnt)
+
+        out["user_in_rate"] = user_rate
+        out["atk_in_rate"] = atk_rate
+        out["user_pass_rate"] = float(user_pass_cnt) / slot_s
+        out["attack_pass_rate"] = float(atk_pass_cnt) / slot_s
+
+        return out
 
     def estimate_detection_cycles_this_frame(
         self,
@@ -591,25 +580,77 @@ class EdgeArea:
         qoe = qoe_sum / float(total) if total > 0 else 0.0
         return float(qoe), assign
 
-    def step_local(self, t: int):
-        """
-        Request-based, OD-only, one fixed upload resolution.
-        If uplink bandwidth is not enough, drop user requests to fit uplink,
-        then allocate detector mix under compute, QoE computed inside allocate_detectors().
-        """
-
-        # 0) total user requests arriving this step
+    def observe_arrivals(self, t: int) -> Dict:
+        # user workload
         total_req_in = float(sum(u.num_requests_at(t) for u in self.users))
-        local_num_request = int(np.floor(total_req_in))
-        attack_dict = self._attack_agg_at(t)
+        user_req_in = int(np.floor(total_req_in))
 
-        ids_out = self.aggregate_load_after_ids(t, attack_dict)  # update signature
-        user_pass_rate = float(ids_out.get("user_pass_rate", total_req_in))
-        passed_req_pre_uplink = int(np.ceil(max(0.0, user_pass_rate)))
+        # attack workload (count proxy)
+        attack_dict = self._attack_agg_at(t)
+        atk_req_in = float(attack_dict["flows"])
+
+        # 2) otherwise convert rate to count
+        if atk_req_in <= 0.0:
+            if "lambda_req" in attack_dict:
+                # interpret as req/s
+                atk_req_in = float(attack_dict["lambda_req"]) * (float(self.slot_ms) / 1000.0)
+            elif "attack_in_rate" in attack_dict:
+                # interpret as req/s
+                atk_req_in = float(attack_dict["attack_in_rate"]) * (float(self.slot_ms) / 1000.0)
+            elif "flows_per_s" in attack_dict:
+                # interpret as req/s
+                atk_req_in = float(attack_dict["flows_per_s"]) * (float(self.slot_ms) / 1000.0)
+
+        atk_req_in_int = int(np.floor(max(0.0, atk_req_in)))
+
+        # total workload used by IDS stage proxy
+        total_workload_in = int(user_req_in + atk_req_in_int)
+
+        return {
+            "total_req_in": total_req_in,            # keep for backwards compatibility
+            "user_req_in": int(user_req_in),
+            "atk_req_in": int(atk_req_in_int),
+            "total_workload_in": int(total_workload_in),
+            "attack_dict": attack_dict,
+            "local_num_request": int(user_req_in),   # keep name used in your history logger
+        }
+
+    def process_ids(self, t: int, user_in: int, atk_in: int, inspect_in: int) -> Dict:
+        """
+        IDS executor-side processing.
+        Inputs are COUNTS for this epoch after IDS offloading has been applied.
+        Returns COUNTS (pass/drop) + utilization for routing math and logging.
+
+        user_in:  user inspection items received by this executor this epoch
+        atk_in:   attack inspection items received by this executor this epoch
+        inspect_in: user_in + atk_in (kept explicit to avoid mismatch)
+        """
+        ids_out = self.aggregate_load_after_ids(
+            t=t,
+            user_in=int(user_in),
+            atk_in=int(atk_in),
+            inspect_in=int(inspect_in),
+        )
+        return ids_out
+
+    def process_va(
+        self,
+        t: int,
+        admitted_user_req_in: int,
+        attack_dict: Dict,
+        ids_out: Dict,
+    ) -> Dict:
+        """
+        Executes VA pipeline for a given admitted workload count.
+        This is your step_local VA part, but replace passed_req_pre_uplink with admitted_user_req_in.
+        """
+        total_req_in = float(admitted_user_req_in)
+        local_num_request = int(admitted_user_req_in)
 
         atk_in = float(ids_out.get("attack_in_rate", 0.0))
         atk_pass = float(ids_out.get("attack_pass_rate", 0.0))
         atk_pass_frac = atk_pass / atk_in if atk_in > 0 else 0.0
+
         attack_uplink_in = attack_dict["bw_in"] * atk_pass_frac
         attack_cycles_per_ms = (attack_dict["cycles_per_s"] * atk_pass_frac) / 1000.0
 
@@ -617,19 +658,15 @@ class EdgeArea:
         attack_mom = attack_dict["mom"]
 
         uplink_total_mb = self.budget.uplink / (1000.0 / self.slot_ms)
-
         uplink_attack_used = attack_uplink_in
-
         uplink_available = max(0.0, uplink_total_mb - uplink_attack_used)
-        
-        # 3) VA compute supply (after attacks)
+
         total_cycles_per_ms = self.cpu_cycle_per_ms * self.budget.cpu
         avail_cycles_per_ms = self.cpu_cycle_per_ms * self.va_cpu
-
         avail_cycles_aft_atk_per_ms = max(0.0, avail_cycles_per_ms - attack_cycles_per_ms)
-        # If nothing survives uplink or no compute, return outage-ish state
-        if avail_cycles_aft_atk_per_ms <= 1e-12 or uplink_available <=1e-12:
-            cache = {
+
+        if avail_cycles_aft_atk_per_ms <= 1e-12 or uplink_available <= 1e-12:
+            return {
                 "ids_out": ids_out,
                 "local_num_request": local_num_request,
                 "ema": attack_ema,
@@ -638,13 +675,14 @@ class EdgeArea:
                 "od_plan": {},
                 "served_req": 0,
                 "dropped_compute": int(total_req_in),
-                "va_cpu_utilization": (total_cycles_per_ms - avail_cycles_aft_atk_per_ms) / total_cycles_per_ms,
-                "uplink_util": 1,
+                "va_cpu_utilization": (total_cycles_per_ms - avail_cycles_aft_atk_per_ms) / max(total_cycles_per_ms, 1e-9),
+                "uplink_util": 1.0,
                 "mean_latency_ms": float("inf"),
                 "qoe": 0.0,
-
             }
-            return cache
+
+        # Here we directly treat admitted_user_req_in as "passed pre uplink"
+        passed_req_pre_uplink = int(admitted_user_req_in)
 
         upload_plan, served_req_uplink, dropped_uplink, uplink_util, per_req_by_h = self.select_resolution(
             passed_req_pre_uplink=int(passed_req_pre_uplink),
@@ -654,21 +692,16 @@ class EdgeArea:
             upload_hs=(224, 320, 412),
         )
 
-        # 4) allocate detector mix under compute budget and compute QoE inside allocate_detectors
-        D_Max = float(self.constraints["D_Max"])
         gamma = float(self.constraints.get("Gamma", 0.0))
 
-        # derive detector list
         dets = []
         for a in self.pipeline.all_actions():
             det = a[0] if isinstance(a, tuple) else a
             dets.append(det)
         dets = sorted(set(dets))
 
-        # cost per request for each detector
         det_costs = {det: float(self.pipeline.detection_cycles(det)) for det in dets}
 
-        # optional quality
         det_quality = None
         if hasattr(self.pipeline, "det_quality"):
             det_quality = {det: float(self.pipeline.det_quality[det]) for det in dets}
@@ -681,8 +714,8 @@ class EdgeArea:
             gamma=float(gamma),
         )
         qoe, od_and_res_plan = self.match_detectors_to_resolutions(upload_plan, od_plan)
-        
-        va_cpu_utilization = used_cycles / (avail_cycles_per_ms * self.slot_ms)
+
+        va_cpu_utilization = used_cycles / max(avail_cycles_per_ms * self.slot_ms, 1e-9)
 
         served_compute = int(sum(od_plan.values()))
         assert served_compute + int(dropped_compute) == int(served_req_uplink)
@@ -690,21 +723,19 @@ class EdgeArea:
         if total_req_in <= 0:
             qoe = 1.0
         else:
-            qoe =  qoe * (served_compute / total_req_in)
-        cache = {
+            qoe = float(qoe) * (served_compute / total_req_in)
+
+        return {
             "ids_out": ids_out,
             "local_num_request": local_num_request,
             "ema": attack_ema,
             "ema_mom": attack_mom,
             "dropped_uplink": int(dropped_uplink),
-            "od_plan": od_plan,  # {det: n_req}
+            "od_plan": od_plan,
             "served_req": int(served_compute),
             "dropped_compute": int(dropped_compute),
             "va_cpu_utilization": float(va_cpu_utilization),
-            "uplink_util": uplink_util,
+            "uplink_util": float(uplink_util),
             "mean_latency_ms": float(mean_latency_ms),
             "qoe": float(qoe),
         }
-        return cache
-    
- 
