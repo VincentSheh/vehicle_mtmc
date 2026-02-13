@@ -6,7 +6,7 @@ collector:
   # frames_per_batch is in *decisions*, not raw env steps
   # decisions_per_episode = ceil(t_max / decision_interval)
   # frames_per_batch = decisions_per_episode * num_envs
-  frames_per_batch: 2048   # computed in code
+  frames_per_batch: 4096   # computed in code
   total_frames: 20_480_000       # computed as frames_per_batch * 2000
   trust_policy: true       # matches SyncDataCollector(... trust_policy=True)
 
@@ -18,7 +18,7 @@ logger:
   backend: wandb
   entity: asture123-national-taiwan-university
   project_name: edgeids
-  exp_name: atk_yoyo_
+  exp_name: atk_yoyo_4096
   plots:
     enabled: true
     out_dir: logs/wandb_plots
