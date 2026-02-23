@@ -131,7 +131,7 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
     base_env = TorchRLEnvWrapper(
         cfg_path=env_cfg_path,
         seed=env_cfg["run"]["seed"],
-        device=device,
+        device="cpu",
         decision_interval=decision_interval
     )
 
@@ -140,7 +140,7 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
             return TorchRLEnvWrapper(
                 cfg_path=env_cfg_path,
                 seed=seed_offset,
-                device=device,
+                device="cpu",
                 decision_interval=decision_interval,
             )
         return _make
@@ -441,7 +441,6 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
                 seq_list = []
                 for k in range(seq_len_eff):
                     seq_list.append(data[t0_idx + k, b_idx])
-                mb_td = torch.stack(seq_list, dim=0).detach()
                 mb_td = torch.stack(seq_list, dim=0)  # TensorDict stacked on time dim
 
                 mb_td = mb_td.detach()
@@ -510,5 +509,5 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
 
         collector.update_policy_weights_()
 if __name__ == "__main__":
-    # train(resume_ckpt="checkpoints/lstm_epoch_20_linear/ckpt_iter_000950.pt")
+    # train(resume_ckpt="checkpoints/atk_yoyo_lin/ckpt_iter_000500.pt")
     train()

@@ -135,8 +135,8 @@ class Attacker:
 
         # random gap duration between repetitions (in steps)
         self.gap_steps = int(self.rng.integers(
-            low=50 * self.steps_per_sec,      # 5 sec
-            high=100 * self.steps_per_sec     # 30 sec
+            low=400 * self.steps_per_sec,      # 5 sec
+            high=800 * self.steps_per_sec     # 30 sec
         ))
 
         total_len = self.rep * trace_len_steps + (self.rep - 1) * self.gap_steps

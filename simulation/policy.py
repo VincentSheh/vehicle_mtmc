@@ -221,7 +221,7 @@ def run_episode(
 
     # stabilize initial ratio
     for i, edge in enumerate(env.edge_areas):
-        edge.cpu_to_ids_ratio = 0.5
+        # edge.cpu_to_ids_ratio = 0.5
         edge.reset(seed=seed + 100 * i)
 
     rng = np.random.default_rng(seed)
@@ -230,7 +230,7 @@ def run_episode(
     n_edges = len(env.edge_areas)
     ids_cpu_max = np.array([e.budget.cpu - 0.5 for e in env.edge_areas], dtype=np.float32)
 
-    ids_cpu = np.array([e.cpu_to_ids_ratio * e.budget.cpu for e in env.edge_areas], dtype=np.float32)
+    ids_cpu = np.array([e.ids_cpu / e.budget.cpu for e in env.edge_areas], dtype=np.float32)
     ids_cpu = np.clip(ids_cpu, ids_cpu_min, ids_cpu_max)
 
     decisions = math.ceil(t_max / decision_interval)
@@ -247,7 +247,7 @@ def run_episode(
 
         obs = build_observation_from_history(env, decision_interval, obs_keys)
         cpu_util = decision_cpu_util(env, decision_interval)
-
+        
         # ---------- policy ----------
         if method.startswith("constant_"):
             constant_cpu = float(method.split("_", 1)[1])
@@ -278,8 +278,12 @@ def run_episode(
 
         else:
             raise ValueError(method)
+        ids_cpu_before = ids_cpu.copy()
 
         ids_cpu = apply_delta(ids_cpu, delta, scale_step, ids_cpu_min, ids_cpu_max)
+
+        rat_before = ids_cpu_before / np.array([e.budget.cpu for e in env.edge_areas], dtype=np.float32)
+        rat_after  = ids_cpu / np.array([e.budget.cpu for e in env.edge_areas], dtype=np.float32)
 
         for _ in range(decision_interval):
             env.step(ids_cpu)
@@ -297,7 +301,8 @@ def run_episode(
 
         local_num_req_ts.append(float(df["local_num_req"].mean()) if "local_num_req" in df.columns else 0.0)
         attack_in_rate_ts.append(float(df["attack_in_rate"].mean()) if "attack_in_rate" in df.columns else 0.0)
-        cpu_to_ids_ratio_ts.append(float(df["cpu_to_ids_ratio"].mean()) if "cpu_to_ids_ratio" in df.columns else 0.0)
+        ratios = ids_cpu / np.array([e.budget.cpu for e in env.edge_areas], dtype=np.float32)
+        cpu_to_ids_ratio_ts.append(float(ratios.mean()))
 
 
 
@@ -313,12 +318,13 @@ def run_episode(
 
 
 def plot_ts_continuous(results: Dict[str, Dict[str, np.ndarray]], outpath: Path, slo_qoe_min: float = 0.2):
-    fig, axes = plt.subplots(4, 1, figsize=(9, 9), sharex=True)
+    fig, axes = plt.subplots(5, 1, figsize=(9, 9), sharex=True)
 
     panels = [
         ("qoe", "QoE"),
         ("local_num_req", "Local #Req"),
         ("attack_in_rate", "Attack in rate"),
+        ("cpu_util", "CPU Utilization"),
         ("cpu_to_ids_ratio", "CPU→IDS Ratio"),
     ]
 
@@ -421,7 +427,7 @@ def main():
 
     # ap.add_argument("--rl_ckpt", type=str, default="checkpoints/penv4*4_anneal/ckpt_iter_000600.pt")
     # ap.add_argument("--rl_ckpt", type=str, default="checkpoints/atari_cfg/ckpt_iter_000400.pt")
-    ap.add_argument("--rl_ckpt", type=str, default="checkpoints/lstm_epoch_20_linear/ckpt_iter_001100.pt")
+    ap.add_argument("--rl_ckpt", type=str, default="checkpoints/atk4_4096/ckpt_iter_000600.pt")
     # ap.add_argument("--rl_ckpt", type=str, default="checkpoints/ppo_simulation_0/ckpt_epoch20.pt")
     # ap.add_argument("--rl_ckpt", type=str, default="checkpoints/ppo_simulation_0/ckpt_ema_000900.pt")
     ap.add_argument("--rl_device", type=str, default="cuda")
@@ -443,6 +449,7 @@ def main():
         "ema_mom",
         "cpu_to_ids_ratio",
         "ids_cpu_utilization",
+        "overhead"
     ]
     obs_dim = len(obs_keys)
 
@@ -463,6 +470,7 @@ def main():
     methods = ["random", "constant_0.5", "reactive"]
     if rl_policy is not None:
         methods = methods + ["rl"]
+    # methods = ["constant_0.5", "reactive"]
 
     results: Dict[str, Dict[str, np.ndarray]] = {m: {} for m in methods}
     for m in methods:

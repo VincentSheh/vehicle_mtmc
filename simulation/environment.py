@@ -29,6 +29,8 @@ from edgearea import ResourceBudget, EdgeArea
 
 from offload import OffloadDecision, OffloadState
 
+N_ACTION = 5
+
 @dataclass(frozen=True)
 class GlobalConfig:
     cpu_cycle_per_ms: float
@@ -203,16 +205,35 @@ class Environment:
         if isinstance(ids_cpus, torch.Tensor):
             ids_cpus = ids_cpus.detach().cpu().tolist() 
         for i, edge in enumerate(self.edge_areas):
-            overhead_ids = overhead if overhead > 0.0 else 0.0          # scale-up lag hits IDS
-            overhead_va  = abs(overhead) if overhead < 0.0 else 0.0          # scale-down lag hits VA
-            edge.ids_cpu = ids_cpus[i] - overhead_ids # Only deduct ids_cpu because va is already deducted
-            edge.va_cpu = edge.budget.cpu - ids_cpus[i] - overhead_va
+            val = float(ids_cpus[i])
+
+            overhead_ids = float(overhead) if overhead > 0.0 else 0.0
+            overhead_va  = float(-overhead) if overhead < 0.0 else 0.0  # abs(overhead) but faster
+
+            ids_cpu_eff = val - overhead_ids
+            va_cpu_eff  = edge.budget.cpu - val - overhead_va
+
+            # clamp to keep invariants, leave at least 0.5 for each side
+            ids_cpu_eff = float(np.clip(ids_cpu_eff, 0.5, edge.budget.cpu - 0.5))
+            va_cpu_eff  = float(np.clip(va_cpu_eff,  0.5, edge.budget.cpu - 0.5))
+
+            # enforce total budget too (in case both got clamped up)
+            total = ids_cpu_eff + va_cpu_eff
+            if total > edge.budget.cpu:
+                # reduce the side that was "penalized" less, simplest is shrink VA
+                excess = total - edge.budget.cpu
+                va_cpu_eff = max(0.5, va_cpu_eff - excess)
+
+            edge.ids_cpu = ids_cpu_eff
+            edge.va_cpu  = va_cpu_eff
 
             cache = edge.step_local(self.t)
             local_cache[edge.area_id] = cache
-            assert(edge.ids_cpu + edge.va_cpu <= edge.budget.cpu)
-            assert(edge.ids_cpu >= 0.5)
-            assert(edge.va_cpu >= 0.5)
+
+            # keep asserts if you want, they should never trigger now
+            assert edge.ids_cpu >= 0.5
+            assert edge.va_cpu >= 0.5
+            assert edge.ids_cpu + edge.va_cpu <= edge.budget.cpu + 1e-6
 
         # 3) Final QoE computation per edge
         for edge in self.edge_areas:
@@ -477,7 +498,7 @@ class TorchRLEnvWrapper(EnvBase):
 
         self.action_spec = CompositeSpec(
             action=DiscreteTensorSpec(
-                n=3,   # {-1, 0, +1}
+                n=N_ACTION,   # {-1, 0, +1}
                 # shape=(self.n_edges,),
                 device=self.device,
             )
@@ -571,7 +592,7 @@ class TorchRLEnvWrapper(EnvBase):
     def _step(self, tensordict: TensorDict) -> TensorDict:
         action = tensordict["action"]                       # scalar 0/1/2
         # propose change
-        delta_cmd = (action.to(self.device).float() - 1.0) * self.scale_step
+        delta_cmd = (action.to(self.device).float() - int(N_ACTION / 2)) * self.scale_step
         # delta_cmd = self._reactive_delta() * self.scale_step  # -1, 0, +1
 
         prev_ids = self.ids_cpu[0].clone()
