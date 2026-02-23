@@ -18,7 +18,11 @@ logger:
   backend: wandb
   entity: asture123-national-taiwan-university
   project_name: edgeids
+<<<<<<< HEAD
   exp_name: ;atk4;_reactive
+=======
+  exp_name: atk4_4096_a2
+>>>>>>> 807f404 (callibrate atk impact + diverse action)
   plots:
     enabled: true
     out_dir: logs/wandb_plots
@@ -55,7 +59,7 @@ loss:
 # =========================
 model:
   hidden_dim: 64           # ActorNet / CriticNet hidden size
-  n_actions: 3             # discrete {scale down, hold, scale up}
+  n_actions: 5             # discrete {scale down, hold, scale up}
 
 # =========================
 # Observation normalization
