@@ -43,7 +43,7 @@ class StepMetrics:
 
     # QoE
     qoe_mean: float
-
+    qoe_weighted: float
     # Requests (OD-only pipeline)
     local_num_req: int                  # served (after IDS + uplink + compute)
     ema: float
@@ -164,7 +164,7 @@ class Environment:
         plan_def = balance_with_caps_and_prop_filter(
             area_ids=area_ids,
             edges=edges,
-            kappa_min=float(self.edge_areas[0].ids.cycles_per_packet),
+            kappa_min=float(self.edge_areas[0].ids.cycles_per_packet)*1,
             W_src=W_def_src,
             c_dst=c_def_dst,
             prop_delay=self.prop_delay,
@@ -197,6 +197,7 @@ class Environment:
                 user_in=int(exec_user_in[e_exec]),
                 atk_in=int(exec_atk_in[e_exec]),
                 inspect_in=int(exec_user_in[e_exec] + exec_atk_in[e_exec]),
+                attack_dict=obs[e_exec]["attack_dict"]
             )
 
         # 4) executor verdict fractions (USE COUNTS, not rate fields)
@@ -244,7 +245,7 @@ class Environment:
             edges=edges,
             W_src=W_va_src,
             c_dst=c_va_dst,
-            kappa_min=float(self.edge_areas[0].pipeline.detection_cycles("nanoDet-m")) * 1000.0,
+            kappa_min=float(self.edge_areas[0].pipeline.detection_cycles("nanoDet-m"))*1,
             prop_delay=self.prop_delay,
             tau_loc=tau_loc,
         )
@@ -252,34 +253,43 @@ class Environment:
 
         # execute VA at each destination edge
         local_cache = {}
+        tot_req=0
         for e_exec in area_ids:
             edge = edges[e_exec]
             cache = edge.process_va(
                 t=self.t,
                 admitted_user_req_in=int(va_in_dst.get(e_exec, 0)),
-                attack_dict=obs[e_exec]["attack_dict"],   # local attack pressure at executor
-                ids_out=ids_out_exec[e_exec],             # executor IDS summary for attack pass frac etc
+                attack_dict=obs[e_exec]["attack_dict"],
+                ids_out=ids_out_exec[e_exec],
             )
             local_cache[e_exec] = cache
+            tot_req += int(cache.get("local_num_request", 0))
 
-        # 5) log metrics (same as your original, using cache)
+        # 5) log metrics
         for edge in self.edge_areas:
             cache = local_cache[edge.area_id]
             ids_out = cache["ids_out"]
+
+            n = int(cache.get("local_num_request", 0))
+            if tot_req > 0:
+                qoe_weighted = float(cache["qoe"]) * (n / tot_req)
+            else:
+                qoe_weighted = float(cache["qoe"])  # no users, default
 
             self.history.append(
                 StepMetrics(
                     t=self.t,
                     area_id=edge.area_id,
                     qoe_mean=float(cache["qoe"]),
+                    qoe_weighted=qoe_weighted * 3,
                     ids_coverage=float(ids_out.get("coverage", 0.0)),
                     attack_in_rate=float(ids_out.get("attack_in_rate", 0.0)),
                     user_drop_rate=float(ids_out.get("user_drop_rate", 0.0)),
                     od_plan=cache["od_plan"],
-                    local_num_req=cache["local_num_request"],
+                    local_num_req=n,
                     ema=cache["ema"],
                     ema_mom=cache["ema_mom"],
-                    attack_drop_rate=float(ids_out.get("attack_drop_rate", 0.0)),
+                    attack_drop_rate=float(ids_out.get("attack_drop_rate", 0.0)),  # fix
                     cpu_to_ids_ratio=edge.ids_cpu / edge.budget.cpu,
                     va_cpu_utilization=cache["va_cpu_utilization"],
                     ids_cpu_utilization=float(ids_out.get("ids_cpu_util", 0.0)),
@@ -290,16 +300,22 @@ class Environment:
 
         # advance time
         self.t += 1
-
-        # return caches plus policies if you want to debug
+        # print("obs", obs, "\n",
+        #     "ids_in_dst", ids_in_dst, "\n",
+        #     "ids_out_exec", ids_out_exec,"\n",
+        #     "plan_def", plan_def, "\n",
+        #     "plan_va", plan_va, "\n",
+        #     "admitted_user_owner", admitted_user_owner,"\n",
+        #     "admitted_atk_owner", admitted_atk_owner, "\n",
+        #     "======"
+        # )
         return {
             "cache": local_cache,
-            "X_def_flow": plan_def.flow,
-            "X_va_flow": plan_va.flow,
-            "ids_in_dst": ids_in_dst,
-            "va_in_dst": va_in_dst,
-        }                
-        
+            "plan_def": plan_def,
+            "plan_va": plan_va,
+            "admitted_user_owner": admitted_user_owner,
+            "admitted_atk_owner": admitted_atk_owner,
+        }
         
 def build_env_base(cfg_path: str):
     cfg_text = Path(cfg_path).read_text(encoding="utf-8")
@@ -730,8 +746,9 @@ def test_environment_run(cfg_path: str, plot=False):
         env.reset(seed=1000 + i)
 
         for _ in range(env.t_max):
-            # env.step([2.5]*len(env.edge_areas))
-            env.step([7.5, 7.5, 0.5])
+            env.step([1.5]*len(env.edge_areas))
+            # env.step([7.5, 0.5, 0.5])
+            
 
         df = pd.DataFrame([m.__dict__ for m in env.history])
         df["episode"] = i
@@ -765,7 +782,7 @@ def test_environment_run(cfg_path: str, plot=False):
 
     (
         all_df.pivot(index="t", columns="area_id", values="local_num_req")
-        .plot(figsize=(20, 4), title="Num Request")
+        .plot(figsize=(10, 4), title="Num Request")
         .get_figure()
         .savefig(f"{out_dir}/local_num_req.png", bbox_inches="tight")
     )
@@ -785,7 +802,7 @@ def test_environment_run(cfg_path: str, plot=False):
         .get_figure()
         .savefig(f"{out_dir}/attack_drop_rate.png", bbox_inches="tight")
     )
-    avg_qoe = all_df["qoe_mean"].mean()
+    avg_qoe = all_df["qoe_weighted"].mean()
     print(f"Average QoE (qoe_mean): {avg_qoe:.4f}")
     print(f"Plots saved to {out_dir}/")    
         

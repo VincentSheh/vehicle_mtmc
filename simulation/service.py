@@ -47,55 +47,95 @@ class IDS:
             return 0.0
         return ids_cycles / self.cycles_per_packet
 
-    def classify_rates(
+    def classify_workload(
         self,
-        attack_dict: Dict[str,Any],
-        user_rate: float,
+        attack_dict: Dict[str, Any],
+        user_in: float,
+        atk_in: float,
         ids_cpu: float,
     ) -> Dict[str, float]:
-        total_attack = float(attack_dict["flows"])
-        total_in = float(user_rate + total_attack)
+        """
+        All inputs/outputs are COUNTS per epoch (NOT fractions).
+        - user_in: number of user inspection items this epoch
+        - atk_in: number of attack inspection items this epoch
 
-        speed = self.effective_speed_pkt_per_step(ids_cpu)
+        Returns:
+          - *_in_cnt, *_drop_cnt, *_pass_cnt are counts per epoch
+          - *_in_rate, *_drop_rate, *_pass_rate are provided only for backward compatibility
+            and are numerically equal to counts unless the caller converts them to per-second.
+        """
+        user_in = float(max(user_in, 0.0))
+        atk_in = float(max(atk_in, 0.0))
+        total_in = user_in + atk_in
+
+        speed = float(self.effective_speed_pkt_per_step(ids_cpu))  # pkt/epoch
         coverage = float(min(1.0, speed / total_in)) if total_in > 0 else 1.0
 
-        # attacks: expected dropped = coverage * TPR * rate
+        # --- attack drops (count) ---
         attack_drop = 0.0
         by_type = attack_dict.get("by_type", {})
+
         if by_type:
+            sum_types = float(sum(by_type.values()))
+            # scale by_type distribution to match atk_in
+            scale = (atk_in / sum_types) if sum_types > 0 else 0.0
             for atk_type, lam in by_type.items():
                 tpr, _fpr = self.acc_tpr_fpr[str(atk_type)]
-                attack_drop += coverage * tpr * float(lam)
+                attack_drop += coverage * float(tpr) * float(lam) * scale
         else:
-            # if you choose not to track by_type, you need a fallback
-            # simplest: assume average TPR across all types
             if self.acc_tpr_fpr:
                 avg_tpr = float(np.mean([v[0] for v in self.acc_tpr_fpr.values()]))
             else:
                 avg_tpr = 0.0
-            attack_drop = coverage * avg_tpr * total_attack
+            attack_drop = coverage * avg_tpr * atk_in
 
-        attack_pass = max(0.0, total_attack - attack_drop)
+        attack_drop = round(float(np.clip(attack_drop, 0.0, atk_in)))
+        attack_pass = int(atk_in - attack_drop)
 
-        # users: expected false drops
+        # --- user false drops (count) ---
         avg_fpr = float(np.mean([v[1] for v in self.acc_tpr_fpr.values()])) if self.acc_tpr_fpr else 0.0
-        user_drop = coverage * avg_fpr * float(user_rate)
-        user_pass = max(0.0, float(user_rate) - user_drop)
 
-        ids_cycles_available = self.effective_cycles_per_step(ids_cpu)
-        ids_used_cycles = min(total_in * self.cycles_per_packet, ids_cycles_available)
-        ids_cpu_util = min(1.0, ids_used_cycles / (ids_cycles_available + 1e-6))
+        # effective drop probability for a benign user request
+        p_drop = float(np.clip(coverage * avg_fpr, 0.0, 1.0))
+
+        # user_drop as a probabilistic (binomial) realization, not a deterministic expectation
+        n_user = int(round(float(user_in)))
+        user_drop = int(np.random.binomial(n=n_user, p=p_drop))
+
+        user_pass = n_user - user_drop
+
+        # --- utilization ---
+        ids_cycles_available = float(self.effective_cycles_per_step(ids_cpu))
+        ids_used_cycles = min(total_in * float(self.cycles_per_packet), ids_cycles_available)
+        ids_cpu_util = float(min(1.0, ids_used_cycles / (ids_cycles_available + 1e-6)))
+
+        # avg_tpr for logging even if by_type is used
+        if by_type:
+            avg_tpr = float(np.mean([v[0] for v in self.acc_tpr_fpr.values()])) if self.acc_tpr_fpr else 0.0
 
         return {
             "coverage": coverage,
-            "attack_in_rate": total_attack,
-            "attack_drop_rate": attack_drop,
-            "attack_pass_rate": attack_pass,
-            "user_drop_rate": user_drop,
-            "user_pass_rate": user_pass,
-            "ids_cpu_util": ids_cpu_util,
-        }
 
+            # counts per epoch (authoritative)
+            "user_in_cnt": user_in,
+            "user_drop_cnt": user_drop,
+            "user_pass_cnt": user_pass,
+            "atk_in_cnt": atk_in,
+            "atk_drop_cnt": attack_drop,
+            "atk_pass_cnt": attack_pass,
+            "inspect_in_cnt": total_in,
+
+            # backward-compat names (these are NOT fractions)
+            # "attack_in_rate": atk_in,
+            # "attack_drop_rate": attack_drop,
+            # "attack_pass_rate": attack_pass,
+            # "user_drop_rate": user_drop,
+            # "user_pass_rate": user_pass,
+
+            "ids_cpu_util": ids_cpu_util,
+            "tpr": float(avg_tpr),
+            "fpr": float(avg_fpr),
+        }
 class VideoPipeline:
     """
     Global video analytics pipeline (cycle-based).

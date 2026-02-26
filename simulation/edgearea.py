@@ -149,92 +149,32 @@ class EdgeArea:
         user_in: int,
         atk_in: int,
         inspect_in: int,
-        attack_dict: Dict[str, Any] | None = None,
+        attack_dict: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, float]:
         """
         Executor-side IDS outcome based on OFFLOADED COUNTS.
-
-        Assumptions:
-          - IDS does not need to recompute arrivals from self.users here.
-          - IDS capacity is determined by self.ids_cpu.
-          - Pass/drop are computed as counts for this epoch.
-
-        Your existing ids.classify_rates expects rates. We provide both:
-          - *_in_rate are derived from counts / slot_s
-          - *_pass_rate are also rates, but we also return *_pass_cnt for correctness.
+        All *_cnt fields are counts per epoch.
+        Also attaches *_per_s fields for convenience (counts / slot_s).
         """
-        slot_s = float(self.slot_ms) / 1000.0
-        slot_s = max(slot_s, 1e-9)
-
-        user_in = max(int(user_in), 0)
-        atk_in = max(int(atk_in), 0)
-        inspect_in = max(int(inspect_in), 0)
-
-        # sanity
+        user_in = int(max(user_in, 0))
+        atk_in = int(max(atk_in, 0))
+        inspect_in = int(max(inspect_in, 0))
         if inspect_in != user_in + atk_in:
             inspect_in = user_in + atk_in
 
-        # convert to rates for your existing IDS model
-        user_rate = float(user_in) / slot_s
-        atk_rate = float(atk_in) / slot_s
-
-        # if your IDS model also needs attack_dict (e.g., FPR/FNR depends on attack type),
-        # pass it through, otherwise it can be None
         attack_dict = attack_dict or {}
 
-        out = self.ids.classify_rates(
+        out = self.ids.classify_workload(
             attack_dict=attack_dict,
-            user_rate=user_rate,
+            user_in=float(user_in),
+            atk_in=float(atk_in),
             ids_cpu=float(self.ids_cpu),
         )
 
-        # out is assumed to include (rate-like):
-        #   user_drop_rate (fraction), user_pass_rate (rate or count in your old code),
-        #   attack_in_rate (rate), attack_pass_rate (rate), etc.
-        #
-        # We will standardize to COUNTS for routing math:
-        user_drop_frac = float(out.get("user_drop_rate", 0.0))
-        user_drop_frac = float(np.clip(user_drop_frac, 0.0, 1.0))
-        user_pass_cnt = int(round(user_in * (1.0 - user_drop_frac)))
-
-        # attack: if ids.classify_rates already computes attack pass rate, use it
-        # otherwise, approximate using attack_drop_rate/attack_in_rate if present
-        atk_pass_cnt = 0
-        if atk_in > 0:
-            # prefer explicit pass fraction if available
-            if "attack_in_rate" in out and "attack_pass_rate" in out:
-                atk_in_rate = float(out.get("attack_in_rate", 0.0))
-                atk_pass_rate = float(out.get("attack_pass_rate", 0.0))
-                atk_pass_frac = 0.0 if atk_in_rate <= 0 else float(np.clip(atk_pass_rate / atk_in_rate, 0.0, 1.0))
-                atk_pass_cnt = int(round(atk_in * atk_pass_frac))
-            elif "attack_drop_rate" in out:
-                # if attack_drop_rate is a count-like, treat as count; if fraction, clamp
-                adr = float(out.get("attack_drop_rate", 0.0))
-                if adr <= 1.0:
-                    atk_pass_cnt = int(round(atk_in * (1.0 - float(np.clip(adr, 0.0, 1.0)))))
-                else:
-                    atk_pass_cnt = int(max(0, atk_in - int(round(adr))))
-            else:
-                atk_pass_cnt = 0
-
-        # attach standardized counts and derived rates for convenience
-        out["user_in_cnt"] = float(user_in)
-        out["atk_in_cnt"] = float(atk_in)
-        out["inspect_in_cnt"] = float(inspect_in)
-
-        out["user_pass_cnt"] = float(user_pass_cnt)
-        out["user_drop_cnt"] = float(user_in - user_pass_cnt)
-
-        out["atk_pass_cnt"] = float(atk_pass_cnt)
-        out["atk_drop_cnt"] = float(atk_in - atk_pass_cnt)
-
-        out["user_in_rate"] = user_rate
-        out["atk_in_rate"] = atk_rate
-        out["user_pass_rate"] = float(user_pass_cnt) / slot_s
-        out["attack_pass_rate"] = float(atk_pass_cnt) / slot_s
+        # optional per-second views (true "rates")
+        slot_s = max(float(self.slot_ms) / 1000.0, 1e-9)
 
         return out
-
     def estimate_detection_cycles_this_frame(
         self,
         detector: str,
@@ -615,7 +555,7 @@ class EdgeArea:
             "local_num_request": int(user_req_in),   # keep name used in your history logger
         }
 
-    def process_ids(self, t: int, user_in: int, atk_in: int, inspect_in: int) -> Dict:
+    def process_ids(self, t: int, user_in: int, atk_in: int, inspect_in: int, attack_dict: Dict,) -> Dict:
         """
         IDS executor-side processing.
         Inputs are COUNTS for this epoch after IDS offloading has been applied.
@@ -630,6 +570,7 @@ class EdgeArea:
             user_in=int(user_in),
             atk_in=int(atk_in),
             inspect_in=int(inspect_in),
+            attack_dict=attack_dict
         )
         return ids_out
 
@@ -642,20 +583,26 @@ class EdgeArea:
     ) -> Dict:
         """
         Executes VA pipeline for a given admitted workload count.
-        This is your step_local VA part, but replace passed_req_pre_uplink with admitted_user_req_in.
+
+        Updated to work with new IDS outputs:
+        - Prefer count-style keys: atk_in_cnt / atk_pass_cnt
+        - Fallback to legacy rate-style keys: attack_in_rate / attack_pass_rate
         """
         total_req_in = float(admitted_user_req_in)
         local_num_request = int(admitted_user_req_in)
 
-        atk_in = float(ids_out.get("attack_in_rate", 0.0))
-        atk_pass = float(ids_out.get("attack_pass_rate", 0.0))
-        atk_pass_frac = atk_pass / atk_in if atk_in > 0 else 0.0
+        # --- UPDATED: compute attack pass fraction robustly ---
+        atk_in = float(ids_out.get("atk_in_cnt", ids_out.get("attack_in_rate", 0.0)))
+        atk_pass = float(ids_out.get("atk_pass_cnt", ids_out.get("attack_pass_rate", 0.0)))
+        atk_pass_frac = (atk_pass / atk_in) if atk_in > 0 else 0.0
+        atk_pass_frac = float(np.clip(atk_pass_frac, 0.0, 1.0))
 
-        attack_uplink_in = attack_dict["bw_in"] * atk_pass_frac
-        attack_cycles_per_ms = (attack_dict["cycles_per_s"] * atk_pass_frac) / 1000.0
+        # attack pressure that survives IDS and reaches VA/uplink
+        attack_uplink_in = float(attack_dict.get("bw_in", 0.0)) * atk_pass_frac
+        attack_cycles_per_ms = (float(attack_dict.get("cycles_per_s", 0.0)) * atk_pass_frac) / 1000.0
 
-        attack_ema = attack_dict["ema"]
-        attack_mom = attack_dict["mom"]
+        attack_ema = float(attack_dict.get("ema", 0.0))
+        attack_mom = float(attack_dict.get("mom", 0.0))
 
         uplink_total_mb = self.budget.uplink / (1000.0 / self.slot_ms)
         uplink_attack_used = attack_uplink_in
@@ -675,13 +622,14 @@ class EdgeArea:
                 "od_plan": {},
                 "served_req": 0,
                 "dropped_compute": int(total_req_in),
-                "va_cpu_utilization": (total_cycles_per_ms - avail_cycles_aft_atk_per_ms) / max(total_cycles_per_ms, 1e-9),
+                "va_cpu_utilization": (total_cycles_per_ms - avail_cycles_aft_atk_per_ms)
+                / max(total_cycles_per_ms, 1e-9),
                 "uplink_util": 1.0,
                 "mean_latency_ms": float("inf"),
                 "qoe": 0.0,
             }
 
-        # Here we directly treat admitted_user_req_in as "passed pre uplink"
+        # treat admitted_user_req_in as "passed pre uplink"
         passed_req_pre_uplink = int(admitted_user_req_in)
 
         upload_plan, served_req_uplink, dropped_uplink, uplink_util, per_req_by_h = self.select_resolution(
