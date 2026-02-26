@@ -23,6 +23,11 @@ from logger import *
 
 
 from pathlib import Path
+import multiprocessing as mp
+import torch.multiprocessing as tmp
+
+mp.set_start_method("spawn", force=True)
+tmp.set_sharing_strategy("file_system")
 
 def save_ckpt(path, policy, value, optim, env_cfg, train_cfg, it, device, env):
     path = Path(path)
@@ -126,13 +131,6 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
         in_key="features",
         out_key="features",
         device=device,
-    )
-
-    base_env = TorchRLEnvWrapper(
-        cfg_path=env_cfg_path,
-        seed=env_cfg["run"]["seed"],
-        device="cpu",
-        decision_interval=decision_interval
     )
 
     def make_env(seed_offset):
@@ -312,25 +310,6 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
 
     env.reset()
     
-    sampler = SliceSampler(
-        slice_len=seq_len,
-        end_key="done",
-        cache_values=True,
-        strict_length=False,
-    )
-
-    # PPO is on-policy, so we reuse a rollout buffer and overwrite it every iteration
-    # Store on GPU to avoid cpu<->gpu ping-pong
-    rollout_storage = LazyTensorStorage(
-        max_size=num_envs,   # store B trajectories, each item is [T,...]
-        device=device,
-    )
-
-    rb = TensorDictReplayBuffer(
-        storage=rollout_storage,
-        sampler=sampler,
-        batch_size=minibatch_size,  # sequences per minibatch
-    )    
 
     for it, batch in enumerate(collector):
         assert_finite(batch, "BATCH")
@@ -507,31 +486,6 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
                 },
             )
 
-<<<<<<< HEAD
-=======
-                log_dict = {
-                    f"ts_step": ts_step,
-                    f"ts/action": a,
-                    f"ts/qoe": q,
-                }
-
-                for e in range(E):
-                    for j, k in enumerate(base_env.obs_keys):
-                        log_dict[f"ts/edge_{e}/{k}"] = float(obs[t, b, e, j].item())
-
-                wandb.log(log_dict, commit=True)
-        wandb.log(
-            {
-                "iter": it,
-                "qoe/mean": float(batch["next", "qoe_mean"].mean().item()),
-                "reward/mean": float(batch["next", "reward"].mean().item()),
-                "loss/total": float(total_loss.detach().item()),
-                "loss/policy": float(out["loss_objective"].detach().item()),
-                "loss/critic": float(out["loss_critic"].detach().item()),
-                "loss/entropy": float(out.get("loss_entropy", torch.tensor(0.0, device=device)).detach().item()),
-            },
-        )
->>>>>>> 3a85424 (Stabilize yaml logging and Atari Params)
         collector.update_policy_weights_()
 if __name__ == "__main__":
     # train(resume_ckpt="checkpoints/atk_yoyo_lin/ckpt_iter_000500.pt")

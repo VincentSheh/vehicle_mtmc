@@ -79,8 +79,15 @@ class IDS:
 
         # users: expected false drops
         avg_fpr = float(np.mean([v[1] for v in self.acc_tpr_fpr.values()])) if self.acc_tpr_fpr else 0.0
-        user_drop = coverage * avg_fpr * float(user_rate)
-        user_pass = max(0.0, float(user_rate) - user_drop)
+
+        # effective drop probability for a benign user request
+        p_drop = float(np.clip(coverage * avg_fpr, 0.0, 1.0))
+
+        # user_drop as a probabilistic (binomial) realization, not a deterministic expectation
+        n_user = int(round(float(user_rate)))
+        user_drop = int(np.random.binomial(n=n_user, p=p_drop))
+
+        user_pass = n_user - user_drop
 
         ids_cycles_available = self.effective_cycles_per_step(ids_cpu)
         ids_used_cycles = min(total_in * self.cycles_per_packet, ids_cycles_available)

@@ -221,7 +221,6 @@ def run_episode(
 
     # stabilize initial ratio
     for i, edge in enumerate(env.edge_areas):
-        # edge.cpu_to_ids_ratio = 0.5
         edge.reset(seed=seed + 100 * i)
 
     rng = np.random.default_rng(seed)
@@ -317,7 +316,7 @@ def run_episode(
     }
 
 
-def plot_ts_continuous(results: Dict[str, Dict[str, np.ndarray]], outpath: Path, slo_qoe_min: float = 0.2):
+def plot_ts_continuous(results: Dict[str, Dict[str, np.ndarray]], outpath: Path, slo_qoe_min: float = 0.2, beta=3):
     fig, axes = plt.subplots(5, 1, figsize=(9, 9), sharex=True)
 
     panels = [
@@ -343,7 +342,7 @@ def plot_ts_continuous(results: Dict[str, Dict[str, np.ndarray]], outpath: Path,
                 
                 viol = (y_valid < 0.2).astype(np.float32)
                 viol_rate = float(viol.mean()) if len(viol) > 0 else 0.0
-                V_edge = np.exp(-3 * viol_rate)                
+                V_edge = np.exp(-beta * viol_rate)                
                 label = f"{method} (avg={avg_qoe*V_edge:.3f}, vio={vio_rate:.2%})"
                 # violation indicator: 1 if QoE below threshold else 0
             else:
@@ -427,7 +426,7 @@ def main():
 
     # ap.add_argument("--rl_ckpt", type=str, default="checkpoints/penv4*4_anneal/ckpt_iter_000600.pt")
     # ap.add_argument("--rl_ckpt", type=str, default="checkpoints/atari_cfg/ckpt_iter_000400.pt")
-    ap.add_argument("--rl_ckpt", type=str, default="checkpoints/atk4_4096/ckpt_iter_000600.pt")
+    ap.add_argument("--rl_ckpt", type=str, default="checkpoints/atk1_noSO_2048_ev4_e10_t045_noema/ckpt_iter_000750.pt")
     # ap.add_argument("--rl_ckpt", type=str, default="checkpoints/ppo_simulation_0/ckpt_epoch20.pt")
     # ap.add_argument("--rl_ckpt", type=str, default="checkpoints/ppo_simulation_0/ckpt_ema_000900.pt")
     ap.add_argument("--rl_device", type=str, default="cuda")
@@ -446,10 +445,10 @@ def main():
     obs_keys = [
         "local_num_req",
         "attack_in_rate",
-        "ema_mom",
+        # "ema_mom",
         "cpu_to_ids_ratio",
         "ids_cpu_utilization",
-        "overhead"
+        # "overhead"
     ]
     obs_dim = len(obs_keys)
 
@@ -467,10 +466,10 @@ def main():
             greedy=args.rl_greedy,
         )
 
-    methods = ["random", "constant_0.5", "reactive"]
+    methods = ["random", "constant_0.5","constant_1.5", "reactive"]
     if rl_policy is not None:
         methods = methods + ["rl"]
-    # methods = ["constant_0.5", "reactive"]
+    methods = ["constant_0.5","constant_1.5", "constant_4.0"]
 
     results: Dict[str, Dict[str, np.ndarray]] = {m: {} for m in methods}
     for m in methods:
@@ -499,8 +498,8 @@ def main():
             for k, v in q.items():
                 results[m][k] = np.concatenate([results[m][k], v])
 
-    plot_ts_continuous(results, outdir / "qoe_ts.png", slo_qoe_min=0.2)
-    plot_qoe_vio_bars(results, outdir / "summary.png", qoe_slo_min=0.2)
+    plot_ts_continuous(results, outdir / "qoe_ts.png", slo_qoe_min=0.2, beta=0)
+    plot_qoe_vio_bars(results, outdir / "summary.png", qoe_slo_min=0.2, beta=0)
 
 
 if __name__ == "__main__":
