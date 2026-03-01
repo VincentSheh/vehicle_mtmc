@@ -2,7 +2,7 @@
 # Collector
 # =========================
 collector:
-  num_envs: 8
+  num_envs: 4
   # frames_per_batch is in *decisions*, not raw env steps
   # decisions_per_episode = ceil(t_max / decision_interval)
   # frames_per_batch = decisions_per_episode * num_envs
@@ -18,7 +18,7 @@ logger:
   backend: wandb
   entity: asture123-national-taiwan-university
   project_name: edgeids
-  exp_name: atk_yoyo_
+  exp_name: multi_edge
   plots:
     enabled: true
     out_dir: logs/wandb_plots
