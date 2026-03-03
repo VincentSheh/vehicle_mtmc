@@ -18,7 +18,7 @@ logger:
   backend: wandb
   entity: asture123-national-taiwan-university
   project_name: edgeids
-  exp_name: multi_edge
+  exp_name: ma_qoe_weighted
   plots:
     enabled: true
     out_dir: logs/wandb_plots

@@ -29,6 +29,8 @@ from edgearea import ResourceBudget, EdgeArea
 
 from offload import OffloadPlan, balance_with_caps_and_prop_filter
 
+
+
 @dataclass(frozen=True)
 class GlobalConfig:
     cpu_cycle_per_ms: float
@@ -309,17 +311,17 @@ class Environment:
                     area_id=eid,
                     qoe_mean=float(cache["qoe"]),
                     qoe_weighted=qoe_weighted * 3,
-                    ids_coverage=float(ids_out.get("coverage", 0.0)),
-                    attack_in_rate=float(ids_out.get("attack_in_rate", 0.0)),
-                    user_drop_rate=float(ids_out.get("user_drop_rate", 0.0)),
+                    ids_coverage=float(ids_out.get("coverage")),
+                    attack_in_rate=float(ids_out.get("atk_in_cnt")),
+                    user_drop_rate=float(ids_out.get("user_drop_cnt")),
                     od_plan=cache["od_plan"],
                     local_num_req=n,
                     ema=cache["ema"],
                     ema_mom=cache["ema_mom"],
-                    attack_drop_rate=float(ids_out.get("attack_drop_rate", 0.0)),
+                    attack_drop_rate=float(ids_out.get("atk_drop_cnt")),
                     cpu_to_ids_ratio=edge.ids_cpu / edge.budget.cpu,
                     va_cpu_utilization=cache["va_cpu_utilization"],
-                    ids_cpu_utilization=float(ids_out.get("ids_cpu_util", 0.0)),
+                    ids_cpu_utilization=float(ids_out.get("ids_cpu_util")),
                     bw_utilization=cache["uplink_util"],
                     overhead=float(overheads[i]),
                 )
@@ -327,28 +329,34 @@ class Environment:
 
         self.t += 1
         qoe_slo = []
+        # inside Environment.step(), replace the final_qoe computation block
         if self.t >= self.t_max:
-            # Calculate the QoE with SLO Violation Rate
-            for i,edge in enumerate(self.edge_areas):
+            num = 0.0
+            den = 0.0
+
+            for edge in self.edge_areas:
                 h = [m for m in self.history if m.area_id == edge.area_id]
                 if len(h) == 0:
                     continue
 
-                last_block = h[-self.t_max:]  # sliding window at the end
-                qoes = np.asarray([float(m.qoe_mean) for m in last_block], dtype=np.float32)
+                last_block = h[-self.t_max:]  # window
+                q = np.asarray([float(m.qoe_weighted) for m in last_block], dtype=np.float32)
 
-                # violation indicator: 1 if QoE below threshold else 0
-                viol = (qoes < edge.slo_threshold).astype(np.float32)
+                # SLO penalty term
+                viol = (q < edge.slo_threshold).astype(np.float32)
+                viol_rate = float(viol.mean()) if viol.size else 0.0
+                V_edge = float(np.exp(-edge.slo_beta * viol_rate))
 
-                # violation rate in [0,1]
-                viol_rate = float(viol.mean()) if len(viol) > 0 else 0.0
+                # edge score (SLO-adjusted)
+                score = float(q.mean()) * V_edge
 
-                # SLO term V in (0,1]
-                V_edge = np.exp(-edge.slo_beta * viol_rate)
+                # weight by total served requests in the window
+                w = float(np.sum([int(m.local_num_req) for m in last_block]))
 
-                # If you want "final QoE with SLO" for this edge:
-                qoe_slo.append(float(qoes.mean()) * V_edge)
-            self.final_qoe = np.mean(qoe_slo)        
+                num += w * score
+                den += w
+
+            self.final_qoe = (num / den) if den > 0 else 0.0    
             
         # print("obs", obs, "\n",
         #     "ids_in_dst", ids_in_dst, "\n",
@@ -472,297 +480,8 @@ def build_env_base(cfg_path: str):
     )
     env.reset(cfg["run"]["seed"])
     return env
-
-
-class TorchRLEnvWrapper(EnvBase):
-    """
-    Correct TorchRL EnvBase wrapper.
-
-    - reset() returns a td with keys: observation, done, terminated (and optionally reward)
-    - _step(td) returns NEXT td with keys: observation, reward, done, terminated
-      TorchRL will create td["next"] automatically.
-    """
-
-    def __init__(
-        self,
-        cfg_path: str,
-        decision_interval: int = 3000,
-        seed: int = 0,
-        device: str | torch.device = "cpu",
-    ):
-        super().__init__(device=torch.device(device), batch_size=[])
-
-        self.env = build_env_base(cfg_path)
-        self.n_edges = len(self.env.edge_areas)
-        self.area_ids = [e.area_id for e in self.env.edge_areas]
-        self.episode_id = 0
-        self.base_seed = seed
-        self.decision_interval = int(decision_interval)
-        # self._step_count = 0
-
-        self.obs_keys = [
-            "local_num_req",
-            # "attack_drop_rate",
-            "attack_in_rate",
-            "ema_mom",
-            "cpu_to_ids_ratio",
-            # "va_cpu_utilization",
-            "ids_cpu_utilization",
-            "overhead",
-            # "bw_utilization",
-            # "I_net",
-        ]
-        
-        self.obs_dim = len(self.obs_keys)
-        self.obs_size = self.n_edges * self.obs_dim
-
-        self.action_dim = self.n_edges
-        self._last_action = torch.zeros(self.action_dim, device=self.device, dtype=torch.float32)
-        self.scale_step = 0.5  # CPU units per scale
-        self.ids_cpu_min = 0.5
-
-        self.ids_cpu = torch.tensor(
-            [e.ids_cpu for e in self.env.edge_areas],
-            device=self.device,
-            dtype=torch.float32,
-        )
-
-        self._set_seed(seed)
-        self._make_specs()
-
-    # ---------------- TorchRL required ----------------
-
-    def _set_seed(self, seed: Optional[int]):
-        if seed is None:
-            return None
-        np.random.seed(int(seed))
-        torch.manual_seed(int(seed))
-        return seed
-
-    def _make_specs(self):
-        self.observation_spec = CompositeSpec(
-            observation=UnboundedContinuousTensorSpec(
-                shape=(self.n_edges, self.obs_dim),
-                dtype=torch.float32,
-                device=self.device,
-            ),
-            observation_flat=UnboundedContinuousTensorSpec(
-                shape=(self.obs_size,),
-                dtype=torch.float32,
-                device=self.device,
-            ),
-            qoe_mean=UnboundedContinuousTensorSpec(
-                shape=(1,),
-                dtype=torch.float32,
-                device=self.device,
-            ),
-            t_internal=BoundedTensorSpec(
-                low=0,
-                high=max(1, int(self.env.t_max)),   # or env.t_max if already built
-                shape=(1,),
-                dtype=torch.int64,
-                device=self.device,
-            ),
-        )
-
-        # Multi-agent action: one discrete action per edge agent
-        self.action_spec = CompositeSpec(
-            action=MultiDiscreteTensorSpec(
-                nvec=torch.full((self.n_edges,), 3, dtype=torch.int64, device=self.device),
-                shape=(self.n_edges,),
-                device=self.device,
-            )
-        )
-
-        # Per-agent reward
-        self.reward_spec = CompositeSpec(
-            reward=UnboundedContinuousTensorSpec(
-                shape=(1,),
-                dtype=torch.float32,
-                device=self.device,
-            )
-        )
-
-        self.done_spec = CompositeSpec(
-            done=BoundedTensorSpec(low=0, high=1, shape=(1,), dtype=torch.bool, device=self.device),
-            terminated=BoundedTensorSpec(low=0, high=1, shape=(1,), dtype=torch.bool, device=self.device),
-            truncated=BoundedTensorSpec(low=0, high=1, shape=(1,), dtype=torch.bool, device=self.device),
-        )
-
-    # ---------------- Reset / Step ----------------
-    def _reset(self, tensordict=None):
-        self.episode_id += 1
-        episode_seed = self.base_seed + self.episode_id * 1000
-
-        # Seed ONLY torch (policy randomness)
-        torch.manual_seed(episode_seed)
-
-        # Reset env with explicit seeds
-        self.env.reset(episode_seed)
-
-
-        obs = self._build_observation().to(self.device)
-        obs_flat = obs.reshape(-1)
-        self.ids_cpu = torch.tensor(
-            [e.ids_cpu for e in self.env.edge_areas],
-            device=self.device,
-            dtype=torch.float32,
-        )        
-
-        return TensorDict(
-            {
-                # "observation": obs,
-                "observation_flat": obs_flat,
-                "qoe_mean": torch.zeros(1, dtype=torch.float32, device=self.device),
-                "t_internal": torch.tensor([int(self.env.t)], dtype=torch.int64, device=self.device),                
-                "done": torch.zeros(1, dtype=torch.bool, device=self.device),
-                "terminated": torch.zeros(1, dtype=torch.bool, device=self.device),
-                "truncated": torch.zeros(1, dtype=torch.bool, device=self.device),
-            },
-            batch_size=[],
-            device=self.device,
-        )
-        
-    def _decision_ids_util(self) -> float:
-        """Max IDS CPU utilization across edges over the last decision window."""
-        if len(self.env.history) < self.decision_interval * self.n_edges:
-            return 0.0
-        records = self.env.history[-self.decision_interval * self.n_edges:]
-        df = pd.DataFrame([m.__dict__ for m in records])
-
-        utils = []
-        for area_id in self.area_ids:
-            g = df[df["area_id"] == area_id]
-            if g.empty or "ids_cpu_utilization" not in g.columns:
-                continue
-            utils.append(float(np.clip(np.mean(g["ids_cpu_utilization"].values), 0.0, 1.0)))
-        return float(max(utils)) if utils else 0.0
-
-    def _reactive_delta(self) -> float:
-        """Return delta in {-1,0,+1} based on IDS util thresholding."""
-        util = self._decision_ids_util()
-        if util >= 0.80:
-            return 1.0
-        if util <= 0.20:
-            return -1.0
-        return 0.0        
-
-    def _step(self, tensordict: TensorDict) -> TensorDict:
-        action = tensordict["action"].to(self.device)  # shape (n_edges,), values 0/1/2
-        if action.ndim == 0:
-            action = action.view(1)
-
-        # delta per agent in {-scale_step, 0, +scale_step}
-        delta_cmd = (action.float() - 1.0) * self.scale_step  # shape (n_edges,)
-
-        prev_ids = self.ids_cpu.clone()
-
-        # clamp each edge separately by its own cpu budget
-        new_ids = self.ids_cpu + delta_cmd
-        for i, edge in enumerate(self.env.edge_areas):
-            new_ids[i] = torch.clamp(
-                new_ids[i],
-                min=self.ids_cpu_min,
-                max=float(edge.budget.cpu) - 0.5,
-            )
-
-        self.ids_cpu = new_ids
-        ids_cpu_vec = self.ids_cpu.clone()
-
-        # overhead per edge equals effective change (signed)
-        delta_eff = (self.ids_cpu - prev_ids).detach()
-        overheads = delta_eff.detach().cpu().tolist()
-
-        total_reward = torch.zeros(self.n_edges, dtype=torch.float32, device=self.device)
-        terminated_flag = False
-        steps = 0
-
-        # simulate internal timesteps
-        for _ in range(self.decision_interval):
-            self.env.step(ids_cpu_vec, overheads)  # overheads is per-edge now
-            total_reward += self._build_reward_per_agent()  # (n_edges,)
-            steps += 1
-            if self.env.t >= self.env.t_max:
-                terminated_flag = True
-                break
-
-        reward = total_reward / max(1, steps)  # (n_edges,)
-        reward_agents = reward  # (n_edges,)
-        reward = reward_agents.mean().view(1)  # (1,)        
-
-        obs = self._build_observation().to(self.device)
-        obs_flat = obs.reshape(-1)
-
-        terminated = torch.tensor([terminated_flag], dtype=torch.bool, device=self.device)
-        truncated = torch.zeros(1, dtype=torch.bool, device=self.device)
-        done = terminated | truncated
-
-        t_internal_end = int(self.env.t)
-        qoe_mean = float(self.env.final_qoe)
-
-        return TensorDict(
-            {
-                # "observation": obs,
-                "observation_flat": obs_flat,
-                "reward": reward,  # per-agent
-
-                "qoe_mean": torch.tensor([qoe_mean * 30], dtype=torch.float32, device=self.device),
-                "t_internal": torch.tensor([t_internal_end], dtype=torch.int64, device=self.device),
-
-                "done": done,
-                "terminated": terminated,
-                "truncated": truncated,
-            },
-            batch_size=[],
-            device=self.device,
-        )
-        
-    # ---------------- Helpers ----------------
-    def _build_observation(self) -> torch.Tensor:
-        obs = torch.zeros((self.n_edges, self.obs_dim), dtype=torch.float32, device=self.device)
-
-        if not self.env.history:
-            return obs
-
-        records = self.env.history[-self.decision_interval * self.n_edges:]
-
-        df = pd.DataFrame([m.__dict__ for m in records])
-
-        for i, area_id in enumerate(self.area_ids):
-            g = df[df["area_id"] == area_id]
-            if g.empty:
-                continue
-            for j, k in enumerate(self.obs_keys):
-                vals = g[k].values
-                if k == "I_net":
-                    obs[i, j] = float(np.sum(vals))
-                elif k == "cpu_to_ids_ratio" or k=="overhead":
-                    obs[i, j] = float(vals[-1])
-                elif k == "ema_mom":
-                    vals_nz = vals[vals != 0.0]
-                    if len(vals_nz) == 0:
-                        obs[i, j] = 0.0
-                        continue
-                    obs[i, j] = float(np.mean(vals_nz))  
-                else:
-                    obs[i, j] = float(np.mean(vals))
-
-        return obs
-
-    def _build_reward_per_agent(self) -> torch.Tensor:
-        if not self.env.history:
-            return torch.zeros(self.n_edges, dtype=torch.float32, device=self.device)
-
-        last_block = self.env.history[-self.n_edges:]
-        q = np.asarray([float(m.qoe_mean) for m in last_block], dtype=np.float32)
-
-        threshold = 0.35
-        alpha = 0.6
-        penalty = alpha * (np.maximum(0.0, threshold - q) / threshold) ** 2
-        q_adj = q - penalty
-
-        return torch.tensor(q_adj, dtype=torch.float32, device=self.device)
-        
+    
+    
 def test_environment_run(cfg_path: str, plot=False):
     env = build_env_base(cfg_path)
 
@@ -771,7 +490,7 @@ def test_environment_run(cfg_path: str, plot=False):
         env.reset(seed=1000 + i)
 
         for _ in range(env.t_max):
-            env.step([1.5]*len(env.edge_areas))
+            env.step([2.5]*len(env.edge_areas))
             # env.step([7.5, 0.5, 0.5])
             
 
@@ -822,10 +541,10 @@ def test_environment_run(cfg_path: str, plot=False):
     
     # Attack in 
     (
-        all_df.pivot(index="t", columns="area_id", values=["attack_drop_rate", "ema"])
+        all_df.pivot(index="t", columns="area_id", values=["attack_in_rate", "ema"])
         .plot(figsize=(10, 4), title="Attack In Rate")
         .get_figure()
-        .savefig(f"{out_dir}/attack_drop_rate.png", bbox_inches="tight")
+        .savefig(f"{out_dir}/attack_in_rate.png", bbox_inches="tight")
     )
     avg_qoe = all_df["qoe_weighted"].mean()
     print(f"Average QoE (qoe_mean): {avg_qoe:.4f}")

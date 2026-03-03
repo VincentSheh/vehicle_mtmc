@@ -23,7 +23,7 @@ globals:
       latency_per_flow: 0.0
       bw_per_flow: 0.0371 # 0.0371 #original max_bw when scaling=1.0 is 190mb
       non_defendable_bw_const: 0.0 
-      scaling: 1.0 # base_scaling for flows_per_sec
+      scaling: 2.0 # base_scaling for flows_per_sec
       mean_rep: 0
 
     atk_02:
@@ -32,7 +32,7 @@ globals:
       latency_per_flow: 0.0
       bw_per_flow: 0.0205 # 0.0205 #original max_bw when scaling=1.0 is 190mb
       non_defendable_bw_const: 0.0
-      scaling: 1.0
+      scaling: 2.0
       mean_rep: 0
 
     atk_03:

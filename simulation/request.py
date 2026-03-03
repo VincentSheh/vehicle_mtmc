@@ -131,7 +131,7 @@ class Attacker:
             self.rep = max(1, int(self.rng.poisson(lam=self.mean_rep)))
 
         # random scaling per episode
-        self.scaling = float(self.rng.uniform(0.2, 2.0))
+        self.scaling = float(self.rng.uniform(0.8, 2.0))
 
         # random gap duration between repetitions (in steps)
         self.gap_steps = int(self.rng.integers(
