@@ -17,6 +17,7 @@ from environment import build_env_base  # your project
 
 # --- single-agent feature net used by your LSTM policy ---
 from train import FeatureNet
+from train_lstm_ex import MultiAgentLSTM, ActorAdapter
 
 import torch.nn as nn
 from tensordict import TensorDict
@@ -203,7 +204,7 @@ class CollaborativeMAPPOPolicy:
 
         actor = TensorDictModule(
             actor_net,
-            in_keys=[("agents", "observation")],
+            in_keys=[("agents", "observation", "obs")],
             out_keys=[("agents", "logits")],
         )
 
@@ -224,11 +225,15 @@ class CollaborativeMAPPOPolicy:
         self.obs_loc = None
         self.obs_scale = None
         if isinstance(self.env_state, dict):
-            loc_key = next((k for k in self.env_state.keys() if str(k).endswith("loc")), None)
-            scale_key = next((k for k in self.env_state.keys() if str(k).endswith("scale")), None)
+            loc_key = next((k for k in self.env_state.keys() if "observation_flat" in str(k) and str(k).endswith("loc")), None)
+            scale_key = next((k for k in self.env_state.keys() if "observation_flat" in str(k) and str(k).endswith("scale")), None)
             if loc_key and scale_key:
                 self.obs_loc = self.env_state[loc_key].detach().to(self.device).reshape(-1)
                 self.obs_scale = self.env_state[scale_key].detach().to(self.device).reshape(-1)
+            else:
+                print("Warning: obsnorm empty!")                
+        else:
+            print("Warning: obsnorm empty!")
 
     def reset_episode(self) -> None:
         return
@@ -248,11 +253,124 @@ class CollaborativeMAPPOPolicy:
     def act(self, obs_mat: np.ndarray) -> np.ndarray:
         obs_mat = self._normalize_obs_mat(obs_mat.astype(np.float32))
         obs = torch.tensor(obs_mat, device=self.device, dtype=torch.float32).unsqueeze(0)  # [1,E,obs_dim]
-        td = TensorDict({("agents", "observation"): obs}, batch_size=[1], device=self.device)
+        td = TensorDict({("agents","observation","obs"): obs}, batch_size=[1], device=self.device)
         td_out = self.policy(td)
         a = td_out.get(("agents", "action")).squeeze(0)  # [E], 0..2
         return (a.to(torch.int64) - 1).detach().cpu().numpy().astype(np.int64)
 
+class MultiAgentLSTMPolicy:
+    """
+    Loads the multi-agent LSTM actor from train_lstm.py style checkpoints.
+
+    Expects checkpoint saved with:
+      - state["policy"] from ProbabilisticActor wrapping a TensorDictModule actor
+      - model cfg in state["train_cfg"]["model"]
+      - optional obsnorm / VecNorm stats in state["obsnorm"] (or state["env_state"])
+
+    Action output: delta in {-1,0,+1} per edge.
+    """
+
+    def __init__(self, ckpt_path: str, n_edges: int, obs_dim: int, device: str = "cpu", greedy: bool = True):
+        self.device = torch.device(device)
+        self.greedy = greedy
+        self.n_edges = int(n_edges)
+        self.obs_dim = int(obs_dim)
+
+        state = torch.load(ckpt_path, map_location=self.device)
+        train_cfg = state.get("train_cfg", {})
+        model_cfg = train_cfg.get("model", {})
+
+        self.n_actions = int(model_cfg.get("n_actions", 3))
+        self.hidden_dim = int(model_cfg.get("hidden_dim", 64))
+
+        # --- rebuild actor core exactly like train_lstm.py ---
+        # IMPORTANT: keep names and structure aligned with training
+        actor_net = MultiAgentLSTM(
+            n_agent_inputs=self.obs_dim,
+            n_agent_outputs=self.n_actions,
+            n_agents=self.n_edges,
+            centralized=False,
+            share_params=True,
+            hidden_dim=self.hidden_dim,
+            device=self.device,
+        )
+
+        actor = TensorDictModule(
+            ActorAdapter(actor_net),
+            in_keys=[("agents", "observation", "obs"), ("agents", "rnn_h"), ("agents", "rnn_c")],
+            out_keys=[("agents", "logits"), ("agents", "rnn_h"), ("agents", "rnn_c")],
+        )
+
+        self.policy = ProbabilisticActor(
+            module=actor,
+            in_keys=[("agents", "logits")],
+            out_keys=[("agents", "action")],
+            distribution_class=Categorical,
+            return_log_prob=False,
+            default_interaction_type=InteractionType.MODE if greedy else InteractionType.RANDOM,
+        ).to(self.device)
+
+        # load weights
+        self.policy.load_state_dict(state["policy"], strict=True)
+        self.policy.eval()
+
+        # --- optional obs normalization ---
+        self.env_state = state.get("env_state", None) or state.get("obsnorm", None)
+        self.obs_loc = None
+        self.obs_scale = None
+        if isinstance(self.env_state, dict):
+            # best effort: find VecNorm loc/scale tensors
+            loc_key = next((k for k in self.env_state.keys() if str(k).endswith("loc")), None)
+            scale_key = next((k for k in self.env_state.keys() if str(k).endswith("scale")), None)
+            if loc_key and scale_key:
+                self.obs_loc = self.env_state[loc_key].detach().to(self.device).reshape(-1)
+                self.obs_scale = self.env_state[scale_key].detach().to(self.device).reshape(-1)
+
+        # recurrent state, per episode
+        self._h = None  # [1, E, H]
+        self._c = None  # [1, E, H]
+
+    def reset_episode(self) -> None:
+        self._h = torch.zeros((1, self.n_edges, self.hidden_dim), device=self.device)
+        self._c = torch.zeros((1, self.n_edges, self.hidden_dim), device=self.device)
+
+    def _normalize_obs_mat(self, obs_mat: np.ndarray) -> np.ndarray:
+        if self.obs_loc is None or self.obs_scale is None:
+            return obs_mat
+        flat = obs_mat.reshape(-1).astype(np.float32)
+        loc = self.obs_loc.detach().cpu().numpy()
+        scale = self.obs_scale.detach().cpu().numpy()
+        if loc.shape[0] != flat.shape[0]:
+            return obs_mat
+        flat_n = (flat - loc) / (scale + 1e-8)
+        return flat_n.reshape(obs_mat.shape)
+
+    @torch.no_grad()
+    def act(self, obs_mat: np.ndarray) -> np.ndarray:
+        if self._h is None or self._c is None:
+            self.reset_episode()
+
+        obs_mat = self._normalize_obs_mat(obs_mat.astype(np.float32))
+        obs = torch.tensor(obs_mat, device=self.device, dtype=torch.float32).unsqueeze(0)  # [1,E,obs_dim]
+
+        td = TensorDict(
+            {
+                ("agents", "observation", "obs"): obs,
+                ("agents", "rnn_h"): self._h,
+                ("agents", "rnn_c"): self._c,
+            },
+            batch_size=[1],
+            device=self.device,
+        )
+
+        td_out = self.policy(td)
+
+        # update recurrent state
+        self._h = td_out.get(("agents", "rnn_h"))
+        self._c = td_out.get(("agents", "rnn_c"))
+
+        a = td_out.get(("agents", "action")).squeeze(0)  # [E], 0..2
+        return (a.to(torch.int64) - 1).detach().cpu().numpy().astype(np.int64)
 
 class SingleEdgeLSTMPolicy:
     """
@@ -696,8 +814,9 @@ def main():
     # Define RL candidates (or override with --rl_specs)
     # -----------------------------------------------------
     rl_candidates = [
-        ("mappo_best", "collab", "checkpoints/ma_qoe_weighted/ckpt_iter_000100.pt"),
+        ("mappo_best", "collab", "checkpoints/ma_qoe_weighted/ckpt_best.pt"),
         # ("indep_epoch20", "indep", "checkpoints/atk1_noSO_2048_ev4_e10_t030_055/ckpt_iter_001000.pt"),
+        # ("marl_lstm_best", "lstm", "checkpoints/ma_lstm/ckpt_best.pt"),
     ]
 
     if args.rl_specs.strip():
@@ -710,8 +829,8 @@ def main():
             if len(parts) != 3:
                 raise ValueError(f"Bad --rl_specs entry: {item}")
             name, mode, ckpt = parts[0].strip(), parts[1].strip(), parts[2].strip()
-            if mode not in ("collab", "indep"):
-                raise ValueError(f"Bad mode '{mode}' for {name}, expected collab|indep")
+            if mode not in ("collab", "indep", "lstm"):
+                raise ValueError(f"Bad mode '{mode}' for {name}, expected collab|indep|lstm")
             rl_candidates.append((name, mode, ckpt))
 
     # -----------------------------------------------------
@@ -719,7 +838,7 @@ def main():
     # -----------------------------------------------------
     baseline_methods = ["random", "constant_0.5", "reactive"]
     # baseline_methods = ["reactive"]
-    # baseline_methods = []
+    baseline_methods = []
 
     rl_method_keys = [f"rl_{name}" for (name, _mode, _ckpt) in rl_candidates]
     all_methods = baseline_methods + rl_method_keys
@@ -779,6 +898,14 @@ def main():
                 device=args.rl_device,
                 greedy=args.rl_greedy,
             )
+        elif mode == "lstm":
+            rl_policy = MultiAgentLSTMPolicy(
+                ckpt_path=ckpt,
+                n_edges=n_edges,
+                obs_dim=obs_dim,
+                device=args.rl_device,
+                greedy=args.rl_greedy,
+            )            
         else:
             raise ValueError(mode)
 

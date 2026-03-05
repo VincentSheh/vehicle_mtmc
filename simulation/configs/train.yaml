@@ -18,7 +18,7 @@ logger:
   backend: wandb
   entity: asture123-national-taiwan-university
   project_name: edgeids
-  exp_name: ma_qoe_weighted
+  exp_name: ma_noSO_norm_e10
   plots:
     enabled: true
     out_dir: logs/wandb_plots
@@ -40,7 +40,7 @@ optim:
 loss:
   gamma: 0.99              # matches GAE(gamma=0.98)
   gae_lambda: 0.95         # matches lmbda=0.95
-  ppo_epochs: 20           # matches ppo_epochs = 20
+  ppo_epochs: 10           # matches ppo_epochs = 20
   mini_batch_size: 128     # matches minibatch_size = 128
   clip_epsilon: 0.2        # matches ClipPPOLoss(clip_epsilon=0.2)
   anneal_clip_epsilon: false
@@ -48,7 +48,7 @@ loss:
   entropy_coeff: 1.0e-3    # matches entropy_coef=1e-3
   loss_critic_type: smooth_l1
   normalize_advantage: false  # you normalize manually
-  seq_len: 16
+  seq_len: 8
 
 # =========================
 # Model

@@ -110,13 +110,13 @@ class Attacker:
             ema = self.df[ema_col].astype(float).ewm(alpha=alpha, adjust=False).mean()
 
         self.df["flows_per_sec_ema"] = ema
-        self.df["flows_per_sec_ema_mom"] = self.df[f"flows_per_sec_ema"].diff().fillna(0.0)
+        # self.df["flows_per_sec_ema_mom"] = self.df[f"flows_per_sec_ema"].diff().fillna(0.0)
         # self.df["flows_per_sec_ema_mom"] = self.df[f"flows_per_sec_ema"].diff(hl).fillna(0.0) / (hl)          
-        mom_raw = self.df["flows_per_sec_ema"].diff().fillna(0.0)
-        self.df["flows_per_sec_ema_mom"] = mom_raw.ewm(alpha=alpha, adjust=False).mean()        
+        # mom_raw = self.df["flows_per_sec_ema"].diff().fillna(0.0)
+        # self.df["flows_per_sec_ema_mom"] = mom_raw.ewm(alpha=alpha, adjust=False).mean()        
         self._flows = self.df["flows_per_sec"].to_numpy(dtype=np.float32)
         self._flows_ema = self.df["flows_per_sec_ema"].to_numpy(dtype=np.float32)
-        self._flows_ema_mom = self.df["flows_per_sec_ema_mom"].to_numpy(dtype=np.float32)
+        # self._flows_ema_mom = self.df["flows_per_sec_ema_mom"].to_numpy(dtype=np.float32)
 
                 
         self.base_seed = seed
@@ -177,8 +177,8 @@ class Attacker:
             "attacker_id": self.attacker_id,
             "attack_type": self.attack_type,
             "flows_per_sec": float(self._flows[sec_idx]) * self.scaling,
-            "flows_per_sec_ema": float(self._flows_ema[sec_idx]) * self.scaling,
-            "flows_per_sec_ema_mom": float(self._flows_ema_mom[sec_idx]) * self.scaling,
+            # "flows_per_sec_ema": float(self._flows_ema[sec_idx]) * self.scaling,
+            # "flows_per_sec_ema_mom": float(self._flows_ema_mom[sec_idx]) * self.scaling,
         }
 
 

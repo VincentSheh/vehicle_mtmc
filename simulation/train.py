@@ -40,7 +40,7 @@ from torchrl.collectors import SyncDataCollector
 from torchrl.data import UnboundedContinuousTensorSpec
 from torchrl.envs import ParallelEnv
 from torchrl.envs.libs.pettingzoo import PettingZooWrapper
-from torchrl.envs.transforms import Compose, InitTracker, Transform, TransformedEnv, VecNorm
+from torchrl.envs.transforms import Compose, InitTracker, Transform, TransformedEnv, ObservationNorm
 from torchrl.modules import MultiAgentMLP, ProbabilisticActor
 
 from environment import build_env_base
@@ -433,7 +433,7 @@ def make_wrapped_env(cfg_path: str, seed: int, decision_interval: int, scale_ste
     return PettingZooWrapper(pz, categorical_actions=True, group_map=group_map)
 
 
-def build_env_stack(env_cfg: dict, cfg_path: str, num_envs: int, use_vecnorm: bool):
+def build_env_stack(env_cfg: dict, cfg_path: str, num_envs: int, train_cfg: dict):
     decision_interval = int(env_cfg["globals"]["decision_interval"])
 
     base = make_wrapped_env(
@@ -464,19 +464,48 @@ def build_env_stack(env_cfg: dict, cfg_path: str, num_envs: int, use_vecnorm: bo
 
     penv = ParallelEnv(num_envs, [make_one(i) for i in range(num_envs)], device="cpu")
 
+    # --- build transforms ---
     transforms: List[Transform] = [
         InitTracker(),
         BuildCentralObs(n_edges=n_edges, obs_dim=obs_dim, out_key="observation_flat"),
         BuildSharedDone(),
     ]
-    if use_vecnorm:
-        transforms.append(VecNorm(in_keys=["observation_flat"], decay=0.999, eps=1e-5))
+
+    # --- OPTIONAL: ObservationNorm on observation_flat (no running mean) ---
+    use_obsnorm = bool(train_cfg.get("use_observation_norm", True))
+    if use_obsnorm:
+        on_cfg = train_cfg.get("observation_norm", {})
+        transforms.append(
+            ObservationNorm(
+                in_keys=["observation_flat"],
+                standard_normal=bool(on_cfg.get("standard_normal", True)),
+                # eps can be set if you want: eps=float(on_cfg.get("eps", 1e-5))
+            )
+        )
 
     env = TransformedEnv(penv, Compose(*transforms))
+
+    # --- populate mean/std ONCE from rollouts ---
+    if use_obsnorm:
+        on_cfg = train_cfg.get("observation_norm", {})
+        num_iter = int(on_cfg.get("num_iter", 100))
+        reduce_dim = tuple(on_cfg.get("reduce_dim", (0, 1)))
+        cat_dim = int(on_cfg.get("cat_dim", 0))
+
+        env.transform.train()
+        # ObservationNorm is last in Compose
+        env.transform[-1].init_stats(
+            num_iter=num_iter,
+            reduce_dim=reduce_dim,
+            cat_dim=cat_dim,
+        )
+        env.transform.eval()
+
     td0 = env.reset()
     print("agents done shape:", td0.get(("agents", "done")).shape)
     print("root done shape:", td0.get("done").shape)
     return env, n_edges, obs_dim
+
 
 
 # =========================
@@ -609,8 +638,7 @@ def train(
     num_envs = int(train_cfg["collector"]["num_envs"])
     decisions_per_episode = int(math.ceil(t_max / decision_interval))
 
-    use_vecnorm = bool(train_cfg.get("use_vecnorm", False))
-    env, n_edges, obs_dim = build_env_stack(env_cfg, env_cfg_path, num_envs, use_vecnorm)
+    env, n_edges, obs_dim = build_env_stack(env_cfg, env_cfg_path, num_envs, train_cfg)
 
     # keep per-agent log_prob, do not aggregate across agents
     set_composite_lp_aggregate(False).set()

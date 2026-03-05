@@ -163,7 +163,8 @@ class Environment:
 
         # 0) set cpu split on each edge
         for i, edge in enumerate(self.edge_areas):
-            oh = overheads[i]
+            # oh = overheads[i]
+            oh = 0 #! Overhead set to 0
             overhead_ids = oh if oh > 0.0 else 0.0
             overhead_va  = abs(oh) if oh < 0.0 else 0.0
 
@@ -240,28 +241,36 @@ class Environment:
             atk_pass_frac_exec[e_exec]  = 0.0 if a_in <= 0 else float(np.clip(a_pass / a_in, 0.0, 1.0))
 
         # 5) owner aggregates returned verdicts
-        admitted_user_owner = {e: 0 for e in area_ids}
-        admitted_atk_owner  = {e: 0 for e in area_ids}
+        # admitted_user_owner = {e: 0 for e in area_ids}
+        # admitted_atk_owner  = {e: 0 for e in area_ids}
 
-        for e_owner in area_ids:
-            u = float(obs[e_owner]["user_req_in"])
-            a = float(obs[e_owner]["atk_req_in"])
-            tot = max(u + a, 1.0)
-            u_share = u / tot
-            a_share = a / tot
+        # for e_owner in area_ids:
+        #     u = float(obs[e_owner]["user_req_in"])
+        #     a = float(obs[e_owner]["atk_req_in"])
+        #     tot = max(u + a, 1.0)
+        #     u_share = u / tot
+        #     a_share = a / tot
 
-            for e_exec, n_sent in plan_def.flow.get(e_owner, {}).items():
-                n_sent = float(n_sent)
-                sent_u = n_sent * u_share
-                sent_a = n_sent * a_share
+        #     for e_exec, n_sent in plan_def.flow.get(e_owner, {}).items():
+        #         n_sent = float(n_sent)
+        #         sent_u = n_sent * u_share
+        #         sent_a = n_sent * a_share
 
-                admitted_user_owner[e_owner] += int(round(sent_u * user_pass_frac_exec.get(e_exec, 1.0)))
-                admitted_atk_owner[e_owner]  += int(round(sent_a * atk_pass_frac_exec.get(e_exec, 0.0)))
+        #         admitted_user_owner[e_owner] += int(round(sent_u * user_pass_frac_exec.get(e_exec, 1.0)))
+        #         admitted_atk_owner[e_owner]  += int(round(sent_a * atk_pass_frac_exec.get(e_exec, 0.0)))
+        # W_va_src = {eid: float(admitted_user_owner[eid]) for eid in area_ids}
+        # c_va_dst = {eid: float(edges[eid].va_cpu) for eid in area_ids}
 
-        # -----------------------
-        # B) VA OFFLOAD + EXECUTE
-        # -----------------------
-        W_va_src = {eid: float(admitted_user_owner[eid]) for eid in area_ids}
+        # 5) executor keeps admitted workload (do NOT return to owner)
+        admitted_user_exec = {e: 0 for e in area_ids}
+        admitted_atk_exec  = {e: 0 for e in area_ids}
+
+        for e_exec in area_ids:
+            # counts already correspond to what the executor inspected
+            admitted_user_exec[e_exec] = int(ids_out_exec[e_exec].get("user_pass_cnt", exec_user_in[e_exec]))
+            admitted_atk_exec[e_exec]  = int(ids_out_exec[e_exec].get("atk_pass_cnt", 0))
+
+        W_va_src = {eid: float(admitted_user_exec[eid]) for eid in area_ids}
         c_va_dst = {eid: float(edges[eid].va_cpu) for eid in area_ids}
         tau_loc  = self._compute_tau_loc(W_va_src, c_va_dst)
 
@@ -371,8 +380,10 @@ class Environment:
             "cache": local_cache,
             "plan_def": plan_def,
             "plan_va": plan_va,
-            "admitted_user_owner": admitted_user_owner,
-            "admitted_atk_owner": admitted_atk_owner,
+            # "admitted_user_owner": admitted_user_owner,
+            # "admitted_atk_owner": admitted_atk_owner,
+            "admitted_user_exec": admitted_user_exec,
+            "admitted_atk_exec": admitted_atk_exec,            
         }
         
 def build_env_base(cfg_path: str):
