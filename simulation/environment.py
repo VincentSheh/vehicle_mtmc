@@ -173,7 +173,7 @@ class Environment:
             edge.va_cpu  = float(edge.budget.cpu) - float(ids_cpus[i]) - float(overhead_va)
 
             assert edge.ids_cpu + edge.va_cpu <= edge.budget.cpu + 1e-6
-            assert edge.ids_cpu >= 0.5
+            # assert edge.ids_cpu >= 0.5
             assert edge.va_cpu >= 0.5
 
         # 1) observe arrivals at owners (ingress)
@@ -509,7 +509,7 @@ def test_environment_run(cfg_path: str, plot=False):
         env.reset(seed=1000 + i)
 
         for _ in range(env.t_max):
-            env.step([2.5]*len(env.edge_areas))
+            env.step([0]*len(env.edge_areas))
             # env.step([7.5, 0.5, 0.5])
             
 

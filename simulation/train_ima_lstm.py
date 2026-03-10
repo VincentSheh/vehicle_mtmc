@@ -235,32 +235,49 @@ class EdgeIDSParallelEnv(PZooParallelEnv):
     #         r[i] = -abs(float(self.ids_cpu[i]) - target_ids_cpu)
     #     return r
 
+    # def _build_reward_per_agent(self) -> np.ndarray:
+    #     if len(self.env.history) < self.n_edges:
+    #         return np.zeros(self.n_edges, dtype=np.float32) # Waits for all agents to log
+
+    #     r = np.zeros(self.n_edges, dtype=np.float32)
+        
+    #     # Grab a safe chunk of recent history to account for potential asynchronous logging
+    #     buffer_size = self.n_edges * 5
+    #     recent_history = self.env.history[-buffer_size:] 
+
+    #     for i, aid in enumerate(self.area_ids):
+    #         q_local = 0.0
+            
+    #         # Search backwards to find the strictly most recent record for THIS specific agent
+    #         for record in reversed(recent_history):
+    #             if getattr(record, "area_id", None) == aid:
+    #                 q_local = float(record.qoe_mean)
+    #                 break
+            
+    #         # Calculate reward with mathematically enforced bounds
+    #         viol = max(0.0, self.threshold - q_local)
+    #         penalty = float(self.alpha * (viol ** 2))
+            
+    #         r[i] = q_local - penalty
+
+    #     return r
+    
     def _build_reward_per_agent(self) -> np.ndarray:
-        if not self.env.history:
+        if len(self.env.history) < self.n_edges:
             return np.zeros(self.n_edges, dtype=np.float32)
 
-        r = np.zeros(self.n_edges, dtype=np.float32)
+        # 1. Get local QoE for each edge (maintains area_id order)
+        last_block = self.env.history[-self.n_edges:]
+        q_local = np.asarray([float(m.qoe_mean) for m in last_block], dtype=np.float32)
         
-        # Grab a safe chunk of recent history to account for potential asynchronous logging
-        buffer_size = self.n_edges * 5
-        recent_history = self.env.history[-buffer_size:] 
+        # 2. Calculate local penalty: how far is THIS specific agent below the threshold?
+        # Use np.maximum for element-wise comparison
+        viol = np.maximum(0.0, self.threshold - q_local)
+        penalty = (self.alpha * (viol ** 2)).astype(np.float32)
 
-        for i, aid in enumerate(self.area_ids):
-            q_local = 0.0
-            
-            # Search backwards to find the strictly most recent record for THIS specific agent
-            for record in reversed(recent_history):
-                if getattr(record, "area_id", None) == aid:
-                    q_local = float(record.qoe_mean)
-                    break
-            
-            # Calculate reward with mathematically enforced bounds
-            viol = max(0.0, self.threshold - q_local)
-            penalty = float(self.alpha * (viol ** 2))
-            
-            r[i] = q_local - penalty
-
-        return r
+        # 3. Reward = Local Performance - Local Penalty
+        # Result is a vector of size (n_edges,)
+        return q_local - penalty    
         
     def _qoe_vec(self) -> np.ndarray:
         # qoe = np.asarray(getattr(self.env, "final_qoe", 0.0), dtype=np.float32)

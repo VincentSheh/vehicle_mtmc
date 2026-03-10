@@ -16,3 +16,4 @@ __py*
 .jedi
 simulation/wandb/
 *.csv
+eval_out/*

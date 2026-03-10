@@ -80,54 +80,57 @@ def build_observation_from_history(env, decision_interval: int, obs_keys: List[s
     return obs
 
 
-def decision_qoe_per_edge(env, threshold: float = 0.35, alpha: float = 0.6) -> np.ndarray:
-    """
-    Match current training env._qoe_vec().
-    Uses whole-episode history up to current time.
-    Returns: [E]
-    """
+def decision_qoe_per_edge(env, decision_interval) -> np.ndarray:
     n_edges = len(env.edge_areas)
-
-    if not getattr(env, "history", None) or len(env.history) == 0:
-        return np.zeros((n_edges,), dtype=np.float32)
-
     q_vec = np.zeros((n_edges,), dtype=np.float32)
 
+    # Return zeros if there isn't enough history yet
+    if not getattr(env, "history", None) or len(env.history) < decision_interval * n_edges:
+        return q_vec
+
+    # Isolate the records from the current decision interval
+    block = env.history[-decision_interval * n_edges :]
+
     for i, edge in enumerate(env.edge_areas):
-        h = [m for m in env.history if m.area_id == edge.area_id]
+        # Filter the recent block for this specific edge
+        h = [m for m in block if m.area_id == edge.area_id]
+        
         if not h:
-            q_vec[i] = 0.0
             continue
 
         q = np.asarray([float(m.qoe_mean) for m in h], dtype=np.float32)
-        if q.size == 0:
-            q_vec[i] = 0.0
-            continue
-
-        slo_thr = float(getattr(edge, "slo_threshold", threshold))
-        slo_beta = float(getattr(edge, "slo_beta", alpha))
-
-        viol_rate = float((q < slo_thr).mean())
-        v_edge = float(np.exp(-slo_beta * viol_rate))
-
-        q_vec[i] = float(q.mean()) * v_edge
+        if q.size > 0:
+            q_vec[i] = float(q.mean())
 
     return q_vec
 
 
-def decision_reward_per_edge(env, threshold: float = 0.35, alpha: float = 0.6) -> np.ndarray:
+def decision_reward_per_edge(env, decision_interval: int, threshold: float = 0.35, alpha: float = 0.6) -> np.ndarray:
     """
-    Match current training env._build_reward_per_agent() on the most recent block.
+    Returns the average reward per edge over the most recent decision interval.
     Returns: [E]
     """
     n_edges = len(env.edge_areas)
-    if len(env.history) < n_edges:
+    
+    if not getattr(env, "history", None) or len(env.history) < decision_interval * n_edges:
         return np.zeros((n_edges,), dtype=np.float32)
 
-    last_block = env.history[-n_edges:]
-    q_local = np.asarray([float(m.qoe_mean) for m in last_block], dtype=np.float32)
+    block = env.history[-decision_interval * n_edges :]
+    q_local = np.zeros((n_edges,), dtype=np.float32)
+
+    for i, edge in enumerate(env.edge_areas):
+        h = [m for m in block if m.area_id == edge.area_id]
+        if not h:
+            continue
+            
+        q = np.asarray([float(m.qoe_mean) for m in h], dtype=np.float32)
+        if q.size > 0:
+            q_local[i] = float(q.mean())
+
+    # Apply the penalty formula using the interval-averaged QoE
     viol = np.maximum(0.0, threshold - q_local)
     penalty = (alpha * (viol ** 2)).astype(np.float32)
+    
     return q_local - penalty
 
 
@@ -325,8 +328,6 @@ class MultiAgentMLPPolicy:
         
         # You can still inspect the logits since the network populated them
         logits = td.get(("agents", "logits")).squeeze(0)   # [E, A]
-        print("logits =", logits)
-        print("action =", a)
 
         return (a.to(torch.int64) - 1).detach().cpu().numpy().astype(np.int64)
 # =========================================================
@@ -409,8 +410,9 @@ def run_episode(
             delta = rl_policy.act(obs_mat)
         else:
             raise ValueError(method)
-
-        ids_cpu = apply_delta(ids_cpu, delta, scale_step, ids_cpu_min, ids_cpu_max)
+        
+        if not(method.startswith("constant_")):
+            ids_cpu = apply_delta(ids_cpu, delta, scale_step, ids_cpu_min, ids_cpu_max)
 
         overheads = (ids_cpu - np.array([e.ids_cpu for e in env.edge_areas], dtype=np.float32)).astype(np.float32).tolist()
 
@@ -422,8 +424,8 @@ def run_episode(
             if env.t >= env.t_max:
                 break
 
-        qoe = decision_qoe_per_edge(env, threshold=threshold, alpha=alpha)
-        rew = decision_reward_per_edge(env, threshold=threshold, alpha=alpha)
+        qoe = decision_qoe_per_edge(env, decision_interval)
+        rew = decision_reward_per_edge(env, decision_interval, threshold=threshold, alpha=alpha)
         met = decision_metrics_per_edge(env, decision_interval, metric_keys)
 
         qoe_ts.append(qoe)
@@ -695,7 +697,8 @@ def main():
     ap.add_argument("--decision_interval", type=int, default=500)
     ap.add_argument("--scale_step", type=float, default=0.5)
     ap.add_argument("--ids_cpu_min", type=float, default=0.5)
-    ap.add_argument("--threshold", type=float, default=0.35)
+    ap.add_argument("--threshold", type=float, default=0.5)
+    ap.add_argument("--slo_threshold", type=float, default=0.4)
     ap.add_argument("--alpha", type=float, default=0.6)
     ap.add_argument("--rl_device", type=str, default="cuda")
     ap.add_argument("--rl_greedy", action="store_true")
@@ -732,7 +735,7 @@ def main():
     edge_names = [str(e.area_id) for e in tmp_env.edge_areas]
 
     rl_candidates = [
-        ("mlp_best", "mlp", "checkpoints/ima_ppo/ckpt_best.pt"),
+        ("mlp_best", "mlp", "checkpoints/atksc2_ima_lstm/ckpt_iter_000200.pt"),
     ]
 
     if args.rl_specs.strip():
@@ -750,9 +753,10 @@ def main():
             rl_candidates.append((name, mode, ckpt))
 
     baseline_methods = ["random", "constant_0.0", 
-                        "constant_2.0", "constant_3.0", "constant_4.0",
+                        "constant_2.0", 
+                        # "constant_3.0", "constant_4.0",
                         "reactive"]
-    # baseline_methods = []
+    # baseline_methods = ["constant_0.0", "reactive"]
     rl_method_keys = [f"rl_{name}" for (name, _mode, _ckpt) in rl_candidates]
     all_methods = baseline_methods + rl_method_keys
 
@@ -827,13 +831,13 @@ def main():
     out_all = outdir / "all"
     out_all.mkdir(parents=True, exist_ok=True)
 
-    plot_ts_per_edge(results_all, out_all, edge_names=edge_names, slo_qoe_min=0.2)
     plot_obs_per_edge(results_all, out_all, edge_names=edge_names, obs_keys=obs_keys)
-    plot_qoe_vio_bars_per_edge(results_all, out_all, edge_names=edge_names, qoe_slo_min=0.2)
+    plot_ts_per_edge(results_all, out_all, edge_names=edge_names, slo_qoe_min=args.slo_threshold)
+    plot_qoe_vio_bars_per_edge(results_all, out_all, edge_names=edge_names, qoe_slo_min=args.slo_threshold)
     plot_global_weighted_summary(
             results_all, 
             out_all, 
-            qoe_slo_min=0.2, # Using the threshold from args
+            qoe_slo_min=args.slo_threshold, # Using the threshold from args
             beta=args.alpha             # Using alpha as the SLO sensitivity
         )
 
