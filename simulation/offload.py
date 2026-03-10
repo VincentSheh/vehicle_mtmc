@@ -31,6 +31,7 @@ def compute_N_max_delay_cap(area_ids, edges, c_va_dst, kappa_min):
         mu_cycles_per_ms = edge.cpu_cycle_per_ms * float(c_va_dst[eid])
         cap = (mu_cycles_per_ms * D_MAX_MS) / max(kappa_min, 1e-9)
         N_max[eid] = max(0, int(math.floor(cap)))
+        N_max[eid] = 1e9
     return N_max
 
 def balance_with_caps_and_prop_filter(

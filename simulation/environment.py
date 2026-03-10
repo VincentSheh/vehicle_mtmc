@@ -57,6 +57,7 @@ class StepMetrics:
     attack_drop_rate: float
     user_drop_rate: float
     cpu_to_ids_ratio: float
+    total_cpu_to_ids_ratio: float
     ids_cpu_utilization: float
 
     # VA / BW
@@ -137,7 +138,7 @@ class Environment:
         self.history.clear()
         self.final_qoe = 0
         for i, edge in enumerate(self.edge_areas):
-            edge.reset(seed=seed + i*99)        
+            edge.reset(seed=seed + i*99)   
 
     def _compute_tau_loc(self, W_va: Dict[int, float], c_va: Dict[int, float]) -> Dict[int, float]:
         # local processing proxy, higher means slower, used as threshold against propagation delay
@@ -306,6 +307,9 @@ class Environment:
             tot_req += int(cache.get("local_num_request", 0))
 
         # log metrics
+        total_cpu_to_ids_ratio = float(
+            sum((edges[eid].ids_cpu / edges[eid].budget.cpu) for eid in area_ids)
+        )        
         for i,eid in enumerate(area_ids):
             edge = edges[eid]
             cache = local_cache[eid]
@@ -319,7 +323,7 @@ class Environment:
                     t=self.t,
                     area_id=eid,
                     qoe_mean=float(cache["qoe"]),
-                    qoe_weighted=qoe_weighted * 3,
+                    qoe_weighted=qoe_weighted * len(self.edge_areas),
                     ids_coverage=float(ids_out.get("coverage")),
                     attack_in_rate=float(ids_out.get("atk_in_cnt")),
                     user_drop_rate=float(ids_out.get("user_drop_cnt")),
@@ -329,6 +333,7 @@ class Environment:
                     ema_mom=cache["ema_mom"],
                     attack_drop_rate=float(ids_out.get("atk_drop_cnt")),
                     cpu_to_ids_ratio=edge.ids_cpu / edge.budget.cpu,
+                    total_cpu_to_ids_ratio = total_cpu_to_ids_ratio,
                     va_cpu_utilization=cache["va_cpu_utilization"],
                     ids_cpu_utilization=float(ids_out.get("ids_cpu_util")),
                     bw_utilization=cache["uplink_util"],
@@ -345,27 +350,30 @@ class Environment:
 
             for edge in self.edge_areas:
                 h = [m for m in self.history if m.area_id == edge.area_id]
-                if len(h) == 0:
+                if not h:
                     continue
 
-                last_block = h[-self.t_max:]  # window
-                q = np.asarray([float(m.qoe_weighted) for m in last_block], dtype=np.float32)
+                # window (in your code this is effectively the whole episode)
+                last_block = h[-self.t_max:]
 
-                # SLO penalty term
-                viol = (q < edge.slo_threshold).astype(np.float32)
+                # use per-edge QoE for SLO + scoring
+                q = np.asarray([float(m.qoe_mean) for m in last_block], dtype=np.float32)
+
+                # SLO violation rate on per-edge QoE
+                viol = (q < float(edge.slo_threshold)).astype(np.float32)
                 viol_rate = float(viol.mean()) if viol.size else 0.0
-                V_edge = float(np.exp(-edge.slo_beta * viol_rate))
+                V_edge = float(np.exp(-float(edge.slo_beta) * viol_rate))
 
                 # edge score (SLO-adjusted)
                 score = float(q.mean()) * V_edge
 
-                # weight by total served requests in the window
+                # weight by served requests at this edge over the window
                 w = float(np.sum([int(m.local_num_req) for m in last_block]))
 
                 num += w * score
                 den += w
 
-            self.final_qoe = (num / den) if den > 0 else 0.0    
+            self.final_qoe = (num / den) if den > 0.0 else 0.0 
             
         # print("obs", obs, "\n",
         #     "ids_in_dst", ids_in_dst, "\n",

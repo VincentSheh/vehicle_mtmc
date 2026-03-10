@@ -18,7 +18,8 @@ logger:
   backend: wandb
   entity: asture123-national-taiwan-university
   project_name: edgeids
-  exp_name: ma_noSO_norm_e10
+  # exp_name: ima_ppo
+  exp_name: atksc2_ima_lstm
   plots:
     enabled: true
     out_dir: logs/wandb_plots
@@ -44,8 +45,8 @@ loss:
   mini_batch_size: 128     # matches minibatch_size = 128
   clip_epsilon: 0.2        # matches ClipPPOLoss(clip_epsilon=0.2)
   anneal_clip_epsilon: false
-  critic_coeff: 1.0
-  entropy_coeff: 1.0e-3    # matches entropy_coef=1e-3
+  critic_coeff: 0.2
+  entropy_coeff: 1.0e-2    # matches entropy_coef=1e-3
   loss_critic_type: smooth_l1
   normalize_advantage: false  # you normalize manually
   seq_len: 8
@@ -54,7 +55,7 @@ loss:
 # Model
 # =========================
 model:
-  hidden_dim: 64           # ActorNet / CriticNet hidden size
+  hidden_dim: 128           # ActorNet / CriticNet hidden size
   n_actions: 3             # discrete {scale down, hold, scale up}
 
 # =========================

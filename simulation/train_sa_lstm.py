@@ -1,51 +1,49 @@
-import yaml
+
+from __future__ import annotations
+
 import math
+from pathlib import Path
+from typing import Dict, Optional, Tuple, List
+
+import yaml
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
-import numpy as np
-from tensordict import TensorDict
+
+from gymnasium import spaces
+from pettingzoo.utils.env import ParallelEnv as PZooParallelEnv
+
+from tensordict import TensorDictBase, TensorDict
+from tensordict.nn import TensorDictModule, TensorDictSequential, InteractionType, set_composite_lp_aggregate
+from torch.distributions import Categorical
 
 from torchrl.collectors import SyncDataCollector
-from torchrl.modules import ProbabilisticActor, ValueOperator
-from tensordict.nn import TensorDictModule, TensorDictSequential, InteractionType
+from torchrl.data import UnboundedContinuousTensorSpec
+from torchrl.envs import ParallelEnv
+from torchrl.envs.libs.pettingzoo import PettingZooWrapper
+from torchrl.envs.transforms import Compose, InitTracker, Transform, TransformedEnv, ObservationNorm
+from torchrl.modules import ProbabilisticActor, LSTMModule
+
+from environment import build_env_base
+from logger import wandb_init
+import wandb
+
+from torchrl.envs import EnvBase
+from torchrl.data import (
+    CompositeSpec,
+    UnboundedContinuousTensorSpec,
+    BoundedTensorSpec,
+    DiscreteTensorSpec,
+    MultiDiscreteTensorSpec,
+)
+
 from torchrl.objectives import ClipPPOLoss
+
 from torchrl.objectives.value import GAE
-from torch.distributions import Categorical, Independent
-from environment import TorchRLEnvWrapper
-from torchrl.envs.transforms import ObservationNorm, VecNorm, TransformedEnv
-from torchrl.envs import ParallelEnv  # or ParallelEnv if you want multiprocessing
-from torchrl.modules import LSTMModule
-from torchrl.envs.transforms import Compose
-from torchrl.envs.transforms import InitTracker
-from torchrl.data import LazyTensorStorage, TensorDictReplayBuffer
-from torchrl.data.replay_buffers.samplers import SliceSampler
-from logger import *
 
+N_ACTION = 3
 
-from pathlib import Path
-import multiprocessing as mp
-import torch.multiprocessing as tmp
-
-mp.set_start_method("spawn", force=True)
-tmp.set_sharing_strategy("file_system")
-
-def save_ckpt(path, policy, value, optim, env_cfg, train_cfg, it, device, env):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "policy": policy.state_dict(),
-            "value": value.state_dict(),
-            "optim": optim.state_dict(),
-            "iter": int(it),
-            "env_cfg": env_cfg,
-            "train_cfg": train_cfg,
-            "device": str(device),
-            "obsnorm": env.state_dict(),
-        },
-        str(path),
-    )
-    
 class TorchRLEnvWrapper(EnvBase):
     """
     Correct TorchRL EnvBase wrapper.
@@ -139,10 +137,12 @@ class TorchRLEnvWrapper(EnvBase):
             ),
         )
 
+        # joint action space size
+        self.n_joint_actions = int(N_ACTION ** self.n_edges)
+
         self.action_spec = CompositeSpec(
             action=DiscreteTensorSpec(
-                n=N_ACTION,   # {-1, 0, +1}
-                # shape=(self.n_edges,),
+                n=self.n_joint_actions,   # joint action index in [0, N_ACTION**E - 1]
                 device=self.device,
             )
         )
@@ -183,13 +183,15 @@ class TorchRLEnvWrapper(EnvBase):
     def _reset(self, tensordict=None):
         self.episode_id += 1
         episode_seed = self.base_seed + self.episode_id * 1000
-
-        # Seed ONLY torch (policy randomness)
         torch.manual_seed(episode_seed)
-
-        # Reset env with explicit seeds
         self.env.reset(episode_seed)
 
+        # ✅ refresh ids_cpu from env
+        self.ids_cpu = torch.tensor(
+            [e.ids_cpu for e in self.env.edge_areas],
+            device=self.device,
+            dtype=torch.float32,
+        )
 
         obs = self._build_observation().to(self.device)
         obs_flat = obs.reshape(-1)
@@ -199,7 +201,7 @@ class TorchRLEnvWrapper(EnvBase):
                 "observation": obs,
                 "observation_flat": obs_flat,
                 "qoe_mean": torch.zeros(1, dtype=torch.float32, device=self.device),
-                "t_internal": torch.tensor([int(self.env.t)], dtype=torch.int64, device=self.device),                
+                "t_internal": torch.tensor([int(self.env.t)], dtype=torch.int64, device=self.device),
                 "done": torch.zeros(1, dtype=torch.bool, device=self.device),
                 "terminated": torch.zeros(1, dtype=torch.bool, device=self.device),
                 "truncated": torch.zeros(1, dtype=torch.bool, device=self.device),
@@ -232,56 +234,61 @@ class TorchRLEnvWrapper(EnvBase):
             return -1.0
         return 0.0        
 
+    def _decode_joint_action(self, a: int) -> torch.Tensor:
+        """
+        a: int in [0, N_ACTION**E - 1]
+        returns per-edge actions: LongTensor [E] with values in {0,1,2}
+        base-N_ACTION digits (little-endian): edge 0 is least significant digit
+        """
+        E = self.n_edges
+        out = torch.zeros(E, dtype=torch.long, device=self.device)
+        x = int(a)
+        for i in range(E):
+            out[i] = x % N_ACTION
+            x //= N_ACTION
+        return out
+
     def _step(self, tensordict: TensorDict) -> TensorDict:
-        action = tensordict["action"]                       # scalar 0/1/2
-        # propose change
-        delta_cmd = (action.to(self.device).float() - int(N_ACTION / 2)) * self.scale_step
-        # delta_cmd = self._reactive_delta() * self.scale_step  # -1, 0, +1
+        a_joint = tensordict["action"]
+        while a_joint.ndim > 0:
+            a_joint = a_joint.squeeze(-1)
+        a_joint = int(a_joint.item())
+        action_vec = self._decode_joint_action(a_joint)  # [E] in {0,1,2}
 
-        prev_ids = self.ids_cpu[0].clone()
-        edge = self.env.edge_areas[0]
-        self.ids_cpu[0] = torch.clamp(
-            self.ids_cpu[0] + delta_cmd,
-            min=self.ids_cpu_min,
-            max=edge.budget.cpu - 0.5,
-        )
-        
-        delta_eff = float((self.ids_cpu[0] - prev_ids).item())
-        ids_cpu = self.ids_cpu.clone()
+        # map 0,1,2 -> -1,0,+1 then scale
+        delta_cmd = (action_vec.float() - 1.0) * self.scale_step  # [E]
 
-        # ids_cpu = [1.5]
-        # overhead is nonnegative and charged because you changed allocation
-        overhead = delta_eff
+        prev_ids = self.ids_cpu.clone()
+        new_ids = self.ids_cpu + delta_cmd
+
+        for i, edge in enumerate(self.env.edge_areas):
+            max_ids = float(edge.budget.cpu) - 0.5
+            new_ids[i] = torch.clamp(new_ids[i], min=self.ids_cpu_min, max=max_ids)
+
+        self.ids_cpu = new_ids
+
+        # overhead per edge if you want it
+        overheads = (self.ids_cpu - prev_ids).detach().cpu().numpy().astype(np.float32).tolist()
 
         total_reward = 0.0
         terminated_flag = False
         steps = 0
-
-        # 2) Simulate decision_interval internal timesteps
-        for i in range(self.decision_interval):
-            self.env.step(ids_cpu, overhead = 0)
+        for _ in range(self.decision_interval):
+            self.env.step(self.ids_cpu, overhead=0)  # or overheads if your env expects a vector
             total_reward += float(self._build_reward())
             steps += 1
             if self.env.t >= self.env.t_max:
                 terminated_flag = True
                 break
 
-        reward = torch.tensor([
-            total_reward 
-            / max(1, steps)
-            ], dtype=torch.float32, device=self.device)
+        reward = torch.tensor([total_reward / max(1, steps)], dtype=torch.float32, device=self.device)
 
-        # 3) Build aggregated outputs
         obs = self._build_observation().to(self.device)
         obs_flat = obs.reshape(-1)
 
-        terminated = torch.tensor(
-            [terminated_flag], dtype=torch.bool, device=self.device
-        )
+        terminated = torch.tensor([terminated_flag], dtype=torch.bool, device=self.device)
         truncated = torch.zeros(1, dtype=torch.bool, device=self.device)
         done = terminated | truncated
-
-        t_internal_end = int(self.env.t)  # end-of-window index (exclusive)
 
         qoe_mean = float(self.env.final_qoe)
 
@@ -290,11 +297,8 @@ class TorchRLEnvWrapper(EnvBase):
                 "observation": obs,
                 "observation_flat": obs_flat,
                 "reward": reward,
-
-                # logging keys that ParallelEnv can batch safely
-                "qoe_mean": torch.tensor([qoe_mean*30], dtype=torch.float32, device=self.device),
-                "t_internal": torch.tensor([t_internal_end], dtype=torch.int64, device=self.device),
-
+                "qoe_mean": torch.tensor([qoe_mean * 30.0], dtype=torch.float32, device=self.device),
+                "t_internal": torch.tensor([int(self.env.t)], dtype=torch.int64, device=self.device),
                 "done": done,
                 "terminated": terminated,
                 "truncated": truncated,
@@ -367,7 +371,25 @@ class TorchRLEnvWrapper(EnvBase):
 
         reward = float(np.mean(qoe - penalty + bonus))
         return torch.tensor([reward], dtype=torch.float32, device=self.device)
-                
+
+
+
+def save_ckpt(path, policy, value, optim, env_cfg, train_cfg, it, device, env):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "policy": policy.state_dict(),
+            "value": value.state_dict(),
+            "optim": optim.state_dict(),
+            "iter": int(it),
+            "env_cfg": env_cfg,
+            "train_cfg": train_cfg,
+            "device": str(device),
+            "obsnorm": env.state_dict(),
+        },
+        str(path),
+    )
 
 def orthogonal_init(m, gain=1.0):
     if isinstance(m, nn.Linear):
@@ -423,7 +445,7 @@ class CriticNet(nn.Module):
     def forward(self, obs):
         return self.net(obs).squeeze(-1)
 
-def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/train.yaml", resume_ckpt=None, device="cuda"):
+def train(env_cfg_path="./configs/simulation_ma_0.yaml", train_cfg_path="./configs/train.yaml", resume_ckpt=None, device="cuda"):
     with open(env_cfg_path, "r") as f:
         env_cfg = yaml.safe_load(f)
     with open(train_cfg_path, "r") as f:
@@ -470,6 +492,9 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
         num_envs,
         [make_env(1000 + i) for i in range(num_envs)],
     )
+    obs_spec = penv.observation_spec["observation"]   # shape: (..., E, D) or (E, D)
+    n_edges = int(obs_spec.shape[-2])
+    n_actions = int(train_cfg["model"]["n_actions"])
 
     env = TransformedEnv(
         penv,
@@ -506,10 +531,37 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
 
     shared_core = TensorDictSequential(feature_module, lstm)
 
-    actor_head = TensorDictModule(
-        nn.Linear(feature_dim, train_cfg["model"]["n_actions"]).to(device),
-        in_keys=["features"],
+    class ReshapeLogits(nn.Module):
+        def __init__(self, n_edges: int, n_actions: int):
+            super().__init__()
+            self.E = int(n_edges)
+            self.A = int(n_actions)
+
+        def forward(self, x):
+            # x: [..., E*A] -> [..., E, A]
+            return x.view(*x.shape[:-1], self.E, self.A)
+            
+
+    reshape_logits = TensorDictModule(
+        ReshapeLogits(n_edges, n_actions).to(device),
+        in_keys=["logits_flat"],
         out_keys=["logits"],
+    )
+
+    n_edges = int(penv.observation_spec["observation"].shape[-2])
+    n_joint_actions = int(N_ACTION ** n_edges)
+
+    feature_module = TensorDictModule(
+        FeatureNet(obs_size, feature_dim).to(device),
+        in_keys=["observation_flat"],
+        out_keys=["features"],
+    )
+    shared_core = TensorDictSequential(feature_module, lstm)
+
+    actor_head = TensorDictModule(
+        nn.Linear(feature_dim, n_joint_actions).to(device),
+        in_keys=["features"],
+        out_keys=["logits"],              # [..., n_joint_actions]
     )
 
     critic_head = TensorDictModule(
@@ -520,24 +572,39 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
 
 
 
-    # actor for loss, head-only
-    loss_actor = ProbabilisticActor(
-        module=actor_head,          # reads "features" -> writes "logits"
+    class SamplePerEdgeCategorical(nn.Module):
+        def __init__(self):
+            super().__init__()
+
+        def forward(self, logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+            # logits: [..., E, A]
+            dist = Categorical(logits=logits)          # batch includes E
+            action = dist.sample()                    # [..., E]
+            logp = dist.log_prob(action).sum(-1, keepdim=True)  # [..., 1]  ✅ scalar logp
+            return action, logp
+    sampler = TensorDictModule(
+        SamplePerEdgeCategorical().to(device),
         in_keys=["logits"],
-        out_keys=["action"],
-        distribution_class=Categorical,
-        return_log_prob=True,
-    )
-
-
+        out_keys=["action", "action_log_prob"],   # action_log_prob: [...,1]
+    )        
     # policy used by collector: DOES include shared_core
     collector_policy = ProbabilisticActor(
         module=TensorDictSequential(shared_core, actor_head),
         in_keys=["logits"],
         out_keys=["action"],
         distribution_class=Categorical,
+        return_log_prob=True,   # produces "action_log_prob" scalar
+    )
+
+    # actor used by loss: head-only, PPO will recompute logits on mb_td
+    loss_actor = ProbabilisticActor(
+        module=actor_head,
+        in_keys=["logits"],
+        out_keys=["action"],
+        distribution_class=Categorical,
         return_log_prob=True,
     )
+
     # critic for loss, head-only
     value = critic_head   # reads "features" -> writes "state_value"
     optim = torch.optim.Adam(
@@ -579,7 +646,13 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
         normalize_advantage=True,
     )
 
-    loss.set_keys(value="state_value", advantage="advantage", value_target="value_target")
+    loss.set_keys(
+        action="action",
+        sample_log_prob="action_log_prob",
+        value="state_value",
+        advantage="advantage",
+        value_target="value_target",
+    )
 
     frames_per_batch = train_cfg["collector"].get(
        "frames_per_batch",
@@ -743,8 +816,9 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
                 seq_list = []
                 for k in range(seq_len_eff):
                     seq_list.append(data[t0_idx + k, b_idx])
-                mb_td = torch.stack(seq_list, dim=0)  # TensorDict stacked on time dim
 
+                mb_td = torch.stack(seq_list, dim=0)          # [seq_len, mb, ...]
+                mb_td = mb_td.transpose(0, 1).contiguous()    # ✅ [mb, seq_len, ...]
                 mb_td = mb_td.detach()
 
                 alpha = 1.0 - (num_network_updates / total_network_updates)

@@ -41,25 +41,25 @@ globals:
       latency_per_flow: 0.0
       bw_per_flow: 0.0303 # 0.0103 #original max_bw when scaling=1.0 is 100mb
       non_defendable_bw_const: 0.0
-      scaling: 1.0
+      scaling: 1.8
       mean_rep: 0
 
     atk_04:
       type: drdos_netbios
       ts_path: output/cicddos2019_1_pruned/DrDoS_NetBIOS.csv
-      latency_per_flow: 0.7
+      latency_per_flow: 1.8 
       bw_per_flow: 0.00331 #original max_bw when scaling=1.0 is 27mb
       non_defendable_bw_const: 0.0
       scaling: 1.0
-      mean_rep: 1
+      mean_rep: 0
 
     atk_05:
       type: syn_flood
       ts_path: output/cicddos2019_1_pruned/Syn.csv
-      latency_per_flow: 0.9
+      latency_per_flow: 8.0
       bw_per_flow: 0.0 #original max_bw when scaling=1.0 is 0mb
       non_defendable_bw_const: 0.0
-      scaling: 4.0
+      scaling: 8.0
       mean_rep: 8.0
 
     atk_06:
@@ -216,10 +216,10 @@ edge_areas:
           sigma: 0.9
 
     attackers:
-      # - attacker_type: "atk_01"
+      - attacker_type: "atk_01"
       # - attacker_type: "atk_02"
       # - attacker_type: "atk_03"
-      - attacker_type: "atk_04"
+      # - attacker_type: "atk_04"
       # - attacker_type: "atk_05"
 
   # - area_id: "E2"

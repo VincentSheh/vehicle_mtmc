@@ -1,17 +1,3 @@
-"""
-MAPPO-ish (CTDE) Recurrent PPO using TorchRL LSTMModule
-- No MultiAgentNetBase
-- No manual LSTMCell loops
-- Actor recurrence is shared across agents by flattening (B*E) into the batch
-- Critic recurrence is per-env (CTDE) on observation_flat
-
-Key invariants (so it learns)
-- At time t, stored ("agents","recurrent_state_h/c") are the INPUT states used to compute logits_t and sample a_t
-- Policy writes NEXT hidden states to ("next","agents","recurrent_state_h/c")
-- Env Transform carries next hidden back to current hidden each step
-- PPO update recomputes logits on sampled sequences using the SAME h_t at the start of the sequence
-"""
-
 from __future__ import annotations
 
 import math
@@ -27,7 +13,7 @@ import torch.nn as nn
 from gymnasium import spaces
 from pettingzoo.utils.env import ParallelEnv as PZooParallelEnv
 
-from tensordict import TensorDictBase, TensorDict
+from tensordict import TensorDictBase
 from tensordict.nn import TensorDictModule, TensorDictSequential, InteractionType, set_composite_lp_aggregate
 from torch.distributions import Categorical
 
@@ -36,12 +22,11 @@ from torchrl.data import UnboundedContinuousTensorSpec
 from torchrl.envs import ParallelEnv
 from torchrl.envs.libs.pettingzoo import PettingZooWrapper
 from torchrl.envs.transforms import Compose, InitTracker, Transform, TransformedEnv, ObservationNorm
-from torchrl.modules import ProbabilisticActor, LSTMModule
+from torchrl.modules import ProbabilisticActor
 
 from environment import build_env_base
 from logger import wandb_init
 import wandb
-
 
 # =========================================================
 # Utils
@@ -63,7 +48,6 @@ def save_ckpt(path, policy, value, optim, env_cfg, train_cfg, it, device, env):
         },
         str(path),
     )
-
 
 def squeeze_last1(td: TensorDictBase, key):
     if key in td.keys(True, True):
@@ -106,13 +90,15 @@ class EdgeIDSParallelEnv(PZooParallelEnv):
         self.alpha = float(alpha)
 
         self.obs_keys = [
-            # "local_num_req",
-            # "attack_in_rate",
+            "local_num_req",
+            "attack_in_rate",
             "cpu_to_ids_ratio",
             "ids_cpu_utilization",
-            "total_cpu_to_ids_ratio"
+            "total_cpu_to_ids_ratio",
+            "ema_mom"
         ]
-        self.obs_dim = len(self.obs_keys)
+        # Current ids_cpu allocation included
+        self.obs_dim = len(self.obs_keys) 
 
         self._obs_space = spaces.Dict(
             {
@@ -139,8 +125,8 @@ class EdgeIDSParallelEnv(PZooParallelEnv):
         self.agents = list(self.possible_agents)
         self.ids_cpu = np.asarray([e.ids_cpu for e in self.env.edge_areas], dtype=np.float32)
 
-        obs_mat = self._build_observation()  # [E, D]
-        qoe = self._qoe_vec()                # [E]
+        obs_mat = self._build_observation()
+        qoe = self._qoe_vec()
 
         observations = {
             aid: {"obs": obs_mat[i].copy(), "qoe_mean": np.array([qoe[i]], dtype=np.float32)}
@@ -152,14 +138,6 @@ class EdgeIDSParallelEnv(PZooParallelEnv):
     def step(self, actions: Dict[str, int]):
         if not self.agents:
             return {}, {}, {}, {}, {}
-
-        act_vec = np.zeros(self.n_edges, dtype=np.int64)
-        for i, aid in enumerate(self.area_ids):
-            a = int(actions[aid])
-            if a < 0 or a > 2:
-                raise ValueError(f"Invalid action {a} for agent {aid}, expected 0..2")
-            act_vec[i] = a
-            
         def _reactive_delta_vec() -> np.ndarray:
             # default: hold
             delta = np.zeros(self.n_edges, dtype=np.int64)
@@ -189,12 +167,16 @@ class EdgeIDSParallelEnv(PZooParallelEnv):
                 else:
                     delta[i] = 0
 
-            return delta            
-        # choose ONE:
-        # 1) RL action drives allocation
-        delta_cmd = (act_vec.astype(np.float32) - 1.0) * self.scale_step
+            return delta             
 
-        # 2) Reactive controller drives allocation (what you asked for)
+        act_vec = np.zeros(self.n_edges, dtype=np.int64)
+        for i, aid in enumerate(self.area_ids):
+            a = int(actions[aid])
+            if a < 0 or a > 2:
+                raise ValueError(f"Invalid action {a} for agent {aid}, expected 0..2")
+            act_vec[i] = a
+            
+        delta_cmd = (act_vec.astype(np.float32) - 1.0) * self.scale_step
         # delta_cmd = _reactive_delta_vec().astype(np.float32) * self.scale_step
         prev_ids = self.ids_cpu.copy()
 
@@ -202,6 +184,8 @@ class EdgeIDSParallelEnv(PZooParallelEnv):
         for i, edge in enumerate(self.env.edge_areas):
             max_ids = float(edge.budget.cpu) - 0.5
             new_ids[i] = float(np.clip(new_ids[i], self.ids_cpu_min, max_ids))
+            # Constant
+            # new_ids[i] = float(0.5)
         self.ids_cpu = new_ids
 
         overheads = (self.ids_cpu - prev_ids).astype(np.float32, copy=False).tolist()
@@ -261,424 +245,183 @@ class EdgeIDSParallelEnv(PZooParallelEnv):
                     obs[i, j] = float(np.mean(vals_nz)) if len(vals_nz) else 0.0
                 else:
                     obs[i, j] = float(np.mean(vals))
+
         return obs
 
     # def _build_reward_per_agent(self) -> np.ndarray:
     #     if len(self.env.history) < self.n_edges:
     #         return np.zeros(self.n_edges, dtype=np.float32)
 
-    #     last_block = self.env.history[-self.n_edges :]
-    #     q = np.asarray([float(m.qoe_mean) for m in last_block], dtype=np.float32)
-    #     penalty = self.alpha * (np.maximum(0.0, self.threshold - q) / self.threshold) ** 2
-    #     return (q - penalty).astype(np.float32, copy=False)
-    
-    # def _build_reward_per_agent(self) -> np.ndarray:
-    #     if len(self.env.history) < self.n_edges:
-    #         return np.zeros(self.n_edges, dtype=np.float32)
-
-    #     last_block = self.env.history[-self.n_edges:]
-    #     q = np.asarray([float(m.qoe_weighted) for m in last_block], dtype=np.float32)  # [E]
-
-    #     # 1) global scalar from all edges
-    #     q_global = float(q.mean())  # or sum(q) if you prefer, mean is scale-stable
-
-    #     # 2) global scalar penalty
-    #     viol = max(0.0, self.threshold - q_global) / max(self.threshold, 1e-9)
-    #     penalty_global = float(self.alpha * (viol ** 2))
-
-    #     # 3) broadcast same reward to all agents
-    #     r_global = np.float32(q_global - penalty_global)
-    #     return np.full((self.n_edges,), r_global, dtype=np.float32)
+    #     target_ids_cpu = 2.0
+    #     r = np.zeros(self.n_edges, dtype=np.float32)
+    #     for i, aid in enumerate(self.area_ids):
+    #         r[i] = -abs(float(self.ids_cpu[i]) - target_ids_cpu)
+    #     return r
     
     def _build_reward_per_agent(self) -> np.ndarray:
         if len(self.env.history) < self.n_edges:
             return np.zeros(self.n_edges, dtype=np.float32)
 
-        last_block = self.env.history[-self.n_edges:]  # one StepMetrics per edge at current env.t
+        # 1. Get local QoE for each edge (maintains area_id order)
+        last_block = self.env.history[-self.n_edges:]
+        q_local = np.asarray([float(m.qoe_mean) for m in last_block], dtype=np.float32)
+        
+        # 2. Calculate local penalty: how far is THIS specific agent below the threshold?
+        # Use np.maximum for element-wise comparison
+        viol = np.maximum(0.0, self.threshold - q_local)
+        penalty = (self.alpha * (viol ** 2)).astype(np.float32)
 
-        # target ratio for ids_cpu == 2.0
-        # assumes env.edge_areas order matches the order you append StepMetrics
-        target = np.asarray(
-            [2.0 / float(edge.budget.cpu) for edge in self.env.edge_areas],
-            dtype=np.float32,
-        )
-
-        ratio = np.asarray([float(m.cpu_to_ids_ratio) for m in last_block], dtype=np.float32)
-
-        # reward in [-inf, 0], best is 0 when ratio == target
-        r = -np.abs(ratio - target)
-
-        return r    
-    
+        local_rewards = q_local - penalty
+        # Return the average reward to all agents (Global Reward)
+        global_rew = np.mean(local_rewards)
+        return np.full(self.n_edges, global_rew, dtype=np.float32)
+        
     def _qoe_vec(self) -> np.ndarray:
-        qoe = np.asarray(getattr(self.env, "final_qoe", 0.0), dtype=np.float32)
-        if qoe.ndim == 0:
-            qoe = np.full((self.n_edges,), float(qoe), dtype=np.float32)
-        return qoe * 30.0
+        # qoe = np.asarray(getattr(self.env, "final_qoe", 0.0), dtype=np.float32)
+        # if qoe.ndim == 0:
+        #     qoe = np.full((self.n_edges,), float(qoe), dtype=np.float32)
+        # return qoe * 30.0
+        
+        if not getattr(self.env, "history", None) or len(self.env.history) == 0:
+            return np.zeros(self.n_edges, dtype=np.float32)
+
+        q_vec = np.zeros(self.n_edges, dtype=np.float32)
+
+        for i, edge in enumerate(self.env.edge_areas):
+            # all history entries for this edge over the whole episode
+            h = [m for m in self.env.history if m.area_id == edge.area_id]
+            if not h:
+                q_vec[i] = 0.0
+                continue
+
+            q = np.asarray([float(m.qoe_mean) for m in h], dtype=np.float32)
+            if q.size == 0:
+                q_vec[i] = 0.0
+                continue
+
+            slo_thr = float(getattr(edge, "slo_threshold", self.threshold))
+            slo_beta = float(getattr(edge, "slo_beta", self.alpha))
+
+            viol_rate = float((q < slo_thr).mean())
+            V_edge = float(np.exp(-slo_beta * viol_rate))
+
+            q_vec[i] = float(q.mean()) * V_edge
+
+        return q_vec
 
 
 # =========================================================
 # Transforms
 # =========================================================
 
-class BuildCentralObs(Transform):
-    """Adds root key 'observation_flat' by flattening agent obs over (E, D)."""
-
-    def __init__(self, n_edges: int, obs_dim: int, out_key: str = "observation_flat"):
-        super().__init__(in_keys=[("agents", "observation", "obs")], out_keys=[out_key])
-        self.out_key = out_key
-        self.flat_dim = int(n_edges * obs_dim)
-
-    def _call(self, td: TensorDictBase) -> TensorDictBase:
-        obs = td.get(("agents", "observation", "obs"), default=None)
-        if obs is not None:
-            td.set(self.out_key, obs.reshape(*obs.shape[:-2], self.flat_dim))
-        return td
-
-    def _reset(self, td: TensorDictBase, td_reset: TensorDictBase, **kwargs) -> TensorDictBase:
-        obs = td_reset.get(("agents", "observation", "obs"), default=None)
-        if obs is not None:
-            td_reset.set(self.out_key, obs.reshape(*obs.shape[:-2], self.flat_dim))
-        return td_reset
-
-    def transform_observation_spec(self, observation_spec):
-        agents_obs = observation_spec[("agents", "observation", "obs")]
-        bs = observation_spec.shape
-        observation_spec[self.out_key] = UnboundedContinuousTensorSpec(
-            shape=(*bs, self.flat_dim),
-            dtype=agents_obs.dtype,
-            device=agents_obs.device,
-        )
-        return observation_spec
-
-class WriteRecurrentOutToNext(Transform):
-    def __init__(self):
-        super().__init__(
-            in_keys=[
-                ("agents","recurrent_state_h_out"),
-                ("agents","recurrent_state_c_out"),
-                "recurrent_state_h_v_out",
-                "recurrent_state_c_v_out",
-            ],
-            out_keys=[],
-        )
-
-    def _call(self, td: TensorDictBase) -> TensorDictBase:
-        # env.step has already created td["next"] when transforms are applied post-step
-        nxt = td.get("next")
-        if nxt is None:
-            return td
-
-        nxt.set(("agents","recurrent_state_h"), td.get(("agents","recurrent_state_h_out")))
-        nxt.set(("agents","recurrent_state_c"), td.get(("agents","recurrent_state_c_out")))
-        nxt.set("recurrent_state_h_v", td.get("recurrent_state_h_v_out"))
-        nxt.set("recurrent_state_c_v", td.get("recurrent_state_c_v_out"))
-        return td
-
-class InitRecurrentState(Transform):
-    def __init__(self, n_edges: int, actor_hidden_dim: int, critic_hidden_dim: int):
-        super().__init__(in_keys=[], out_keys=[])
-        self.n_edges = int(n_edges)
-        self.actor_hidden_dim = int(actor_hidden_dim)
-        self.critic_hidden_dim = int(critic_hidden_dim)
-
-    def _reset(self, td, td_reset, **kwargs):
-        bs = tuple(td_reset.batch_size)
-        dev = td_reset.device
-        B = bs[0] if len(bs) else 1
-        E = self.n_edges
-        Ha = self.actor_hidden_dim
-        Hc = self.critic_hidden_dim
-
-        # actor
-        td_reset.set(("agents","recurrent_state_h"), torch.zeros((B,E,1,Ha), device=dev))
-        td_reset.set(("agents","recurrent_state_c"), torch.zeros((B,E,1,Ha), device=dev))
-        td_reset.set(("agents","recurrent_state_h_out"), torch.zeros((B,E,1,Ha), device=dev))
-        td_reset.set(("agents","recurrent_state_c_out"), torch.zeros((B,E,1,Ha), device=dev))
-
-        # critic
-        td_reset.set("recurrent_state_h_v", torch.zeros((B,1,Hc), device=dev))
-        td_reset.set("recurrent_state_c_v", torch.zeros((B,1,Hc), device=dev))
-        td_reset.set("recurrent_state_h_v_out", torch.zeros((B,1,Hc), device=dev))
-        td_reset.set("recurrent_state_c_v_out", torch.zeros((B,1,Hc), device=dev))
-        return td_reset
-
-
-class CarryActorRecurrentState(Transform):
-    def __init__(self):
-        super().__init__(
-            in_keys=[("next","agents","recurrent_state_h"), ("next","agents","recurrent_state_c")],
-            out_keys=[("agents","recurrent_state_h"), ("agents","recurrent_state_c")],
-        )
-
-    def _call(self, td):
-        td.set(("agents","recurrent_state_h"), td.get(("next","agents","recurrent_state_h")))
-        td.set(("agents","recurrent_state_c"), td.get(("next","agents","recurrent_state_c")))
-        return td
-
-class CarryCriticState(Transform):
-    def __init__(self):
-        super().__init__(
-            in_keys=[("next","recurrent_state_h_v"), ("next","recurrent_state_c_v")],
-            out_keys=["recurrent_state_h_v", "recurrent_state_c_v"],
-        )
-
-    def _call(self, td):
-        td.set("recurrent_state_h_v", td.get(("next","recurrent_state_h_v")))
-        td.set("recurrent_state_c_v", td.get(("next","recurrent_state_c_v")))
-        return td
-    
-class FlatToAgentsObs(Transform):
-    """
-    Reconstruct ("agents","observation","obs") from "observation_flat".
-
-    Assumes observation_flat is concatenated as:
-      [agent0 D dims][agent1 D dims]...[agent(E-1) D dims]
-
-    Works for:
-      step: observation_flat [B, E*D]  -> agents obs [B, E, D]
-      rollout: observation_flat [B,T,E*D] -> agents obs [B,T,E,D]
-    """
-    def __init__(self, n_edges: int, obs_dim: int,
-                 in_key: str = "observation_flat",
-                 out_key=("agents", "observation", "obs")):
+class AddAgentID(Transform):
+    def __init__(self, n_edges: int, in_key=("agents","observation","obs"), out_key=("agents","observation","obs")):
         super().__init__(in_keys=[in_key], out_keys=[out_key])
         self.n_edges = int(n_edges)
-        self.obs_dim = int(obs_dim)
         self.in_key = in_key
         self.out_key = out_key
 
-    def _flat_to_agents(self, x: torch.Tensor) -> torch.Tensor:
-        E, D = self.n_edges, self.obs_dim
-        if x.ndim == 2:
-            # [B, E*D] -> [B, E, D]
-            B = x.shape[0]
-            return x.view(B, E, D)
-        if x.ndim == 3:
-            # [B, T, E*D] -> [B, T, E, D]
-            B, T = x.shape[:2]
-            return x.view(B, T, E, D)
-        raise RuntimeError(f"{self.in_key} expected 2D or 3D, got {x.shape}")
+    def _append_id(self, obs: torch.Tensor) -> torch.Tensor:
+        E = self.n_edges
+        eye = torch.eye(E, device=obs.device, dtype=obs.dtype)
+        if obs.ndim == 3:
+            B = obs.shape[0]
+            ids = eye.unsqueeze(0).expand(B, E, E)
+            return torch.cat([obs, ids], dim=-1)
+        if obs.ndim == 4:
+            B, T = obs.shape[:2]
+            ids = eye.view(1,1,E,E).expand(B, T, E, E)
+            return torch.cat([obs, ids], dim=-1)
+        raise RuntimeError(f"obs must be 3D or 4D, got {obs.shape}")
 
-    def _call(self, td: TensorDictBase) -> TensorDictBase:
-        x = td.get(self.in_key, default=None)
-        if x is not None:
-            td.set(self.out_key, self._flat_to_agents(x))
+    def _call(self, td):
+        obs = td.get(self.in_key, None)
+        if obs is not None:
+            td.set(self.out_key, self._append_id(obs))
 
-        nxt = td.get("next", default=None)
+        nxt = td.get("next", None)
         if nxt is not None:
-            x2 = nxt.get(self.in_key, default=None)
-            if x2 is not None:
-                nxt.set(self.out_key, self._flat_to_agents(x2))
+            obs2 = nxt.get(self.in_key, None)
+            if obs2 is not None:
+                nxt.set(self.out_key, self._append_id(obs2))
         return td
 
-    def _reset(self, td: TensorDictBase, td_reset: TensorDictBase, **kwargs) -> TensorDictBase:
-        x = td_reset.get(self.in_key, default=None)
-        if x is not None:
-            td_reset.set(self.out_key, self._flat_to_agents(x))
+    def _reset(self, td, td_reset, **kwargs):
+        obs = td_reset.get(self.in_key, None)
+        if obs is not None:
+            td_reset.set(self.out_key, self._append_id(obs))
         return td_reset
 
     def transform_observation_spec(self, observation_spec):
-        # add / overwrite the per-agent obs spec to match reconstructed tensor
-        bs = observation_spec.shape  # typically [num_envs] or [B,T]
-        flat_spec = observation_spec[self.in_key]
+        spec = observation_spec[self.in_key]
+        new_shape = (*spec.shape[:-1], spec.shape[-1] + self.n_edges)
         observation_spec[self.out_key] = UnboundedContinuousTensorSpec(
-            shape=(*bs, self.n_edges, self.obs_dim),
-            dtype=flat_spec.dtype,
-            device=flat_spec.device,
+            shape=new_shape, dtype=spec.dtype, device=spec.device
         )
-        return observation_spec 
-    
+        return observation_spec
+
+
 # =========================================================
-# Networks (Feature + LSTMModule + heads)
+# Networks (Pure MLPs)
 # =========================================================
 
-class FeatureNet(nn.Module):
-    def __init__(self, in_dim: int, hidden: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden),
-            nn.Tanh(),
-            nn.Linear(hidden, hidden),
-            nn.Tanh(),
-        )
+class AgentMLPCore(nn.Module):
+    in_keys = [("agents", "observation", "obs")]
+    out_keys = [("agents", "features")]
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
-
-class AgentRecurrentCore(nn.Module):
     def __init__(self, n_edges: int, obs_dim: int, hidden_dim: int, device: str):
         super().__init__()
-        self.n_edges = int(n_edges)
-        self.obs_dim = int(obs_dim)
-        self.hidden_dim = int(hidden_dim)
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+        ).to(device)
 
-        self.feature = FeatureNet(self.obs_dim, self.hidden_dim).to(device)
-        self.lstm = LSTMModule(
-            input_size=self.hidden_dim,
-            hidden_size=self.hidden_dim,
-            in_key="features_t",
-            out_key="features_t",
-            device=device,
-        )
-        
     def forward(self, td: TensorDictBase) -> TensorDictBase:
-        x = td.get("observation_flat")   # step: [B, E*D], train: [B,T,E*D]
-        is_init = td.get("is_init")      # step: [B,1],    train: [B,T,1] usually
-
-        E = self.n_edges
-        D = self.obs_dim
-
-        step_mode = (x.ndim == 2)
-        if step_mode:
-            x = x.unsqueeze(1)          # [B,1,E*D]
-        if is_init.ndim == 2:
-            is_init = is_init.unsqueeze(1)  # [B,1,1]
-
-        B, T, FD = x.shape
-        if FD != E * D:
-            raise RuntimeError(f"observation_flat last dim {FD} != E*D {E*D}")
-
-        obs = x.view(B, T, E, D)        # ✅ normalized per-agent obs
-
-        H = self.hidden_dim
-
-        # flatten agents into batch
-        obs_be = obs.reshape(B * E, T, D)            # [B*E,T,D]
-        feats_be = self.feature(obs_be)              # [B*E,T,H]
-        is_init_be = is_init.repeat_interleave(E, dim=0)  # [B*E,T,1]
-
-        # pull recurrent states
-        h = td.get(("agents","recurrent_state_h"))
-        c = td.get(("agents","recurrent_state_c"))
-        if h.ndim == 5:   # [B,T,E,1,H]
-            h0 = h[:, 0]  # [B,E,1,H]
-            c0 = c[:, 0]
-        else:             # [B,E,1,H]
-            h0 = h
-            c0 = c
-
-        h_be = h0.reshape(B * E, 1, H).contiguous()
-        c_be = c0.reshape(B * E, 1, H).contiguous()
-
-        td_be = TensorDict(
-            {"recurrent_state_h": h_be, "recurrent_state_c": c_be},
-            batch_size=[B * E],
-            device=feats_be.device,
-        )
-
-        out = []
-        for t in range(T):
-            td_be.set("is_init", is_init_be[:, t])    # [B*E,1]
-            td_be.set("features_t", feats_be[:, t])   # [B*E,H]
-            self.lstm(td_be)
-            out.append(td_be.get("features_t"))
-
-        feats_be2 = torch.stack(out, dim=1)  # [B*E,T,H]
-        feats_btEH = feats_be2.reshape(B, E, T, H).transpose(1, 2).contiguous()  # [B,T,E,H]
-
-        if step_mode:
-            td.set(("agents","features"), feats_btEH[:, 0])  # [B,E,H]
-            td.set(("agents","recurrent_state_h_out"), td_be.get("recurrent_state_h").reshape(B, E, 1, H))
-            td.set(("agents","recurrent_state_c_out"), td_be.get("recurrent_state_c").reshape(B, E, 1, H))
-        else:
-            td.set(("agents","features"), feats_btEH)        # [B,T,E,H]
-            # for training minibatches you usually do not need *_out
-
+        obs = td.get(("agents", "observation", "obs"))
+        # PyTorch natively handles arbitrary leading dimensions (B, T, E, D)
+        td.set(("agents", "features"), self.net(obs))
         return td
-    
-class CriticRecurrentCore(nn.Module):
-    """
-    Centralized critic recurrence per environment.
 
-    Reads:
-      - "observation_flat": step [B,F], train [B,T,F]
-      - "is_init": step [B,1], train [B,T,1]
-      - "recurrent_state_h_v"/"recurrent_state_c_v": step [B,1,H] or train [B,T,1,H]
+class CentralizedCriticMLPCore(nn.Module):
+    # We now look at the global entry or a flattened version of all agent obs
+    in_keys = [("agents", "observation", "obs")] 
+    out_keys = [("agents", "vf_features")]
 
-    Writes:
-      - "vf_features": step [B,H], train [B,T,H]
-      - ("next","recurrent_state_h_v") / ("next","recurrent_state_c_v"): [B,1,H]
-    """
-    def __init__(self, flat_dim: int, hidden_dim: int, device: str):
+    def __init__(self, n_agents: int, local_obs_dim: int, hidden_dim: int, device: str):
         super().__init__()
-        self.hidden_dim = int(hidden_dim)
-        self.feature = FeatureNet(flat_dim, hidden_dim).to(device)
-        self.lstm = LSTMModule(
-            input_size=hidden_dim,
-            hidden_size=hidden_dim,
-            in_key="vf_t",
-            out_key="vf_t",
-            device=device,
-        )
+        # Input size is local_obs_dim * n_agents
+        self.net = nn.Sequential(
+            nn.Linear(local_obs_dim * n_agents, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+        ).to(device)
+        self.n_agents = n_agents
 
     def forward(self, td: TensorDictBase) -> TensorDictBase:
-        x = td.get("observation_flat")     # step [B,F], train [B,T,F]
-        is_init = td.get("is_init")        # step [B,1], train [B,T,1] usually
-
-        step_mode = (x.ndim == 2)
-        if step_mode:
-            x = x.unsqueeze(1)             # [B,1,F]
-        if is_init.ndim == 2:
-            is_init = is_init.unsqueeze(1) # [B,1,1]
-
-        B, T, F = x.shape
-        H = self.hidden_dim
-
-        vf = self.feature(x)               # [B,T,H]
-        is_init_bt = is_init               # [B,T,1]
-
-        # pull critic recurrent state from td
-        h = td.get("recurrent_state_h_v", default=None)
-        c = td.get("recurrent_state_c_v", default=None)
-
-        # # build zero state if missing (this is what fixes your crash)
-        # if h is None or c is None:
-        #     # step_mode: x is [B,1,F], else [B,T,F]
-        #     h0 = torch.zeros((B, 1, H), device=vf.device)
-        #     c0 = torch.zeros((B, 1, H), device=vf.device)
-        # else:
-        # if sequence-shaped, take t=0 as initial
-        if h.ndim == 4:
-            h0 = h[:, 0]   # [B,1,H]
-            c0 = c[:, 0]
-        else:
-            h0 = h
-            c0 = c
-
-        td_v = TensorDict(
-            {
-                "recurrent_state_h": h0.contiguous(),   # [B,1,H]
-                "recurrent_state_c": c0.contiguous(),   # [B,1,H]
-            },
-            batch_size=[B],
-            device=vf.device,
-        )
-
-        out = []
-        for t in range(T):
-            td_v.set("is_init", is_init_bt[:, t])       # [B,1]
-            td_v.set("vf_t", vf[:, t])                  # [B,H] ✅ 2D input
-            self.lstm(td_v)
-            out.append(td_v.get("vf_t"))                # [B,H]
-
-        vf2 = torch.stack(out, dim=1)                   # [B,T,H]
-
-        # write features back (this must match batch)
-        if step_mode:
-            td.set("vf_features", vf2[:, 0])      # [B,H]
-        else:
-            td.set("vf_features", vf2)            # [B,T,H]
-
-        h_next = td_v.get("recurrent_state_h")
-        c_next = td_v.get("recurrent_state_c")
-
-        if step_mode:
-            td.set("recurrent_state_h_v_out", h_next)  # [B,1,H]
-            td.set("recurrent_state_c_v_out", c_next)
-
+        # obs shape: [Batch, Time, Agents, Dim]
+        obs = td.get(("agents", "observation", "obs"))
+        
+        # Create global state by flattening the Agent dimension into the Feature dimension
+        # Result shape: [Batch, Time, Agents, Dim * Agents]
+        # We broadcast the global state to all agents so each gets a centralized value estimate
+        shape = obs.shape
+        # Flatten last two dims: [B, T, E, D] -> [B, T, E*D]
+        global_state = obs.view(*shape[:-2], -1) 
+        
+        # Expand back so each agent i has the full state as input
+        # [B, T, E*D] -> [B, T, E, E*D]
+        global_input = global_state.unsqueeze(-2).expand(*shape[:-1], global_state.shape[-1])
+        
+        td.set(("agents", "vf_features"), self.net(global_input))
         return td
+
+class SqueezeLast(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x.squeeze(-1)    
+
 
 # =========================================================
 # PPO / GAE
@@ -686,18 +429,16 @@ class CriticRecurrentCore(nn.Module):
 
 @torch.no_grad()
 def compute_gae_inplace(traj: TensorDictBase, gamma: float, lmbda: float, n_edges: int):
-    reward = traj.get(("agents", "reward"))          # [B,T,E]
+    reward = traj.get(("agents", "reward"))
     done = traj.get(("agents", "done")).to(torch.bool)
     terminated = traj.get(("agents", "terminated")).to(torch.bool)
-    values = traj.get(("agents", "state_value"))     # [B,T,E]
+    values = traj.get(("agents", "state_value"))
     next_values = traj.get("next").get(("agents", "state_value"))
 
     not_end = ~(done | terminated)
     not_end = not_end.to(values.dtype)
 
     B, T, E = reward.shape
-    if E != n_edges:
-        raise RuntimeError(f"Expected E={n_edges}, got reward last dim={E}")
 
     adv = torch.zeros_like(reward)
     last_gae = torch.zeros((B, E), device=reward.device, dtype=reward.dtype)
@@ -712,29 +453,25 @@ def compute_gae_inplace(traj: TensorDictBase, gamma: float, lmbda: float, n_edge
 
 
 def valid_sequence_minibatches(traj: TensorDictBase, seq_len: int, minibatch_size: int):
-    """
-    Sample windows that do not cross episode boundary (no done-any-agent inside the window).
-    traj batch: [B,T]
-    """
     B, T = traj.batch_size
     if T < seq_len:
         raise RuntimeError(f"T={T} < seq_len={seq_len}")
 
-    done = traj.get(("agents", "done")).to(torch.bool)           # [B,T,E]
+    done = traj.get(("agents", "done")).to(torch.bool)
     while done.ndim > 3:
         done = done.squeeze(-1)
-    done_any = done.any(dim=-1)                                  # [B,T]
+    done_any = done.any(dim=-1)
 
     max_t0 = T - seq_len
-    csum = torch.cumsum(done_any.to(torch.int32), dim=1)          # [B,T]
+    csum = torch.cumsum(done_any.to(torch.int32), dim=1)
 
     left = csum[:, : max_t0 + 1]
     right = csum[:, seq_len - 1 : seq_len - 1 + (max_t0 + 1)]
     prev_left = torch.cat([torch.zeros(B, 1, device=traj.device, dtype=csum.dtype), left[:, :-1]], dim=1)
     window_sum = right - prev_left
-    valid = window_sum == 0                                      # [B, max_t0+1]
+    valid = window_sum == 0
 
-    valid_idx = valid.nonzero(as_tuple=False)                    # [N,2] = (b, t0)
+    valid_idx = valid.nonzero(as_tuple=False)
     if valid_idx.numel() == 0:
         all_b = torch.arange(B, device=traj.device).repeat_interleave(max_t0 + 1)
         all_t0 = torch.arange(max_t0 + 1, device=traj.device).repeat(B)
@@ -748,7 +485,7 @@ def valid_sequence_minibatches(traj: TensorDictBase, seq_len: int, minibatch_siz
         b_idx = idx[:, 0]
         t0 = idx[:, 1]
         slices = [traj[b_idx, t0 + k] for k in range(seq_len)]
-        yield torch.stack(slices, dim=1).to_tensordict()          # [mb, seq, ...]
+        yield torch.stack(slices, dim=1).to_tensordict()
 
 
 # =========================================================
@@ -760,14 +497,16 @@ def make_wrapped_env(cfg_path: str, seed: int, decision_interval: int):
     group_map = {"agents": list(pz.possible_agents)}
     return PettingZooWrapper(pz, categorical_actions=True, group_map=group_map)
 
-
 def build_env_stack(env_cfg: dict, train_cfg: dict, cfg_path: str, num_envs: int):
     decision_interval = int(env_cfg["globals"]["decision_interval"])
 
+    # 1. Get specs from a dummy env
     base = make_wrapped_env(cfg_path=cfg_path, seed=int(env_cfg["run"]["seed"]), decision_interval=decision_interval)
-    obs_spec = base.observation_spec[("agents", "observation", "obs")]
+    obs_key = ("agents", "observation", "obs") # The specific key where data lives
+    obs_spec = base.observation_spec[obs_key]
     n_edges = int(obs_spec.shape[-2])
     obs_dim = int(obs_spec.shape[-1])
+    obs_dim_with_id = obs_dim + n_edges
 
     def make_one(i: int):
         def _make():
@@ -776,42 +515,37 @@ def build_env_stack(env_cfg: dict, train_cfg: dict, cfg_path: str, num_envs: int
 
     penv = ParallelEnv(num_envs, [make_one(i) for i in range(num_envs)], device="cpu")
 
-    hidden_dim = int(train_cfg["model"]["hidden_dim"])
-    actor_h = hidden_dim
-    critic_h = hidden_dim * 2
+    # 2. Define transforms with correct key mapping
+    norm_transform = ObservationNorm(
+        in_keys=[obs_key],  # Changed from "obs_keys" to the actual nested key
+        standard_normal=True,
+    )
+
     transforms: List[Transform] = [
         InitTracker(),
-        BuildCentralObs(n_edges=n_edges, obs_dim=obs_dim, out_key="observation_flat"),
-        ObservationNorm(
-            in_keys=["observation_flat"],
-            standard_normal=True,
-        ),        
-        FlatToAgentsObs(n_edges=n_edges, obs_dim=obs_dim),   
-        InitRecurrentState(n_edges=n_edges, actor_hidden_dim=actor_h, critic_hidden_dim=critic_h),
-        WriteRecurrentOutToNext(),
-        CarryActorRecurrentState(),
-        CarryCriticState(),
+        norm_transform,
+        AddAgentID(n_edges=n_edges),
     ]
 
     env = TransformedEnv(penv, Compose(*transforms))
 
+    # 3. Initialize stats
     on_cfg = train_cfg.get("observation_norm", {})
     env.transform.train()
-    env.transform[2].init_stats(
+    
+    # reduce_dim should include (0, 1, 2) to reduce over [Batch, Time, Agents]
+    # cat_dim is 0 to concatenate samples along the batch dimension during init
+    norm_transform.init_stats(
         num_iter=int(on_cfg.get("num_iter", 100)),
-        reduce_dim=tuple(on_cfg.get("reduce_dim", (0, 1))),
-        cat_dim=int(on_cfg.get("cat_dim", 0)),
+        reduce_dim=tuple(on_cfg.get("reduce_dim", (0, 1, 2))), 
+        cat_dim=0,
     )
-    env.transform.eval()
-
+    
+    env.transform.eval()    
     td0 = env.reset()
-    print("env.batch_size:", env.batch_size)
-    print("obs step shape:", td0.get(("agents","observation","obs")).shape)
-    print("actor h shape:", td0.get(("agents","recurrent_state_h")).shape)
-    print("critic h shape:", td0.get("recurrent_state_h_v").shape)
+    print("obs reset shape:", td0.get(obs_key).shape)
 
-    return env, n_edges, obs_dim
-
+    return env, n_edges, obs_dim_with_id
 
 # =========================================================
 # Train
@@ -846,8 +580,8 @@ def train(
     n_actions = int(train_cfg["model"]["n_actions"])
     hidden_dim = int(train_cfg["model"]["hidden_dim"])
 
-    # --- actor ---
-    actor_core = AgentRecurrentCore(
+    # --- Actor ---
+    actor_core = AgentMLPCore(
         n_edges=n_edges,
         obs_dim=obs_dim,
         hidden_dim=hidden_dim,
@@ -868,14 +602,24 @@ def train(
         default_interaction_type=InteractionType.RANDOM,
     )
 
-    # --- critic (CTDE) ---
-    critic_core = CriticRecurrentCore(flat_dim=n_edges * obs_dim, hidden_dim=hidden_dim * 2, device=device)
-    critic_head = TensorDictModule(
-        nn.Linear(hidden_dim * 2, n_edges).to(device),   # outputs per-agent values
-        in_keys=["vf_features"],
-        out_keys=[("agents", "state_value")],
+    # --- Critic ---
+    critic_core = CentralizedCriticMLPCore(
+        n_agents=n_edges, 
+        local_obs_dim=obs_dim, 
+        hidden_dim=hidden_dim * 2, # Global state usually requires more capacity
+        device=device
     )
+    critic_head = TensorDictModule(
+        nn.Sequential(
+            nn.Linear(hidden_dim * 2, 1).to(device),
+            SqueezeLast() # Output strictly [..., E]
+        ),
+        in_keys=[("agents","vf_features")],
+        out_keys=[("agents","state_value")],
+    )
+
     value_net = TensorDictSequential(critic_core, critic_head)
+    collector_policy = TensorDictSequential(policy, value_net)
 
     optim = torch.optim.Adam(
         list(actor_core.parameters())
@@ -886,7 +630,7 @@ def train(
         weight_decay=float(train_cfg["optim"]["weight_decay"]),
         eps=float(train_cfg["optim"]["eps"]),
     )
-
+    
     if resume_ckpt:
         state = torch.load(resume_ckpt, map_location=device)
         policy.load_state_dict(state["policy"])
@@ -902,7 +646,7 @@ def train(
 
     collector = SyncDataCollector(
         env,
-        policy=policy,
+        policy=collector_policy,
         frames_per_batch=frames_per_batch,
         total_frames=total_frames,
         device=device,
@@ -931,16 +675,18 @@ def train(
     for it, batch in enumerate(collector):
         traj = batch.clone(False)
 
-        # --- make reward/done/terminated available at root ("agents",...) ---
-        # Some wrappers already provide them at root, some only under "next".
+        # Move root keys
         for k in [("agents", "reward"), ("agents", "done"), ("agents", "terminated")]:
             nk = ("next",) + k
             if k not in traj.keys(True, True) and nk in traj.keys(True, True):
                 traj.set(k, traj.get(nk))
 
-            # always squeeze last singleton if present
+        # Force strict [B, T, E] shaping across all core tensors
+        for k in [("agents", "reward"), ("agents", "done"), ("agents", "terminated"), 
+                  ("agents", "action"), ("agents", "sample_log_prob"), ("agents", "state_value")]:
             squeeze_last1(traj, k)
-            squeeze_last1(traj.get("next"), k)
+            if "next" in traj.keys(True, True):
+                squeeze_last1(traj.get("next"), k)
 
         if ("agents","done") in traj.keys(True, True):
             traj.set(("agents", "done"), traj.get(("agents", "done")).to(torch.bool))
@@ -951,7 +697,6 @@ def train(
         if ("agents","terminated") in traj.get("next").keys(True, True):
             traj.get("next").set(("agents", "terminated"), traj.get("next").get(("agents","terminated")).to(torch.bool))
 
-        # --- values + GAE ---
         with torch.no_grad():
             value_net(traj)
             value_net(traj.get("next"))
@@ -960,9 +705,10 @@ def train(
         last_total_loss = last_policy_loss = last_critic_loss = last_entropy = None
         seq_len = int(train_cfg["loss"].get("seq_len", 32))
 
+        # --- Clean, Verified, Manual PPO Updates ---
         for _ in range(ppo_epochs):
             for sub in valid_sequence_minibatches(traj, seq_len=seq_len, minibatch_size=minibatch_size):
-                # anneal
+                
                 alpha = 1.0 - (updates_done / total_updates_est)
                 alpha = max(alpha, 0.0)
                 if bool(train_cfg["optim"].get("anneal_lr", True)):
@@ -972,22 +718,22 @@ def train(
                 clip_eps_now = base_clip_eps * alpha if bool(train_cfg["loss"].get("anneal_clip_epsilon", True)) else base_clip_eps
                 updates_done += 1
 
-                # recompute current logits/values on this sub-sequence with stored recurrent inputs
+                # 1. Forward pass
                 actor_core(sub)
                 actor_head(sub)
                 value_net(sub)
-
+                
                 act = sub.get(("agents", "action")).long()
-                if act.ndim == 4 and act.shape[-1] == 1:
-                    act = act.squeeze(-1)
-
                 old_logp = sub.get(("agents", "sample_log_prob"))
-                if old_logp.ndim == 4 and old_logp.shape[-1] == 1:
-                    old_logp = old_logp.squeeze(-1)
 
-                adv = sub.get(("agents", "advantage"))
-                adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+                # 2. Centralized Advantage Normalization
+                adv = sub.get(("agents","advantage"))
+                # Normalize across Batch, Time, AND Agents
+                m = adv.mean()
+                s = adv.std().clamp_min(1e-8)
+                adv = (adv - m) / s
 
+                # 3. Policy Loss
                 logits = sub.get(("agents", "logits"))
                 dist = Categorical(logits=logits)
                 new_logp = dist.log_prob(act)
@@ -998,15 +744,18 @@ def train(
                 surr2 = torch.clamp(ratio, 1.0 - clip_eps_now, 1.0 + clip_eps_now) * adv
                 policy_loss = -(torch.min(surr1, surr2)).mean()
 
+                # 4. Critic Loss
                 v_pred = sub.get(("agents", "state_value"))
                 v_targ = sub.get(("agents", "value_target"))
                 critic_loss = 0.5 * (v_targ - v_pred).pow(2).mean()
 
+                # 5. Backprop
                 entropy_loss = -entropy.mean()
                 total_loss = policy_loss + critic_coeff * critic_loss + entropy_coeff * entropy_loss
 
                 optim.zero_grad(set_to_none=True)
                 total_loss.backward()
+                
                 params = (
                     list(actor_core.parameters())
                     + list(actor_head.parameters())
@@ -1025,12 +774,7 @@ def train(
 
         reward_mean = float(traj.get(("agents", "reward")).mean().item())
         qoe_mean = float(traj.get(("next", "agents", "observation", "qoe_mean")).mean().item())
-        obs = traj.get(("next","agents","observation","obs"))  # [B,T,E,D]
-        print("obs shape", obs.shape)
-        print("obs nan?", torch.isnan(obs).any().item())
-        print("obs mean per feature", obs.mean(dim=(0,1,2)).cpu().numpy())  # [D]
-        print("obs std per feature", obs.std(dim=(0,1,2)).cpu().numpy())    # [D]
-        print("obs min/max", obs.min().item(), obs.max().item())
+        
         if (it + 1) % ckpt_every == 0:
             save_ckpt(ckpt_dir / f"ckpt_iter_{it+1:06d}.pt", policy, value_net, optim, env_cfg, train_cfg, it + 1, device, env)
 
@@ -1039,7 +783,17 @@ def train(
             save_ckpt(ckpt_dir / "ckpt_best.pt", policy, value_net, optim, env_cfg, train_cfg, it + 1, device, env)
 
         print(f"it={it} reward_mean={reward_mean:.4f}, qoe_mean={qoe_mean:.4f}")
+        reward_mean_per_agent = traj.get(("agents", "reward")).mean(dim=(0, 1))  # [E]
+        qoe_mean_per_agent = traj.get(("next", "agents", "observation", "qoe_mean")).mean(dim=(0, 1))  # [E,1] or [E]
 
+        if qoe_mean_per_agent.ndim > 1:
+            qoe_mean_per_agent = qoe_mean_per_agent.squeeze(-1)
+
+        for i in range(n_edges):
+            print(
+                f"it={it} agent={i} reward_mean={reward_mean_per_agent[i].item():.4f} "
+                f"qoe_mean={qoe_mean_per_agent[i].item():.4f}"
+            )
 
         wandb.log(
             {
@@ -1051,10 +805,8 @@ def train(
                 "loss/critic": float(last_critic_loss.item()) if last_critic_loss is not None else 0.0,
                 "entropy": float(last_entropy.item()) if last_entropy is not None else 0.0,
                 "train/lr": float(optim.param_groups[0]["lr"]),
-                "train/clip_eps": float(clip_eps_now),
             }
         )
-
 
 if __name__ == "__main__":
     train()

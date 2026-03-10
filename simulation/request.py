@@ -34,6 +34,7 @@ class Attacker:
     ):
         self.attacker_id = attacker_id
         self.attack_type = attack_type
+        self.episode_active = True
         self.latency_per_flow = latency_per_flow
         self.cycle_per_flow = latency_per_flow * float(cpu_cycle_per_ms) * int(cpu_cores)
         self.bw_per_flow = bw_per_flow
@@ -135,8 +136,8 @@ class Attacker:
 
         # random gap duration between repetitions (in steps)
         self.gap_steps = int(self.rng.integers(
-            low=50 * self.steps_per_sec,      # 5 sec
-            high=100 * self.steps_per_sec     # 30 sec
+            low=400 * self.steps_per_sec,
+            high=800 * self.steps_per_sec
         ))
 
         total_len = self.rep * trace_len_steps + (self.rep - 1) * self.gap_steps
