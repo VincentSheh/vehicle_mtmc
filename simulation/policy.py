@@ -15,7 +15,7 @@ from tqdm import tqdm
 
 from environment import build_env_base
 
-from tensordict import TensorDict
+from tensordict import TensorDict, TensorDictBase
 from tensordict.nn import TensorDictModule, TensorDictSequential, InteractionType
 from torchrl.modules import ProbabilisticActor
 from torch.distributions import Categorical
@@ -226,9 +226,85 @@ class AgentMLPCore(nn.Module):
         td.set(("agents", "features"), self.net(obs))
         return td
 
+class FeatureNet(nn.Module):
+    def __init__(self, in_dim: int, hidden: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.Tanh(),
+            nn.Linear(hidden, hidden),
+            nn.Tanh(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+class AgentRecurrentCore(nn.Module):
+    in_keys = [("agents", "observation", "obs"), "is_init", ("agents", "recurrent_state_h"), ("agents", "recurrent_state_c")]
+    out_keys = [("agents", "features"), ("agents", "recurrent_state_h_out"), ("agents", "recurrent_state_c_out")]
+
+    def __init__(self, n_edges: int, obs_dim: int, hidden_dim: int, device: str):
+        super().__init__()
+        self.n_edges, self.obs_dim, self.hidden_dim = n_edges, obs_dim, hidden_dim
+        self.feature = FeatureNet(obs_dim, hidden_dim).to(device)
+        self.lstm = nn.LSTMCell(hidden_dim, hidden_dim).to(device)
+        # Prevents BPTT gradients from compounding and exploding the memory gates
+        for name, param in self.lstm.named_parameters():
+            if "weight" in name:
+                nn.init.orthogonal_(param.data)
+            elif "bias" in name:
+                param.data.fill_(0.0)        
+
+    def forward(self, td: TensorDictBase) -> TensorDictBase:
+        obs = td.get(("agents", "observation", "obs"))
+        is_init = td.get("is_init", None)
+        step_mode = obs.ndim == 3
+        if step_mode: obs = obs.unsqueeze(1)
+        
+        b, t, e, d = obs.shape
+        hdim = self.hidden_dim
+
+        if is_init is None:
+            mask = torch.ones((b * e, t, 1), device=obs.device)
+        else:
+            if is_init.ndim == 1: is_init = is_init.unsqueeze(1).expand(b, t)
+            if is_init.shape[1] == 1 and t > 1: is_init = is_init.expand(b, t)
+            mask = (~is_init).float().view(b, 1, t, 1).expand(b, e, t, 1).reshape(b * e, t, 1)
+
+        obs_be = obs.transpose(1, 2).contiguous().reshape(b * e, t, d)
+        feats_be = self.feature(obs_be)
+
+        h = td.get(("agents", "recurrent_state_h"))
+        c = td.get(("agents", "recurrent_state_c"))
+        h_curr = h[:, 0].reshape(b * e, hdim).contiguous() if h.ndim == 5 else h.reshape(b * e, hdim).contiguous()
+        c_curr = c[:, 0].reshape(b * e, hdim).contiguous() if c.ndim == 5 else c.reshape(b * e, hdim).contiguous()
+
+        out_h, out_c = [], []
+        for ti in range(t):
+            m = mask[:, ti]
+            h_curr, c_curr = h_curr * m, c_curr * m
+            h_curr, c_curr = self.lstm(feats_be[:, ti], (h_curr, c_curr))
+            out_h.append(h_curr)
+            out_c.append(c_curr)
+
+        # Reconstruct exactly matching dimensions: [B, T, E, H]
+        feats = torch.stack(out_h, dim=1).view(b, e, t, hdim).transpose(1, 2).contiguous()
+        all_h = torch.stack(out_h, dim=1).view(b, e, t, hdim).transpose(1, 2).unsqueeze(-2).contiguous()
+        all_c = torch.stack(out_c, dim=1).view(b, e, t, hdim).transpose(1, 2).unsqueeze(-2).contiguous()
+
+        if step_mode:
+            td.set(("agents", "features"), feats[:, 0])
+            td.set(("agents", "recurrent_state_h_out"), all_h[:, 0])
+            td.set(("agents", "recurrent_state_c_out"), all_c[:, 0])
+        else:
+            td.set(("agents", "features"), feats)
+            td.set(("agents", "recurrent_state_h_out"), all_h)
+            td.set(("agents", "recurrent_state_c_out"), all_c)
+
+        return td
 
 # =========================================================
-# RL policy compatible with current training code
+# RL policies compatible with current training code
 # =========================================================
 
 class MultiAgentMLPPolicy:
@@ -292,18 +368,10 @@ class MultiAgentMLPPolicy:
         return
 
     def _normalize_obs(self, obs_mat: np.ndarray) -> np.ndarray:
-        """
-        Normalize BEFORE agent ID append, matching training transform order.
-        obs_mat: [E, D]
-        """
         if self.obs_loc is None or self.obs_scale is None:
             return obs_mat.astype(np.float32)
-
-        # Keep as 1D arrays of size D
         loc = self.obs_loc.detach().cpu().numpy()
         scale = self.obs_scale.detach().cpu().numpy()
-
-        # Numpy automatically broadcasts (E, D) with (D,)
         obs_n = (obs_mat - loc) / (scale + 1e-8)
         return obs_n.astype(np.float32)
 
@@ -319,17 +387,113 @@ class MultiAgentMLPPolicy:
             device=self.device,
         )
 
-        # Let ProbabilisticActor do all the work!
-        # This runs the network AND automatically samples/takes the mode
+        self.policy(td)
+        a = td.get(("agents", "action")).squeeze(0)
+        return (a.to(torch.int64) - 1).detach().cpu().numpy().astype(np.int64)
+
+
+class MultiAgentLSTMPolicy:
+    """
+    Compatible with LSTM training code:
+    - Maintains 'recurrent_state_h' and 'recurrent_state_c' across acts.
+    """
+
+    def __init__(self, ckpt_path: str, n_edges: int, obs_dim_no_id: int, device: str = "cpu", greedy: bool = True):
+        self.device = torch.device(device)
+        self.greedy = greedy
+        self.n_edges = int(n_edges)
+        self.obs_dim_no_id = int(obs_dim_no_id)
+        self.obs_dim_with_id = self.obs_dim_no_id + self.n_edges
+
+        state = torch.load(ckpt_path, map_location=self.device)
+        train_cfg = state.get("train_cfg", {})
+        model_cfg = train_cfg.get("model", {})
+
+        self.n_actions = int(model_cfg.get("n_actions", 3))
+        self.hidden_dim = int(model_cfg.get("hidden_dim", 64))
+
+        actor_core = AgentRecurrentCore(
+            n_edges=self.n_edges,
+            obs_dim=self.obs_dim_with_id,
+            hidden_dim=self.hidden_dim,
+            device=str(self.device),
+        )
+        actor_head = TensorDictModule(
+            nn.Linear(self.hidden_dim, self.n_actions).to(self.device),
+            in_keys=[("agents", "features")],
+            out_keys=[("agents", "logits")],
+        )
+
+        self.policy = ProbabilisticActor(
+            module=TensorDictSequential(actor_core, actor_head),
+            in_keys=[("agents", "logits")],
+            out_keys=[("agents", "action")],
+            distribution_class=Categorical,
+            return_log_prob=False,
+            default_interaction_type=InteractionType.MODE if greedy else InteractionType.RANDOM,
+        ).to(self.device)
+
+        self.policy.load_state_dict(state["policy"], strict=True)
+        self.policy.eval()
+
+        obsnorm_state = state.get("obsnorm", None)
+        self.obs_loc, self.obs_scale = _find_obsnorm_loc_scale_from_env_state(
+            obsnorm_state=obsnorm_state,
+            obs_dim=self.obs_dim_no_id,
+            device=self.device,
+        )
+
+        if self.obs_loc is None or self.obs_scale is None:
+            print("Warning: could not recover ObservationNorm loc/scale from checkpoint. Using raw observations.")
+            
+        self.reset_episode()
+
+    def reset_episode(self) -> None:
+        # Re-initialize hidden states: shape [B=1, E, 1, H]
+        self.h = torch.zeros((1, self.n_edges, 1, self.hidden_dim), device=self.device)
+        self.c = torch.zeros((1, self.n_edges, 1, self.hidden_dim), device=self.device)
+        self.is_first = True
+
+    def _normalize_obs(self, obs_mat: np.ndarray) -> np.ndarray:
+        if self.obs_loc is None or self.obs_scale is None:
+            return obs_mat.astype(np.float32)
+        loc = self.obs_loc.detach().cpu().numpy()
+        scale = self.obs_scale.detach().cpu().numpy()
+        obs_n = (obs_mat - loc) / (scale + 1e-8)
+        return obs_n.astype(np.float32)
+
+    @torch.no_grad()
+    def act(self, obs_mat: np.ndarray) -> np.ndarray:
+        obs_mat = self._normalize_obs(obs_mat)
+        obs_with_id = add_agent_id(obs_mat)
+
+        obs = torch.tensor(obs_with_id, device=self.device, dtype=torch.float32).unsqueeze(0)
+        
+        is_init_tensor = torch.tensor([self.is_first], device=self.device, dtype=torch.bool)
+        
+        td = TensorDict(
+            {
+                ("agents", "observation", "obs"): obs,
+                ("agents", "recurrent_state_h"): self.h,
+                ("agents", "recurrent_state_c"): self.c,
+                "is_init": is_init_tensor
+            },
+            batch_size=[1],
+            device=self.device,
+        )
+
         self.policy(td)
 
-        # Extract the automatically generated action
         a = td.get(("agents", "action")).squeeze(0)
         
-        # You can still inspect the logits since the network populated them
-        logits = td.get(("agents", "logits")).squeeze(0)   # [E, A]
+        # Keep updated states around for the next decision step
+        self.h = td.get(("agents", "recurrent_state_h_out"))
+        self.c = td.get(("agents", "recurrent_state_c_out"))
+        self.is_first = False
 
         return (a.to(torch.int64) - 1).detach().cpu().numpy().astype(np.int64)
+
+
 # =========================================================
 # Episode runner
 # =========================================================
@@ -597,47 +761,45 @@ def plot_qoe_vio_bars_per_edge(
         plt.savefig(edge_dir / "summary.png", dpi=200)
         plt.close()
 
-def plot_global_weighted_summary(
+def plot_global_summary(
     results: Dict[str, Dict[str, np.ndarray]],
     outdir: Path,
     qoe_slo_min: float = 0.2,
     beta: float = 3.0,
 ):
     """
-    Plots a system-wide summary where QoE and Violations are weighted 
-    by the number of users (local_num_req) in each area.
+    Plots a system-wide summary where QoE and Violations are simply 
+    averaged across all areas and time steps.
     """
-    methods, weighted_avg_qoe, weighted_vio_rate = [], [], []
+    methods, avg_qoe_list, vio_rate_list = [], [], []
 
     for method, series in results.items():
         qoe = series.get("qoe") 
-        users = series.get("local_num_req") 
         
-        if qoe is None or users is None or qoe.size == 0:
+        if qoe is None or qoe.size == 0:
             continue
 
+        # Flatten all edge areas and time steps into a single array
         q_flat = qoe.flatten()
-        u_flat = users.flatten()
         
-        # Filter NaNs and ensure we don't divide by zero
-        mask = np.isfinite(q_flat) & (u_flat > 0)
+        # Filter NaNs
+        mask = np.isfinite(q_flat)
         q_clean = q_flat[mask]
-        u_clean = u_flat[mask]
         
-        if u_clean.sum() == 0:
+        if q_clean.size == 0:
             continue
 
-        # Calculate weighted metrics
+        # Calculate unweighted metrics
         is_violating = (q_clean < qoe_slo_min).astype(np.float32)
-        v_rate = np.average(is_violating, weights=u_clean)
+        v_rate = float(np.mean(is_violating))
         
-        raw_avg_qoe = np.average(q_clean, weights=u_clean)
+        raw_avg_qoe = float(np.mean(q_clean))
         slo_penalty = np.exp(-beta * v_rate)
         final_qoe = raw_avg_qoe * slo_penalty
 
         methods.append(method)
-        weighted_avg_qoe.append(final_qoe)
-        weighted_vio_rate.append(v_rate)
+        avg_qoe_list.append(final_qoe)
+        vio_rate_list.append(v_rate)
 
     if not methods:
         return
@@ -647,10 +809,10 @@ def plot_global_weighted_summary(
     width = 0.6
     fig, axes = plt.subplots(1, 2, figsize=(13, 6))
 
-    # 1. Weighted QoE Plot
-    bars0 = axes[0].bar(x, weighted_avg_qoe, width, color='skyblue', edgecolor='black')
-    axes[0].set_title(f"Global Weighted QoE\n(Threshold={qoe_slo_min}, Beta={beta})", fontweight='bold')
-    axes[0].set_ylabel("Weighted QoE Score")
+    # 1. Average QoE Plot
+    bars0 = axes[0].bar(x, avg_qoe_list, width, color='skyblue', edgecolor='black')
+    axes[0].set_title(f"Global Average QoE\n(Threshold={qoe_slo_min}, Beta={beta})", fontweight='bold')
+    axes[0].set_ylabel("Average QoE Score")
     
     # Add labels to QoE bars
     for bar in bars0:
@@ -660,11 +822,14 @@ def plot_global_weighted_summary(
             f'{val:.3f}', ha='center', va='bottom', fontweight='bold'
         )
 
-    # 2. Weighted Violation Rate Plot
-    bars1 = axes[1].bar(x, weighted_vio_rate, width, color='salmon', edgecolor='black')
-    axes[1].set_title("Global Weighted Violations\n(% of User-Requests below Threshold)", fontweight='bold')
-    axes[1].set_ylabel("Weighted Violation Rate")
-    axes[1].set_ylim(0, max(max(weighted_vio_rate) * 1.2, 0.2)) # Dynamic height with headroom
+    # 2. Average Violation Rate Plot
+    bars1 = axes[1].bar(x, vio_rate_list, width, color='salmon', edgecolor='black')
+    axes[1].set_title(f"Global Average Violations\n(% of Steps below Threshold)", fontweight='bold')
+    axes[1].set_ylabel("Average Violation Rate")
+    
+    # Dynamic height with headroom, defaulting to 0.2 if empty
+    max_vio = max(vio_rate_list) if vio_rate_list else 0.0
+    axes[1].set_ylim(0, max(max_vio * 1.2, 0.2)) 
 
     # Add labels to Violation bars as percentages
     for bar in bars1:
@@ -681,7 +846,7 @@ def plot_global_weighted_summary(
         ax.grid(axis='y', linestyle=':', alpha=0.6)
 
     plt.tight_layout()
-    save_path = outdir / "global_weighted_summary.png"
+    save_path = outdir / "global_summary.png"
     plt.savefig(save_path, dpi=300)
     print(f"Global summary saved to: {save_path}")
     plt.close()
@@ -706,7 +871,7 @@ def main():
         "--rl_specs",
         type=str,
         default="",
-        help="Comma-separated specs: <name>:<mode>:<ckpt>. mode currently supports mlp",
+        help="Comma-separated specs: <name>:<mode>:<ckpt>. mode currently supports mlp, lstm",
     )
 
     args = ap.parse_args()
@@ -735,7 +900,8 @@ def main():
     edge_names = [str(e.area_id) for e in tmp_env.edge_areas]
 
     rl_candidates = [
-        ("mlp_best", "mlp", "checkpoints/atksc2_ima_lstm/ckpt_iter_000200.pt"),
+        ("mlp_best", "mlp", "checkpoints/atksc2_a01_ima_ppo_frew/ckpt_iter_000100.pt"),
+        ("lstm_best", "lstm", "checkpoints/atksc2_a01_ima_lstm_frew/ckpt_iter_000100.pt"),
     ]
 
     if args.rl_specs.strip():
@@ -748,15 +914,15 @@ def main():
             if len(parts) != 3:
                 raise ValueError(f"Bad --rl_specs entry: {item}")
             name, mode, ckpt = parts[0].strip(), parts[1].strip(), parts[2].strip()
-            if mode != "mlp":
-                raise ValueError(f"Bad mode '{mode}' for {name}, expected mlp")
+            if mode not in ("mlp", "lstm"):
+                raise ValueError(f"Bad mode '{mode}' for {name}, expected mlp or lstm")
             rl_candidates.append((name, mode, ckpt))
 
     baseline_methods = ["random", "constant_0.0", 
-                        "constant_2.0", 
-                        # "constant_3.0", "constant_4.0",
+                        # "constant_2.0", 
+                        # "constant_3.0",
                         "reactive"]
-    # baseline_methods = ["constant_0.0", "reactive"]
+    # baseline_methods = []
     rl_method_keys = [f"rl_{name}" for (name, _mode, _ckpt) in rl_candidates]
     all_methods = baseline_methods + rl_method_keys
 
@@ -806,6 +972,14 @@ def main():
                 device=args.rl_device,
                 greedy=args.rl_greedy,
             )
+        elif mode == "lstm":
+            rl_policy = MultiAgentLSTMPolicy(
+                ckpt_path=ckpt,
+                n_edges=n_edges,
+                obs_dim_no_id=obs_dim,
+                device=args.rl_device,
+                greedy=args.rl_greedy,
+            )
         else:
             raise ValueError(mode)
 
@@ -834,12 +1008,12 @@ def main():
     plot_obs_per_edge(results_all, out_all, edge_names=edge_names, obs_keys=obs_keys)
     plot_ts_per_edge(results_all, out_all, edge_names=edge_names, slo_qoe_min=args.slo_threshold)
     plot_qoe_vio_bars_per_edge(results_all, out_all, edge_names=edge_names, qoe_slo_min=args.slo_threshold)
-    plot_global_weighted_summary(
-            results_all, 
-            out_all, 
-            qoe_slo_min=args.slo_threshold, # Using the threshold from args
-            beta=args.alpha             # Using alpha as the SLO sensitivity
-        )
+    plot_global_summary(  # <-- Updated name here
+        results_all, 
+        out_all, 
+        qoe_slo_min=args.slo_threshold,
+        beta=args.alpha
+    )
 
 if __name__ == "__main__":
     main()

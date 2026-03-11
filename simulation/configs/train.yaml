@@ -19,7 +19,7 @@ logger:
   entity: asture123-national-taiwan-university
   project_name: edgeids
   # exp_name: ima_ppo
-  exp_name: atksc2_ima_lstm_ep20
+  exp_name: atksc2_a01_ima_lstm_frew_fqoe
   plots:
     enabled: true
     out_dir: logs/wandb_plots
@@ -41,7 +41,7 @@ optim:
 loss:
   gamma: 0.99              # matches GAE(gamma=0.98)
   gae_lambda: 0.95         # matches lmbda=0.95
-  ppo_epochs: 20      # matches ppo_epochs = 20
+  ppo_epochs: 10      # matches ppo_epochs = 20
   mini_batch_size: 128     # matches minibatch_size = 128
   clip_epsilon: 0.2        # matches ClipPPOLoss(clip_epsilon=0.2)
   anneal_clip_epsilon: false

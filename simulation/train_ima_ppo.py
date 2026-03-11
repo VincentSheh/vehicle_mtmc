@@ -138,71 +138,33 @@ class EdgeIDSParallelEnv(PZooParallelEnv):
     def step(self, actions: Dict[str, int]):
         if not self.agents:
             return {}, {}, {}, {}, {}
-        def _reactive_delta_vec() -> np.ndarray:
-            # default: hold
-            delta = np.zeros(self.n_edges, dtype=np.int64)
-
-            if not self.env.history:
-                return delta
-
-            # use just the most recent per-edge block (same style as before)
-            last_block = self.env.history[-self.n_edges:]
-            df = pd.DataFrame([m.__dict__ for m in last_block])
-
-            # thresholds you can tune
-            util_hi = 0.8   # IDS is overloaded -> increase IDS CPU
-            util_lo = 0.2   # IDS underutilized -> decrease IDS CPU
-
-            for i, aid in enumerate(self.area_ids):
-                g = df[df["area_id"] == aid]
-                if g.empty:
-                    continue
-
-                util = float(g["ids_cpu_utilization"].iloc[-1])
-
-                if util >= util_hi:
-                    delta[i] = +1
-                elif util <= util_lo:
-                    delta[i] = -1
-                else:
-                    delta[i] = 0
-
-            return delta             
 
         act_vec = np.zeros(self.n_edges, dtype=np.int64)
         for i, aid in enumerate(self.area_ids):
             a = int(actions[aid])
-            if a < 0 or a > 2:
-                raise ValueError(f"Invalid action {a} for agent {aid}, expected 0..2")
             act_vec[i] = a
-            
+
         delta_cmd = (act_vec.astype(np.float32) - 1.0) * self.scale_step
-        # delta_cmd = _reactive_delta_vec().astype(np.float32) * self.scale_step
         prev_ids = self.ids_cpu.copy()
 
         new_ids = self.ids_cpu + delta_cmd
         for i, edge in enumerate(self.env.edge_areas):
             max_ids = float(edge.budget.cpu) - 0.5
             new_ids[i] = float(np.clip(new_ids[i], self.ids_cpu_min, max_ids))
-            # Constant
-            # new_ids[i] = float(0.5)
         self.ids_cpu = new_ids
 
         overheads = (self.ids_cpu - prev_ids).astype(np.float32, copy=False).tolist()
-
-        total_rew = np.zeros(self.n_edges, dtype=np.float32)
         terminated_flag = False
-        steps = 0
 
+        # 1. Run the inner loop PURELY to advance the environment time
         for _ in range(self.decision_interval):
             self.env.step(self.ids_cpu, overheads)
-            total_rew += self._build_reward_per_agent()
-            steps += 1
             if self.env.t >= self.env.t_max:
                 terminated_flag = True
                 break
 
-        rew_agents = (total_rew / max(1, steps)).astype(np.float32, copy=False)
+        # 2. Calculate the reward ONCE for the entire interval block
+        rew_agents = self._build_reward_per_agent()
         rewards = {aid: float(rew_agents[i]) for i, aid in enumerate(self.area_ids)}
 
         terminations = {aid: bool(terminated_flag) for aid in self.area_ids}
@@ -258,46 +220,102 @@ class EdgeIDSParallelEnv(PZooParallelEnv):
     #         r[i] = -abs(float(self.ids_cpu[i]) - target_ids_cpu)
     #     return r
     
+    # def _build_reward_per_agent(self) -> np.ndarray:
+    #     if len(self.env.history) < self.n_edges:
+    #         return np.zeros(self.n_edges, dtype=np.float32)
+
+    #     # 1. Get local QoE for each edge (maintains area_id order)
+    #     last_block = self.env.history[-self.n_edges:]
+    #     q_local = np.asarray([float(m.qoe_mean) for m in last_block], dtype=np.float32)
+        
+    #     # 2. Calculate local penalty: how far is THIS specific agent below the threshold?
+    #     # Use np.maximum for element-wise comparison
+    #     viol = np.maximum(0.0, self.threshold - q_local)
+    #     penalty = (self.alpha * (viol ** 2)).astype(np.float32)
+
+    #     # 3. Reward = Local Performance - Local Penalty
+    #     # Result is a vector of size (n_edges,)
+    #     return q_local - penalty
+    
+    # # Quadratic Penalty
+    # def _build_reward_per_agent(self) -> np.ndarray:
+    #         if not getattr(self.env, "history", None) or len(self.env.history) < self.decision_interval * self.n_edges:
+    #             return np.zeros(self.n_edges, dtype=np.float32)
+
+    #         # Grab the whole decision interval block
+    #         block = self.env.history[-self.decision_interval * self.n_edges :]
+    #         reward_local = np.zeros(self.n_edges, dtype=np.float32)
+
+    #         for i, aid in enumerate(self.area_ids):
+    #             h = [m for m in block if m.area_id == aid]
+    #             if not h:
+    #                 continue
+                    
+    #             # 1. Get raw QoE for every micro-step in the interval
+    #             q_arr = np.asarray([float(m.qoe_mean) for m in h], dtype=np.float32)
+                
+    #             # 2. Vectorized penalty: calculate the squared penalty for EACH tick
+    #             viol = np.maximum(0.0, self.threshold - q_arr)
+    #             penalty = self.alpha * (viol ** 2)
+                
+    #             # 3. Average the penalized ticks
+    #             reward_local[i] = float((q_arr - penalty).mean())
+
+    #         return reward_local
+    
+    # SLO Penalty
     def _build_reward_per_agent(self) -> np.ndarray:
-        if len(self.env.history) < self.n_edges:
+        if not getattr(self.env, "history", None) or len(self.env.history) < self.decision_interval * self.n_edges:
             return np.zeros(self.n_edges, dtype=np.float32)
 
-        # 1. Get local QoE for each edge (maintains area_id order)
-        last_block = self.env.history[-self.n_edges:]
-        q_local = np.asarray([float(m.qoe_mean) for m in last_block], dtype=np.float32)
-        
-        # 2. Calculate local penalty: how far is THIS specific agent below the threshold?
-        # Use np.maximum for element-wise comparison
-        viol = np.maximum(0.0, self.threshold - q_local)
-        penalty = (self.alpha * (viol ** 2)).astype(np.float32)
+        # Grab the whole decision interval block
+        block = self.env.history[-self.decision_interval * self.n_edges :]
+        reward_local = np.zeros(self.n_edges, dtype=np.float32)
 
-        # 3. Reward = Local Performance - Local Penalty
-        # Result is a vector of size (n_edges,)
-        return q_local - penalty
-        
+        for i, edge in enumerate(self.env.edge_areas):
+            h = [m for m in block if m.area_id == edge.area_id]
+            if not h:
+                continue
+                
+            # 1. Get raw QoE for every micro-step in the interval
+            q_arr = np.asarray([float(m.qoe_mean) for m in h], dtype=np.float32)
+            if q_arr.size == 0:
+                continue
+            
+            # 2. Get edge-specific SLO parameters (falling back to class defaults)
+            slo_thr = float(getattr(edge, "slo_threshold", self.threshold))
+            slo_beta = float(getattr(edge, "slo_beta", self.alpha))
+            
+            # 3. Calculate violation rate over the interval
+            viol_rate = float((q_arr < slo_thr).mean())
+            
+            # 4. Apply the exponential SLO penalty to the mean QoE
+            v_edge = float(np.exp(-slo_beta * viol_rate))
+            reward_local[i] = float(q_arr.mean()) * v_edge
+
+        return reward_local    
+            
     def _qoe_vec(self) -> np.ndarray:
-        # qoe = np.asarray(getattr(self.env, "final_qoe", 0.0), dtype=np.float32)
-        # if qoe.ndim == 0:
-        #     qoe = np.full((self.n_edges,), float(qoe), dtype=np.float32)
-        # return qoe * 30.0
-        
-        if not getattr(self.env, "history", None) or len(self.env.history) == 0:
+        # Wait until we have enough history for a full decision interval block
+        if not getattr(self.env, "history", None) or len(self.env.history) < self.decision_interval * self.n_edges:
             return np.zeros(self.n_edges, dtype=np.float32)
 
         q_vec = np.zeros(self.n_edges, dtype=np.float32)
+        
+        # Isolate the records strictly from the current decision interval
+        block = self.env.history[-self.decision_interval * self.n_edges :]
 
         for i, edge in enumerate(self.env.edge_areas):
-            # all history entries for this edge over the whole episode
-            h = [m for m in self.env.history if m.area_id == edge.area_id]
+            # Filter the recent block for this specific edge
+            h = [m for m in block if m.area_id == edge.area_id]
             if not h:
-                q_vec[i] = 0.0
                 continue
 
             q = np.asarray([float(m.qoe_mean) for m in h], dtype=np.float32)
             if q.size == 0:
-                q_vec[i] = 0.0
                 continue
 
+            # Calculate penalties based ONLY on this interval's ticks
             slo_thr = float(getattr(edge, "slo_threshold", self.threshold))
             slo_beta = float(getattr(edge, "slo_beta", self.alpha))
 
@@ -307,6 +325,7 @@ class EdgeIDSParallelEnv(PZooParallelEnv):
             q_vec[i] = float(q.mean()) * V_edge
 
         return q_vec
+
 
 
 # =========================================================

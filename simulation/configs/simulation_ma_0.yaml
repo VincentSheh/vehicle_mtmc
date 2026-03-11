@@ -215,7 +215,7 @@ edge_areas:
           sigma: 0.9
 
     attackers:
-      - attacker_type: "atk_02"
+      - attacker_type: "atk_01"
 
   - area_id: "E2"
     cpu_cycle_per_ms: 3.8 #3.8GHz #3.8E6 / ms
