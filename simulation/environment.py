@@ -125,6 +125,8 @@ class Environment:
                 self.prop_delay[(s, r)] = float(self.delay_ms[si, ri])
 
         np.random.seed(seed)
+        self.rng = np.random.default_rng(seed)
+        self.active_attack = None        
 
     def _area_ids(self) -> List[int]:
         return self.area_ids
@@ -137,8 +139,33 @@ class Environment:
         self.last_history = list(self.history)
         self.history.clear()
         self.final_qoe = 0
+
+        # reset edges
         for i, edge in enumerate(self.edge_areas):
-            edge.reset(seed=seed + i*99)   
+            edge.reset(seed=seed + i * 99)
+
+        # ---- enforce: only ONE attacker active in this episode ----
+        # gather all attacker instances across all edges
+        candidates: List[Tuple[int, int]] = []
+        for ei, edge in enumerate(self.edge_areas):
+            for ai, atk in enumerate(getattr(edge, "attackers", [])):
+                candidates.append((ei, ai))
+
+        # disable all attackers by default
+        for edge in self.edge_areas:
+            for atk in getattr(edge, "attackers", []):
+                atk.episode_active = False
+
+        if candidates:
+            # pick exactly one attacker to activate
+            # if you want deterministic per seed, reseed rng here
+            rng = np.random.default_rng(seed)
+            ei, ai = candidates[int(rng.integers(0, len(candidates)))]
+
+            self.edge_areas[ei].attackers[ai].episode_active = True
+            self.active_attack = (ei, ai)
+        else:
+            self.active_attack = None
 
     def _compute_tau_loc(self, W_va: Dict[int, float], c_va: Dict[int, float]) -> Dict[int, float]:
         # local processing proxy, higher means slower, used as threshold against propagation delay
@@ -505,7 +532,7 @@ def test_environment_run(cfg_path: str, plot=False):
     env = build_env_base(cfg_path)
 
     dfs = []
-    for i in range(1):
+    for i in range(5):
         env.reset(seed=1000 + i)
 
         for _ in range(env.t_max):

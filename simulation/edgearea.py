@@ -135,7 +135,11 @@ class EdgeArea:
         mom = 0.0
 
         for atk in self.cur_attacker:
-            r = atk.load_at(t)
+            # r = atk.load_at(t)
+            if not getattr(atk, "episode_active", True):
+                continue
+            r = atk.load_at(t)            
+            
             if r is None:
                 continue
 

@@ -19,7 +19,7 @@ logger:
   entity: asture123-national-taiwan-university
   project_name: edgeids
   # exp_name: ima_ppo
-  exp_name: atksc2_a01_ima_lstm_frew_fqoe
+  exp_name: oneatk_ima_ppo
   plots:
     enabled: true
     out_dir: logs/wandb_plots
