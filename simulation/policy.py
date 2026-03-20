@@ -326,6 +326,7 @@ def run_episode(
     cpu_util_ts = []
     local_num_req_ts = []
     attack_in_rate_ts = []
+    attack_drop_rate_ts = []
     ema_mom_ts = []
     cpu_to_ids_ratio_ts = []
 
@@ -381,6 +382,7 @@ def run_episode(
         cpu_util_ts.append(cpu_util)
         local_num_req_ts.append(float(df["local_num_req"].mean()) if "local_num_req" in df.columns else 0.0)
         attack_in_rate_ts.append(float(df["attack_in_rate"].mean()) if "attack_in_rate" in df.columns else 0.0)
+        attack_drop_rate_ts.append(float(df["attack_drop_rate"].mean()) if "attack_drop_rate" in df.columns else 0.0)
         ema_mom_ts.append(float(df["ema_mom"].mean()) if "ema_mom" in df.columns else 0.0)
         ratios = ids_cpu / np.array([e.budget.cpu for e in env.edge_areas], dtype=np.float32)
         cpu_to_ids_ratio_ts.append(float(ratios.mean()))
@@ -391,19 +393,21 @@ def run_episode(
         "cpu_util": np.asarray(cpu_util_ts, dtype=np.float32),
         "local_num_req": np.asarray(local_num_req_ts, dtype=np.float32),
         "attack_in_rate": np.asarray(attack_in_rate_ts, dtype=np.float32),
+        "attack_drop_rate": np.asarray(attack_drop_rate_ts, dtype=np.float32),
         "ema_mom": np.asarray(ema_mom_ts, dtype=np.float32),
         "cpu_to_ids_ratio": np.asarray(cpu_to_ids_ratio_ts, dtype=np.float32),
     }
 
 
 def plot_ts_continuous(results: Dict[str, Dict[str, np.ndarray]], outpath: Path, slo_qoe_min: float = 0.2, beta=3):
-    fig, axes = plt.subplots(6, 1, figsize=(9, 9), sharex=True)
+    fig, axes = plt.subplots(8, 1, figsize=(9, 9), sharex=True)
 
     panels = [
         ("qoe", "QoE"),
         ("benign_col_dmg", "Benign Collateral Damage"),
         ("local_num_req", "Local #Req"),
         ("attack_in_rate", "Attack in rate"),
+        ("attack_drop_rate", "Attack drop rate"),
         ("cpu_util", "CPU Utilization"),
         ("cpu_to_ids_ratio", "CPU→IDS Ratio"),
         ("ema_mom", "EMA Momentum"),
@@ -424,8 +428,9 @@ def plot_ts_continuous(results: Dict[str, Dict[str, np.ndarray]], outpath: Path,
 
                 viol = (y_valid < 0.2).astype(np.float32)
                 viol_rate = float(viol.mean()) if len(viol) > 0 else 0.0
-                V_edge = np.exp(-beta * viol_rate)
-                label = f"{method} (avg={avg_qoe*V_edge:.3f}, vio={vio_rate:.2%})"
+                V_edge = np.exp(-beta * viol_rate)                
+                label = f"{method} (avg={avg_qoe:.3f}, vio={vio_rate:.2%})"
+                # violation indicator: 1 if QoE below threshold else 0
             else:
                 label = method
 
@@ -445,11 +450,14 @@ def plot_qoe_vio_bars(results: Dict[str, Dict[str, np.ndarray]],
                       outpath: Path,
                       qoe_slo_min: float = 0.2,
                       beta: float = 3.0):
-    methods, avg_qoe, vio_rate, avg_benign_col_dmg = [], [], [], []
+    methods, avg_qoe, vio_rate = [], [], []
+    avg_benign_col_dmg, avg_attack_drop_pct = [], []
 
     for method, series in results.items():
         qoe = series.get("qoe", None)
         benign_col_dmg = series.get("benign_col_dmg", None)
+        attack_drop_rate_ts = series.get("attack_drop_rate", None)
+        attack_in_rate_ts = series.get("attack_in_rate", None)
 
         if qoe is None:
             continue
@@ -469,14 +477,31 @@ def plot_qoe_vio_bars(results: Dict[str, Dict[str, np.ndarray]],
         if benign_col_dmg is None:
             avg_benign_col_dmg.append(np.nan)
         else:
-            b = np.asarray(benign_col_dmg, dtype=np.float32)
+            b = np.asarray(benign_col_dmg, dtype=np.float32).reshape(-1)
             b = b[np.isfinite(b)]
             avg_benign_col_dmg.append(float(np.mean(b)) if b.size > 0 else np.nan)
+
+        if attack_drop_rate_ts is None or attack_in_rate_ts is None:
+            avg_attack_drop_pct.append(np.nan)
+        else:
+            drop = np.asarray(attack_drop_rate_ts, dtype=np.float32).reshape(-1)
+            atk_in = np.asarray(attack_in_rate_ts, dtype=np.float32).reshape(-1)
+
+            m = min(len(drop), len(atk_in))
+            drop = drop[:m]
+            atk_in = atk_in[:m]
+
+            valid = np.isfinite(drop) & np.isfinite(atk_in) & (atk_in > 0)
+            if np.any(valid):
+                drop_pct = drop[valid] / atk_in[valid]
+                avg_attack_drop_pct.append(float(np.mean(drop_pct)))
+            else:
+                avg_attack_drop_pct.append(np.nan)
 
     x = np.arange(len(methods), dtype=np.int32)
     width = 0.7
 
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    fig, axes = plt.subplots(1, 4, figsize=(20, 4))
 
     bars_qoe = axes[0].bar(x, avg_qoe, width)
     axes[0].set_xticks(x)
@@ -530,10 +555,27 @@ def plot_qoe_vio_bars(results: Dict[str, Dict[str, np.ndarray]],
                 fontsize=9,
             )
 
+    bars_drop = axes[3].bar(x, avg_attack_drop_pct, width)
+    axes[3].set_xticks(x)
+    axes[3].set_xticklabels(methods, rotation=20, ha="right")
+    axes[3].set_ylabel("Attack Drop %")
+    axes[3].set_ylim(0.0, 1.0)
+    axes[3].set_title("Average Attack Drop Percentage")
+    axes[3].grid(axis="y", alpha=0.3)
+    for bar, val in zip(bars_drop, avg_attack_drop_pct):
+        if np.isfinite(val):
+            axes[3].text(
+                bar.get_x() + bar.get_width() / 2,
+                float(bar.get_height()),
+                f"{float(val):.1%}",
+                ha="center",
+                va="bottom",
+                fontsize=9,
+            )
+
     plt.tight_layout()
     plt.savefig(outpath, dpi=200)
     plt.close()
-
 
 def main():
     ap = argparse.ArgumentParser()
@@ -605,6 +647,7 @@ def main():
             "cpu_util": np.array([], dtype=np.float32),
             "local_num_req": np.array([], dtype=np.float32),
             "attack_in_rate": np.array([], dtype=np.float32),
+            "attack_drop_rate": np.array([], dtype=np.float32),
             "ema_mom": np.array([], dtype=np.float32),
             "cpu_to_ids_ratio": np.array([], dtype=np.float32),
         }
@@ -628,8 +671,8 @@ def main():
             for k, v in q.items():
                 results[m][k] = np.concatenate([results[m][k], v])
 
-    plot_ts_continuous(results, outdir / "qoe_ts.png", slo_qoe_min=0.2, beta=0)
-    plot_qoe_vio_bars(results, outdir / "summary.png", qoe_slo_min=0.2, beta=0)
+    plot_ts_continuous(results, outdir / "qoe_ts.png", slo_qoe_min=0.2, beta=3)
+    plot_qoe_vio_bars(results, outdir / "summary.png", qoe_slo_min=0.2, beta=3)
 
 
 if __name__ == "__main__":

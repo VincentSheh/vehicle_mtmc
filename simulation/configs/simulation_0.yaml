@@ -216,10 +216,10 @@ edge_areas:
           sigma: 0.9
 
     attackers:
-      - attacker_type: "atk_01"
+      # - attacker_type: "atk_01"
       # - attacker_type: "atk_02"
       # - attacker_type: "atk_03"
-      # - attacker_type: "atk_04"
+      - attacker_type: "atk_04"
       # - attacker_type: "atk_05"
 
   # - area_id: "E2"

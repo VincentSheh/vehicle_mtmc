@@ -215,7 +215,7 @@ class EdgeArea:
             atk_seed = int(self.rng.integers(0, 2**32))
             atk.reset(seed=atk_seed)     
         idx = int(self.rng.integers(0, len(self.attackers)))
-        self.cur_attacker = [self.attackers[idx]]
+        self.attackers = [self.attackers[idx]]
 
     # --------------------------
     # Load aggregation
@@ -229,7 +229,7 @@ class EdgeArea:
         ema = 0.0
         mom = 0.0
 
-        for atk in self.cur_attacker:
+        for atk in self.attackers:
          
             if not getattr(atk, "episode_active", True):
                 continue
@@ -292,37 +292,41 @@ class EdgeArea:
         """
         return max(0.0, self.slot_ms)
 
+    from typing import Dict, Tuple, List
+
+
     def select_resolution(
         self,
         passed_req_pre_uplink: int,
-        uplink_available: float,        # megabits available for users in this slot
-        uplink_attack_used: float,      # already-consumed uplink by attacks (Mb)
-        uplink_total_mb: float,         # total uplink budget for utilization calc (Mb)
+        uplink_available: float,        # Mb available for benign users in this slot
+        uplink_attack_used: float,      # Mb already consumed by attacks
+        uplink_total_mb: float,         # total uplink budget for utilization
         upload_hs=(223, 320, 416),
     ) -> Tuple[Dict[int, int], int, int, float, Dict[int, float]]:
         """
-        Throughput-first greedy with quality refinement.
+        Algorithm 1: Resolution selection under uplink budget.
 
-        Stage 1: maximize served requests using lowest resolution
-        Stage 2: upgrade some requests to higher resolutions using leftover uplink
+        Stage 1: assign as many requests as possible to the lowest-cost resolution
+        Stage 2: upgrade some served requests to higher resolutions using leftover uplink
 
-        Returns:
-        upload_plan: {h: n_req}
-        served_req_uplink: int
-        dropped_uplink: int
-        uplink_util: float
-        per_req_uplink_by_h: {h: Mb_per_req}
+        Returns
+        -------
+        upload_plan : {h: n_req}
+        served_req_uplink : int
+        dropped_uplink : int
+        uplink_util : float
+        per_req_uplink_by_h : {h: Mb_per_req}
         """
 
-        # --- uplink cost per request in MEGABITS ---
         def uplink_mbps_for_h(h: int) -> float:
+            # Consistent with previous implementation
             w = h
-            size_bits = 0.1 * (w * h * 3) * 8          # RGB bits
-            return size_bits / (1024.0 * 1024.0) # Mb
+            size_bits = 0.1 * (w * h * 3) * 8
+            return size_bits / (1024.0 * 1024.0)
 
         hs = sorted(set(int(h) for h in upload_hs))
+        per_req = {h: float(uplink_mbps_for_h(h)) for h in hs}
 
-        # trivial cases
         if passed_req_pre_uplink <= 0 or uplink_available <= 0 or not hs:
             upload_plan = {h: 0 for h in hs}
             uplink_util = min(1.0, uplink_attack_used / max(1e-9, uplink_total_mb))
@@ -331,35 +335,28 @@ class EdgeArea:
                 0,
                 int(max(0, passed_req_pre_uplink)),
                 float(uplink_util),
-                {h: uplink_mbps_for_h(h) for h in hs},
+                per_req,
             )
 
-        # per-request uplink cost
-        per_req = {h: float(uplink_mbps_for_h(h)) for h in hs}
-
-        # --------------------------------------------------
-        # Stage 1: Throughput-first (lowest resolution)
-        # --------------------------------------------------
+        # Stage 1: throughput-first at minimum-cost resolution
         h_min = min(hs, key=lambda h: per_req[h])
         c_min = per_req[h_min]
 
         max_served = int(uplink_available // max(1e-12, c_min))
-        served_req = min(passed_req_pre_uplink, max_served)
+        served_req = min(int(passed_req_pre_uplink), max_served)
 
         upload_plan: Dict[int, int] = {h: 0 for h in hs}
         upload_plan[h_min] = served_req
 
-        remaining_uplink = uplink_available - served_req * c_min
+        remaining_uplink = float(uplink_available) - served_req * c_min
 
-        # --------------------------------------------------
-        # Stage 2: Quality refinement (upgrade requests)
-        # --------------------------------------------------
+        # Stage 2: upgrade served requests using leftover uplink
         for h in sorted(hs, reverse=True):
             if h == h_min:
                 continue
 
-            delta = per_req[h] - c_min  # extra cost to upgrade
-            if delta <= 0 or remaining_uplink <= 0:
+            delta = float(per_req[h] - c_min)
+            if delta <= 1e-12 or remaining_uplink <= 1e-12:
                 continue
 
             can_upgrade = int(remaining_uplink // delta)
@@ -370,11 +367,8 @@ class EdgeArea:
                 upload_plan[h] += take
                 remaining_uplink -= take * delta
 
-        # --------------------------------------------------
-        # Final accounting
-        # --------------------------------------------------
         served_req_uplink = int(sum(upload_plan.values()))
-        dropped_uplink = int(passed_req_pre_uplink - served_req_uplink)
+        dropped_uplink = int(max(0, passed_req_pre_uplink - served_req_uplink))
 
         uplink_user_used = sum(upload_plan[h] * per_req[h] for h in hs)
         uplink_used = float(uplink_user_used + uplink_attack_used)
@@ -388,136 +382,142 @@ class EdgeArea:
             per_req,
         )
 
+
     def allocate_detectors(
         self,
         det_costs: dict,            # {det: cycles_per_req}
-        det_quality: dict | None,   # {det: score}, optional
+        det_quality: dict | None,   # {det: quality_score}
         N: int,
-        mu_cycles_per_ms: float,    # avail_cycles_aft_atk_per_ms (cycles per ms)
-        gamma: float = 0.0,         # latency penalty strength (0 = hard cutoff)
+        mu_cycles_per_ms: float,    # available cycles per ms
+        gamma: float = 0.0,         # kept for interface compatibility
     ):
         """
-        Feasible detector mixing where feasibility is defined by a latency constraint
-        computed from the current available CPU cycles.
+        Algorithm 2: Model/detector selection under CPU budget.
 
-        Latency model (per slot):
-        total_cycles = sum_det n_det * c_det
-        mean_latency_ms = total_cycles / mu_cycles_per_ms
+        Stage 1: assign as many requests as possible to the cheapest detector
+        Stage 2: upgrade some served requests to higher-cost detectors using leftover CPU budget
 
-        Constraint:
-        mean_latency_ms <= D_Max
-        Equivalent cycle budget:
-        total_cycles <= D_Max * mu_cycles_per_ms
+        Feasibility is defined by the latency-implied cycle budget:
+            total_cycles <= self.slot_ms * mu_cycles_per_ms
 
-        Returns:
-        plan: {det: n_req}
-        feasible_all: bool
-        dropped: int
-        used_cycles: float
-        mean_latency_ms: float
-        qoe: float  (average QoE over original N, dropped contribute 0)
+        Returns
+        -------
+        plan : {det: n_req}
+        feasible_all : bool
+        dropped : int
+        used_cycles : float
+        mean_latency_ms : float
+        qoe : float
         """
         import math
 
-
-        # no requests means no violation and full satisfaction
-        if N == 0:
+        if N <= 0:
             return {}, True, 0, 0.0, 0.0, 1.0
 
-        # invalid compute or latency bound means cannot serve any positive demand
-        if N < 0:
-            N = 0
         if mu_cycles_per_ms <= 1e-12 or self.slot_ms <= 0:
-            return {}, False, int(N), 0.0, float("inf"), 0.0
+            return {}, False, int(max(0, N)), 0.0, float("inf"), 0.0
 
-        # cycle budget implied by current compute and latency bound
-        C_budget = float(self.slot_ms) * float(mu_cycles_per_ms)
-
-        # sort detectors by quality (desc), if missing then by cost (desc)
         dets = list(det_costs.keys())
         if not dets:
             return {}, False, int(N), 0.0, float("inf"), 0.0
 
-        dets.sort(key=lambda d: float(det_quality[d]), reverse=True)
+        # latency-implied cycle budget
+        C_budget = float(self.slot_ms) * float(mu_cycles_per_ms)
+
+        # quality normalization
+        if det_quality is None:
+            det_quality = {d: 1.0 for d in dets}
+
         qmax = max(1e-12, max(float(det_quality[d]) for d in dets))
-        qnorm = {d: float(det_quality[d]) / qmax for d in dets}  # 0..1
+        qnorm = {d: float(det_quality[d]) / qmax for d in dets}
 
-        # cheapest detector as backstop
-        det_light = min(dets, key=lambda d: float(det_costs[d]))
-        cL = float(det_costs[det_light])
+        # cheapest detector baseline
+        det_min = min(dets, key=lambda d: float(det_costs[d]))
+        c_min = float(det_costs[det_min])
 
-        # helper QoE from plan
-        def _qoe_from_plan(plan: dict, dropped: int, used_cycles: float):
+        def _qoe_from_plan(plan: dict, total_N: int, used_cycles: float):
             served = int(sum(plan.values()))
             mean_latency = used_cycles / max(1e-9, mu_cycles_per_ms) if served > 0 else float("inf")
-
-            if mean_latency >= self.slot_ms:
-                lat_pen = 1.0
-            else:
-                lat_pen = math.exp(-gamma * (mean_latency - self.slot_ms)) if gamma > 0 else 0.0
-            lat_pen = 1.0
-            quality_sum = 0.0
-            for det, n in plan.items():
-                quality_sum += float(n) * float(qnorm.get(det, 0.0))
-
-            qoe = (quality_sum / float(N)) * float(lat_pen) if N > 0 else 0.0
+            quality_sum = sum(float(n) * float(qnorm.get(d, 0.0)) for d, n in plan.items())
+            qoe = (quality_sum / float(total_N)) if total_N > 0 else 0.0
             return float(qoe), float(mean_latency)
 
-        # if even all-light violates latency bound, serve what we can with lightest
-        if N * cL > C_budget + 1e-9:
-            served = int(C_budget // cL) if cL > 0 else 0
-            served = max(0, min(N, served))
-            plan = {det_light: served} if served > 0 else {}
-            used = served * cL
-            dropped = N - served
-            qoe, mean_lat = _qoe_from_plan(plan, dropped, used)
-            return plan, False, int(dropped), float(used), float(mean_lat), float(qoe)
+        # Stage 1: throughput-first at cheapest detector
+        max_served = int(C_budget // max(1e-12, c_min))
+        served_req = min(int(N), max_served)
 
-        # otherwise, all N can meet latency bound, now maximize quality with feasibility backstop
         plan = {d: 0 for d in dets}
-        B = float(C_budget)
-        R = int(N)
+        if served_req > 0:
+            plan[det_min] = served_req
 
-        for det in dets:
-            if det == det_light:
+        remaining_budget = float(C_budget) - served_req * c_min
+
+        # If not all requests can even be served with cheapest detector
+        if served_req < N:
+            used_cycles = served_req * c_min
+            dropped = int(N - served_req)
+            qoe, mean_lat = _qoe_from_plan(
+                {d: n for d, n in plan.items() if n > 0},
+                int(N),
+                used_cycles,
+            )
+            return (
+                {d: n for d, n in plan.items() if n > 0},
+                False,
+                dropped,
+                float(used_cycles),
+                float(mean_lat),
+                float(qoe),
+            )
+
+        # Stage 2: upgrade served requests using leftover CPU budget
+        # Use descending quality order to mirror the resolution algorithm
+        dets_upgrade = sorted(
+            dets,
+            key=lambda d: (float(det_quality[d]), float(det_costs[d])),
+            reverse=True,
+        )
+
+        for det in dets_upgrade:
+            if det == det_min:
                 continue
-            if R <= 0:
-                break
 
-            ck = float(det_costs[det])
-            if ck <= cL + 1e-12:
+            delta = float(det_costs[det]) - c_min
+            if delta <= 1e-12 or remaining_budget <= 1e-12:
                 continue
 
-            # keep enough budget to run remaining requests using the lightest detector
-            # n <= (B - R*cL) / (ck - cL)
-            numer = B - R * cL
-            denom = ck - cL
-            n_max = math.floor(numer / denom + 1e-12) if denom > 0 else 0
-            n = max(0, min(R, int(n_max)))
+            can_upgrade = int(remaining_budget // delta)
+            take = min(plan[det_min], can_upgrade)
 
-            if n > 0:
-                plan[det] += n
-                B -= n * ck
-                R -= n
+            if take > 0:
+                plan[det_min] -= take
+                plan[det] += take
+                remaining_budget -= take * delta
 
-        if R > 0:
-            plan[det_light] += R
-            B -= R * cL
-            R = 0
+        plan = {d: int(n) for d, n in plan.items() if n > 0}
+        used_cycles = sum(n * float(det_costs[d]) for d, n in plan.items())
 
-        used_cycles = C_budget - B
-        assert sum(plan.values()) == N
+        assert sum(plan.values()) == int(N)
         assert used_cycles <= C_budget + 1e-6
 
-        qoe, mean_lat = _qoe_from_plan(plan, 0, used_cycles)
+        qoe, mean_lat = _qoe_from_plan(plan, int(N), used_cycles)
         return plan, True, 0, float(used_cycles), float(mean_lat), float(qoe)
+
 
     def match_detectors_to_resolutions(
         self,
         upload_plan: Dict[int, int],
         det_plan: Dict[str, int],
     ) -> Tuple[float, Dict[Tuple[str, int], int]]:
-        det_res_map = self.pipeline.res_to_acc  # {(det,h): map}
+        """
+        Monotone matching:
+        low resolution -> low-quality detector
+        high resolution -> high-quality detector
+
+        Assumes both plans are already produced by the separate pseudocode-aligned
+        resolution and detector selection stages.
+        """
+        det_res_map = self.pipeline.res_to_acc  # {(det,h): acc}
 
         up = {int(h): int(n) for h, n in upload_plan.items() if int(n) > 0}
         dp = {str(d): int(n) for d, n in det_plan.items() if int(n) > 0}
@@ -527,18 +527,15 @@ class EdgeArea:
         sum_up = int(sum(up.values()))
         sum_dp = int(sum(dp.values()))
 
-        # If mismatch, shrink upload_plan by reducing the lowest resolution first.
-        # This is safe because it only drops some uploaded requests, it does not fabricate uploads.
+        # Trim excess uploads if compute serves fewer requests than uplink admitted
         if sum_up != sum_dp:
             if sum_up < sum_dp:
                 raise ValueError(
-                    f"Mismatch where uploads < detections: sum(upload_plan)={sum_up} < sum(det_plan)={sum_dp}. "
-                    "This means detector allocation exceeds uploaded requests. Fix upstream (served_req_uplink vs served_compute)."
+                    f"Mismatch where uploads < detections: sum(upload_plan)={sum_up} < sum(det_plan)={sum_dp}."
                 )
 
-            # sum_up > sum_dp: drop (sum_up - sum_dp) uploads from lowest resolution bins
             excess = sum_up - sum_dp
-            for h in sorted(up.keys()):  # lowest resolution first
+            for h in sorted(up.keys()):  # drop lowest resolutions first
                 if excess <= 0:
                     break
                 drop = min(up[h], excess)
@@ -547,19 +544,20 @@ class EdgeArea:
                 if up[h] == 0:
                     del up[h]
 
-            sum_up = int(sum(up.values()))
-            if sum_up != sum_dp:
-                raise RuntimeError(f"Failed to reconcile counts after trimming uploads: sum_up={sum_up}, sum_dp={sum_dp}")
+            if int(sum(up.values())) != sum_dp:
+                raise RuntimeError(
+                    f"Failed to reconcile counts after trimming uploads: sum_up={sum(up.values())}, sum_dp={sum_dp}"
+                )
 
-        # monotone matching low-res -> low-quality detector (quality proxy = detector max mAP)
+        # Detector quality proxy = best achievable accuracy across resolutions
         dets: List[str] = list(dp.keys())
         det_proxy: Dict[str, float] = {}
         for d in dets:
             vals = [float(v) for (dd, _h), v in det_res_map.items() if dd == d]
             det_proxy[d] = max(vals) if vals else 0.0
 
-        res_list = sorted(up.keys())  # low->high
-        det_list = sorted(dets, key=lambda d: (det_proxy.get(d, 0.0), d))  # low->high
+        res_list = sorted(up.keys())  # low -> high
+        det_list = sorted(dets, key=lambda d: (det_proxy.get(d, 0.0), d))  # low -> high
 
         assign: Dict[Tuple[str, int], int] = {}
         rem_res = {h: up[h] for h in res_list}
@@ -584,33 +582,24 @@ class EdgeArea:
 
         if sum(rem_res.values()) != 0 or sum(rem_det.values()) != 0:
             raise RuntimeError(
-                f"Post-match leftovers: uploads={sum(rem_res.values())}, dets={sum(rem_det.values())}. "
-                "Counts should match after trimming."
+                f"Post-match leftovers: uploads={sum(rem_res.values())}, dets={sum(rem_det.values())}."
             )
+
+        missing = [(d, int(h)) for (d, h) in assign if (d, int(h)) not in det_res_map]
+        if missing:
+            raise KeyError(f"Missing (det,h) in pipeline.res_to_acc: {missing[:10]}")
 
         total = int(sum(assign.values()))
         if total <= 0:
             return 0.0, {}
 
-
-        missing = []
-        for (d, h), n in assign.items():
-            if (d, int(h)) not in det_res_map:
-                missing.append((d, int(h)))
-
-        if missing:
-            raise KeyError(f"Missing (det,h) in pipeline.res_to_acc: {missing[:10]}")
-
-        # global normalization constant over ALL available (det,h) pairs
         qmax = max(1e-12, max(float(v) for v in det_res_map.values()))
-
-        total = sum(assign.values())
         qoe_sum = 0.0
         for (d, h), n in assign.items():
             q = float(det_res_map[(d, int(h))]) / qmax
             qoe_sum += float(n) * q
 
-        qoe = qoe_sum / float(total) if total > 0 else 0.0
+        qoe = qoe_sum / float(total)
         return float(qoe), assign
 
     def step_local(self, t: int):
@@ -668,6 +657,7 @@ class EdgeArea:
         avail_cycles_per_ms = self.cpu_cycle_per_ms * self.va_cpu
 
         avail_cycles_aft_atk_per_ms = max(0.0, avail_cycles_per_ms - attack_cycles_per_ms)
+        
         # If nothing survives uplink or no compute, return outage-ish state
         if avail_cycles_aft_atk_per_ms <= 1e-12 or uplink_available <=1e-12:
             cache = {
@@ -679,7 +669,7 @@ class EdgeArea:
                 "od_plan": {},
                 "served_req": 0,
                 "dropped_compute": int(total_req_in),
-                "va_cpu_utilization": (total_cycles_per_ms - avail_cycles_aft_atk_per_ms) / total_cycles_per_ms,
+                "va_cpu_utilization": min(1,(attack_cycles_per_ms + self.ids_cpu * self.cpu_cycle_per_ms) / avail_cycles_per_ms),
                 "uplink_util": 1,
                 "mean_latency_ms": float("inf"),
                 "qoe": 0.0,
@@ -723,8 +713,8 @@ class EdgeArea:
         )
         qoe, od_and_res_plan = self.match_detectors_to_resolutions(upload_plan, od_plan)
         
-        va_cpu_utilization = used_cycles / (avail_cycles_per_ms * self.slot_ms)
-
+        va_cpu_utilization = min(1,(used_cycles + attack_cycles_per_ms) / (avail_cycles_per_ms))
+        va_cpu_utilization = min(1,(used_cycles + attack_cycles_per_ms + self.ids_cpu * self.cpu_cycle_per_ms) / (total_cycles_per_ms))
         served_compute = int(sum(od_plan.values()))
         assert served_compute + int(dropped_compute) == int(served_req_uplink)
 

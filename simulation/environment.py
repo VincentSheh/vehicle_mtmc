@@ -650,7 +650,7 @@ class TorchRLEnvWrapper(EnvBase):
 
         # 2) Simulate decision_interval internal timesteps
         for i in range(self.decision_interval):
-            self.env.step(ids_cpu, overhead = 0)
+            self.env.step(ids_cpu, overhead)
             total_reward += float(self._build_reward())
             steps += 1
             if self.env.t >= self.env.t_max:
@@ -733,30 +733,31 @@ class TorchRLEnvWrapper(EnvBase):
         last_block = self.env.history[-self.n_edges:]
 
         qoe = np.asarray([float(m.qoe_mean) for m in last_block], dtype=np.float32)
+        benign_col_dmg = np.asarray([float(m.benign_col_dmg) for m in last_block], dtype=np.float32)
+        attack_in = np.asarray([float(m.attack_in_rate) for m in last_block], dtype=np.float32)
+        attack_drop = np.asarray([float(m.attack_drop_rate) for m in last_block], dtype=np.float32)
 
-        # choose your attack indicator
-        atk_in = np.asarray([float(m.attack_in_rate) for m in last_block], dtype=np.float32)
+        # coefficients
+        alpha = 1.0 / 0.20
+        beta = 1.0 / 0.12
+        gamma = 1.0 / 0.10
+        q_th = 0.55
 
-        atk_eps = 1e-3  # tune if needed
-        attack_present = atk_in > atk_eps  # boolean mask per edge
+        # Λ_res,e^t = total attack pass / total attack in
+        attack_pass = np.maximum(0.0, attack_in - attack_drop)
+        lambda_res = np.where(attack_in > 1e-6, attack_pass / attack_in, 0.0).astype(np.float32)
 
-        # thresholds
-        threshold_a = 0.30  # under attack
-        threshold_b = 0.55  # no attack
+        # QoE shortfall penalty
+        qoe_shortfall = np.maximum(0.0, q_th - qoe) / max(q_th, 1e-6)
+        qoe_penalty = qoe_shortfall
 
-        # pick the active threshold per edge
-        thr = np.where(attack_present, threshold_a, threshold_b).astype(np.float32)
+        reward_per_edge = (
+            - alpha * lambda_res
+            - beta * benign_col_dmg
+            - gamma * qoe_penalty
+        )
 
-        # penalty for falling below the relevant threshold
-        alpha = 0.6
-        viol = np.maximum(0.0, thr - qoe) / np.maximum(thr, 1e-6)
-        penalty = alpha * (viol ** 2)
-
-        # optional: small bonus for being above threshold to avoid "just meet threshold"
-        bonus_beta = 0.0  # start with 0, add later if needed
-        bonus = bonus_beta * np.maximum(0.0, qoe - thr)
-
-        reward = float(np.mean(qoe - penalty + bonus))
+        reward = float(np.mean(reward_per_edge))
         return torch.tensor([reward], dtype=torch.float32, device=self.device)
             
 def test_environment_run(cfg_path: str, plot=False):

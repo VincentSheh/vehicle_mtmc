@@ -43,7 +43,7 @@ class IDS:
 
     def effective_speed_pkt_per_step(self, ids_cpu: float) -> float:
         ids_cycles = self.effective_cycles_per_step(ids_cpu)
-        if self.cycles_per_packet <= 0:
+        if ids_cpu <= 0:
             return 0.0
         return ids_cycles / self.cycles_per_packet
 
@@ -57,7 +57,7 @@ class IDS:
         total_in = float(user_rate + total_attack)
 
         speed = self.effective_speed_pkt_per_step(ids_cpu)
-        coverage = float(min(1.0, speed / total_in)) if total_in > 0 else 1.0
+        coverage = float(min(1.0, speed / total_attack)) if total_attack > 0 else 1.0
 
         # attacks: expected dropped = coverage * TPR * rate
         attack_drop = 0.0

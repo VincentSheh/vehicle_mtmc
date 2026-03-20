@@ -178,6 +178,7 @@ class Attacker:
             "attacker_id": self.attacker_id,
             "attack_type": self.attack_type,
             "flows_per_sec": float(self._flows[sec_idx]) * self.scaling,
+            # "flows_per_sec": float(self._flows[sec_idx]) * self.scaling,
             # "flows_per_sec_ema": float(self._flows_ema[sec_idx]) * self.scaling,
             # "flows_per_sec_ema_mom": float(self._flows_ema_mom[sec_idx]) * self.scaling,
         }
