@@ -11,33 +11,96 @@ import numpy as np
 import pandas as pd
 import torch
 import matplotlib.pyplot as plt
-
-from environment import build_env_base  # your project
-from train import ActorNet, FeatureNet
-from tqdm import tqdm
-from torchrl.modules import LSTMModule
-from tensordict.nn import TensorDictModule, TensorDictSequential, InteractionType
-from torchrl.modules import ProbabilisticActor, ValueOperator
-from torch.distributions import Categorical
 import torch.nn as nn
-import numpy as np
+from tqdm import tqdm
+
+from environment import build_env_base
+
+# MLP training code
+from train_mlp import ActorNet as MLPActorNet
+
+# LSTM training code
+from train_lstm import FeatureNet as LSTMFeatureNet
+
 from tensordict import TensorDict
+from tensordict.nn import TensorDictModule, TensorDictSequential
+from torchrl.modules import LSTMModule
 
 
-class RLPolicy:
+# =========================================================
+# Policy wrappers
+# =========================================================
+class BaseRLPolicy:
+    def normalize_obs_flat(self, obs_flat: np.ndarray) -> np.ndarray:
+        raise NotImplementedError
+
+    def act_from_obs_flat(self, obs_flat: np.ndarray) -> np.ndarray:
+        raise NotImplementedError
+
+    def reset(self):
+        pass
+
+
+class MLPPolicy(BaseRLPolicy):
+    def __init__(self, ckpt_path: str, obs_size: int, device: str = "cpu", greedy: bool = True):
+        self.device = torch.device(device)
+        self.greedy = greedy
+
+        self.net = MLPActorNet(obs_dim=obs_size, n_actions=3).to(self.device)
+
+        state = torch.load(ckpt_path, map_location=self.device)
+        self.obsnorm = state.get("obsnorm", None)
+
+        if isinstance(state, dict) and "actor_net" in state:
+            self.net.load_state_dict(state["actor_net"])
+        elif isinstance(state, dict) and "state_dict" in state:
+            self.net.load_state_dict(state["state_dict"])
+        elif isinstance(state, dict):
+            self.net.load_state_dict(state)
+        else:
+            raise ValueError("Unsupported checkpoint format for MLP actor.")
+
+        self.net.eval()
+
+    def normalize_obs_flat(self, obs_flat: np.ndarray) -> np.ndarray:
+        if self.obsnorm is None:
+            return obs_flat
+
+        loc = self.obsnorm["loc"].detach().cpu().numpy().reshape(-1)
+        scale = self.obsnorm["scale"].detach().cpu().numpy().reshape(-1)
+        return (obs_flat - loc) / (scale + 1e-8)
+
+    @torch.no_grad()
+    def act_from_obs_flat(self, obs_flat: np.ndarray) -> np.ndarray:
+        x = torch.from_numpy(obs_flat.astype(np.float32)).to(self.device)
+        logits = self.net(x)
+        probs = torch.softmax(logits, dim=-1)
+
+        if self.greedy:
+            a = torch.argmax(probs, dim=-1)
+        else:
+            a = torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+        delta = int(a.item()) - 1
+        return np.array([delta], dtype=np.int64)
+
+
+class LSTMPolicy(BaseRLPolicy):
     def __init__(self, ckpt_path: str, obs_size: int, device: str = "cpu", greedy: bool = True):
         self.device = torch.device(device)
         self.greedy = greedy
 
         state = torch.load(ckpt_path, map_location=self.device)
         self.obsnorm = state.get("obsnorm", None)
-        # ---- rebuild training architecture ----
-        feature_dim = state["train_cfg"]["model"]["hidden_dim"]        
+
+        feature_dim = state["train_cfg"]["model"]["hidden_dim"]
         n_actions = state["train_cfg"]["model"]["n_actions"]
+
         self.h_size = feature_dim
-        self.n_layers = 1 
+        self.n_layers = 1
+
         feature_module = TensorDictModule(
-            FeatureNet(obs_size, feature_dim).to(self.device),
+            LSTMFeatureNet(obs_size, feature_dim).to(self.device),
             in_keys=["observation_flat"],
             out_keys=["features"],
         )
@@ -56,39 +119,33 @@ class RLPolicy:
             out_keys=["logits"],
         )
 
-        self.shared_core = TensorDictSequential(feature_module, self.lstm).to(self.device)
-        self.actor = TensorDictSequential(self.shared_core, actor_head).to(self.device)
+        self.actor = TensorDictSequential(feature_module, self.lstm, actor_head).to(self.device)
 
-        # match training policy wrapper only if you need log_prob etc
-        self.policy = ProbabilisticActor(
-            module=self.actor,
-            in_keys=["logits"],
-            out_keys=["action"],
-            distribution_class=Categorical,
-            return_log_prob=False,
-        ).to(self.device)
+        policy_sd = state["policy"]
 
-        # ---- load weights ----
-        self.policy.load_state_dict(state["policy"])
+        mapped_sd = {}
+        for k, v in policy_sd.items():
+            new_k = k
+            new_k = new_k.replace("module.0.module.0.module.0.", "module.0.")
+            new_k = new_k.replace("module.0.module.0.module.1.", "module.1.")
+            new_k = new_k.replace("module.0.module.1.", "module.2.")
+            mapped_sd[new_k] = v
 
+        self.actor.load_state_dict(mapped_sd, strict=False)
+        self.actor.eval()
 
-        # keep recurrent state for inference
         self._h = None
         self._c = None
-        self.policy.eval()
-        
-        # you saved env.state_dict() under "obsnorm" so it is NOT directly loc/scale
+
         self.env_state = state.get("obsnorm", None)
-        
         self.obs_loc = None
         self.obs_scale = None
         if self.env_state is not None:
-            # find loc/scale tensors inside env.state_dict()
             loc_key = next((k for k in self.env_state.keys() if k.endswith("loc")), None)
             scale_key = next((k for k in self.env_state.keys() if k.endswith("scale")), None)
             if loc_key and scale_key:
                 self.obs_loc = self.env_state[loc_key].detach().to(self.device).reshape(-1)
-                self.obs_scale = self.env_state[scale_key].detach().to(self.device).reshape(-1)        
+                self.obs_scale = self.env_state[scale_key].detach().to(self.device).reshape(-1)
 
     def normalize_obs_flat(self, obs_flat: np.ndarray) -> np.ndarray:
         if self.obs_loc is None or self.obs_scale is None:
@@ -98,7 +155,7 @@ class RLPolicy:
         return (obs_flat - loc) / (scale + 1e-8)
 
     @torch.no_grad()
-    def act_from_obs_flat(self, obs_flat: np.ndarray) -> int:
+    def act_from_obs_flat(self, obs_flat: np.ndarray) -> np.ndarray:
         td = TensorDict(
             {"observation_flat": torch.tensor(obs_flat, device=self.device).unsqueeze(0)},
             batch_size=[1],
@@ -106,18 +163,16 @@ class RLPolicy:
         )
 
         if self._h is None:
-            hs = self.h_size
-            self._h = torch.zeros(self.n_layers, 1, hs, device=self.device)
-            self._c = torch.zeros(self.n_layers, 1, hs, device=self.device)
+            self._h = torch.zeros(self.n_layers, 1, self.h_size, device=self.device)
+            self._c = torch.zeros(self.n_layers, 1, self.h_size, device=self.device)
 
         td.set("recurrent_state_h", self._h)
         td.set("recurrent_state_c", self._c)
         td.set("is_init", torch.zeros(1, 1, device=self.device, dtype=torch.bool))
 
-        td = self.actor(td)                    # writes "logits"
-        logits = td.get("logits").squeeze(0)   # [n_actions]
+        td = self.actor(td)
+        logits = td.get("logits").squeeze(0)
 
-        # update recurrent state from td (LSTMModule writes back)
         self._h = td.get("recurrent_state_h")
         self._c = td.get("recurrent_state_c")
 
@@ -126,19 +181,47 @@ class RLPolicy:
         else:
             probs = torch.softmax(logits, dim=-1)
             a = int(torch.multinomial(probs, 1).item())
-        delta = int(a) - 1
+
+        delta = a - 1
         return np.array([delta], dtype=np.int64)
 
-
-    
     def reset(self):
         self._h = None
-        self._c = None    
+        self._c = None
+
+
+class RLPolicy(BaseRLPolicy):
+    def __init__(
+        self,
+        policy_type: str,
+        ckpt_path: str,
+        obs_size: int,
+        device: str = "cpu",
+        greedy: bool = True,
+    ):
+        policy_type = policy_type.lower()
+        if policy_type == "mlp":
+            self.impl = MLPPolicy(ckpt_path, obs_size, device=device, greedy=greedy)
+        elif policy_type == "lstm":
+            self.impl = LSTMPolicy(ckpt_path, obs_size, device=device, greedy=greedy)
+        else:
+            raise ValueError(f"Unknown policy_type: {policy_type}")
+
+    @property
+    def obsnorm(self):
+        return getattr(self.impl, "obsnorm", None)
+
+    def normalize_obs_flat(self, obs_flat: np.ndarray) -> np.ndarray:
+        return self.impl.normalize_obs_flat(obs_flat)
+
+    def act_from_obs_flat(self, obs_flat: np.ndarray) -> np.ndarray:
+        return self.impl.act_from_obs_flat(obs_flat)
+
+    def reset(self):
+        self.impl.reset()
+
 
 def build_observation_from_history(env, decision_interval: int, obs_keys: List[str]) -> np.ndarray:
-    """
-    Returns obs shaped (n_edges, obs_dim)
-    """
     n_edges = len(env.edge_areas)
     obs_dim = len(obs_keys)
     obs = np.zeros((n_edges, obs_dim), dtype=np.float32)
@@ -170,9 +253,12 @@ def build_observation_from_history(env, decision_interval: int, obs_keys: List[s
 def decision_qoe_mean(env, decision_interval: int) -> float:
     n_edges = len(env.edge_areas)
     if len(env.history) < decision_interval * n_edges:
-        return 0.0
+        return 0.0, 0.0
     block = env.history[-decision_interval * n_edges :]
-    return float(np.mean([m.qoe_mean for m in block]))
+    return (
+        float(np.mean([m.qoe_mean for m in block])),
+        float(np.mean([m.benign_col_dmg for m in block])),
+    )
 
 
 def decision_cpu_util(env, decision_interval: int) -> float:
@@ -215,12 +301,10 @@ def run_episode(
     rl_policy: Optional[RLPolicy],
 ) -> Dict[str, np.ndarray]:
     env = build_env_base(cfg_path)
-
-    # your Environment.reset(seed) signature
     env.reset(seed)
 
-    # stabilize initial ratio
     for i, edge in enumerate(env.edge_areas):
+        edge.ids_cpu = 4.0
         edge.reset(seed=seed + 100 * i)
 
     rng = np.random.default_rng(seed)
@@ -234,10 +318,15 @@ def run_episode(
 
     decisions = math.ceil(t_max / decision_interval)
 
+    if method == "rl" and rl_policy is not None:
+        rl_policy.reset()
+
     qoe_ts = []
+    benign_col_dmg_ts = []
     cpu_util_ts = []
     local_num_req_ts = []
     attack_in_rate_ts = []
+    ema_mom_ts = []
     cpu_to_ids_ratio_ts = []
 
     for _k in range(decisions):
@@ -246,8 +335,7 @@ def run_episode(
 
         obs = build_observation_from_history(env, decision_interval, obs_keys)
         cpu_util = decision_cpu_util(env, decision_interval)
-        
-        # ---------- policy ----------
+
         if method.startswith("constant_"):
             constant_cpu = float(method.split("_", 1)[1])
             ids_cpu = np.clip(np.full(n_edges, constant_cpu, dtype=np.float32), ids_cpu_min, ids_cpu_max)
@@ -265,7 +353,6 @@ def run_episode(
                 delta = np.zeros(n_edges, dtype=np.int64)
 
         elif method == "rl":
-            rl_policy.reset()   # call once before decisions loop
             if rl_policy is None:
                 raise ValueError("rl_policy is None but method == 'rl'")
 
@@ -277,54 +364,49 @@ def run_episode(
 
         else:
             raise ValueError(method)
-        ids_cpu_before = ids_cpu.copy()
 
         ids_cpu = apply_delta(ids_cpu, delta, scale_step, ids_cpu_min, ids_cpu_max)
-
-        rat_before = ids_cpu_before / np.array([e.budget.cpu for e in env.edge_areas], dtype=np.float32)
-        rat_after  = ids_cpu / np.array([e.budget.cpu for e in env.edge_areas], dtype=np.float32)
 
         for _ in range(decision_interval):
             env.step(ids_cpu)
             if env.t >= env.t_max:
                 break
 
-        # ---------- metrics ----------
-        qoe = decision_qoe_mean(env, decision_interval)    
+        qoe, benign_col_dmg = decision_qoe_mean(env, decision_interval)
         block = env.history[-decision_interval * n_edges :]
         df = pd.DataFrame([m.__dict__ for m in block])
 
         qoe_ts.append(qoe)
-         
+        benign_col_dmg_ts.append(benign_col_dmg)
         cpu_util_ts.append(cpu_util)
-
         local_num_req_ts.append(float(df["local_num_req"].mean()) if "local_num_req" in df.columns else 0.0)
         attack_in_rate_ts.append(float(df["attack_in_rate"].mean()) if "attack_in_rate" in df.columns else 0.0)
+        ema_mom_ts.append(float(df["ema_mom"].mean()) if "ema_mom" in df.columns else 0.0)
         ratios = ids_cpu / np.array([e.budget.cpu for e in env.edge_areas], dtype=np.float32)
         cpu_to_ids_ratio_ts.append(float(ratios.mean()))
 
-
-
-
-    # If you want "final QoE with SLO" for this edge:
     return {
         "qoe": np.asarray(qoe_ts, dtype=np.float32),
+        "benign_col_dmg": np.asarray(benign_col_dmg_ts, dtype=np.float32),
         "cpu_util": np.asarray(cpu_util_ts, dtype=np.float32),
         "local_num_req": np.asarray(local_num_req_ts, dtype=np.float32),
         "attack_in_rate": np.asarray(attack_in_rate_ts, dtype=np.float32),
+        "ema_mom": np.asarray(ema_mom_ts, dtype=np.float32),
         "cpu_to_ids_ratio": np.asarray(cpu_to_ids_ratio_ts, dtype=np.float32),
     }
 
 
 def plot_ts_continuous(results: Dict[str, Dict[str, np.ndarray]], outpath: Path, slo_qoe_min: float = 0.2, beta=3):
-    fig, axes = plt.subplots(5, 1, figsize=(9, 9), sharex=True)
+    fig, axes = plt.subplots(6, 1, figsize=(9, 9), sharex=True)
 
     panels = [
         ("qoe", "QoE"),
+        ("benign_col_dmg", "Benign Collateral Damage"),
         ("local_num_req", "Local #Req"),
         ("attack_in_rate", "Attack in rate"),
         ("cpu_util", "CPU Utilization"),
         ("cpu_to_ids_ratio", "CPU→IDS Ratio"),
+        ("ema_mom", "EMA Momentum"),
     ]
 
     for ax, (k, ylabel) in zip(axes, panels):
@@ -339,12 +421,11 @@ def plot_ts_continuous(results: Dict[str, Dict[str, np.ndarray]], outpath: Path,
                 y_valid = y[np.isfinite(y)]
                 avg_qoe = float(np.nanmean(y_valid)) if y_valid.size else 0.0
                 vio_rate = float(np.nanmean((y_valid < float(slo_qoe_min)).astype(np.float32))) if y_valid.size else 0.0
-                
+
                 viol = (y_valid < 0.2).astype(np.float32)
                 viol_rate = float(viol.mean()) if len(viol) > 0 else 0.0
-                V_edge = np.exp(-beta * viol_rate)                
+                V_edge = np.exp(-beta * viol_rate)
                 label = f"{method} (avg={avg_qoe*V_edge:.3f}, vio={vio_rate:.2%})"
-                # violation indicator: 1 if QoE below threshold else 0
             else:
                 label = method
 
@@ -364,10 +445,12 @@ def plot_qoe_vio_bars(results: Dict[str, Dict[str, np.ndarray]],
                       outpath: Path,
                       qoe_slo_min: float = 0.2,
                       beta: float = 3.0):
-    methods, avg_qoe, vio_rate = [], [], []
+    methods, avg_qoe, vio_rate, avg_benign_col_dmg = [], [], [], []
 
     for method, series in results.items():
         qoe = series.get("qoe", None)
+        benign_col_dmg = series.get("benign_col_dmg", None)
+
         if qoe is None:
             continue
 
@@ -376,17 +459,24 @@ def plot_qoe_vio_bars(results: Dict[str, Dict[str, np.ndarray]],
         if q.size == 0:
             continue
 
-        vr = float(np.mean((q < qoe_slo_min).astype(np.float32)))  # scalar
-        v = float(np.exp(-beta * vr))                               # scalar
+        vr = float(np.mean((q < qoe_slo_min).astype(np.float32)))
+        v = float(np.exp(-beta * vr))
 
         methods.append(method)
         vio_rate.append(vr)
         avg_qoe.append(float(np.mean(q)) * v)
 
+        if benign_col_dmg is None:
+            avg_benign_col_dmg.append(np.nan)
+        else:
+            b = np.asarray(benign_col_dmg, dtype=np.float32)
+            b = b[np.isfinite(b)]
+            avg_benign_col_dmg.append(float(np.mean(b)) if b.size > 0 else np.nan)
+
     x = np.arange(len(methods), dtype=np.int32)
     width = 0.7
 
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
 
     bars_qoe = axes[0].bar(x, avg_qoe, width)
     axes[0].set_xticks(x)
@@ -396,8 +486,14 @@ def plot_qoe_vio_bars(results: Dict[str, Dict[str, np.ndarray]],
     axes[0].grid(axis="y", alpha=0.3)
     for bar in bars_qoe:
         h = float(bar.get_height())
-        axes[0].text(bar.get_x() + bar.get_width() / 2, h, f"{h:.3f}",
-                     ha="center", va="bottom", fontsize=9)
+        axes[0].text(
+            bar.get_x() + bar.get_width() / 2,
+            h,
+            f"{h:.3f}",
+            ha="center",
+            va="bottom",
+            fontsize=9,
+        )
 
     bars_vio = axes[1].bar(x, vio_rate, width)
     axes[1].set_xticks(x)
@@ -408,12 +504,36 @@ def plot_qoe_vio_bars(results: Dict[str, Dict[str, np.ndarray]],
     axes[1].grid(axis="y", alpha=0.3)
     for bar in bars_vio:
         h = float(bar.get_height())
-        axes[1].text(bar.get_x() + bar.get_width() / 2, h, f"{h:.1%}",
-                     ha="center", va="bottom", fontsize=9)
+        axes[1].text(
+            bar.get_x() + bar.get_width() / 2,
+            h,
+            f"{h:.1%}",
+            ha="center",
+            va="bottom",
+            fontsize=9,
+        )
+
+    bars_dmg = axes[2].bar(x, avg_benign_col_dmg, width)
+    axes[2].set_xticks(x)
+    axes[2].set_xticklabels(methods, rotation=20, ha="right")
+    axes[2].set_ylabel("Benign Collateral Damage")
+    axes[2].set_title("Average Benign Collateral Damage")
+    axes[2].grid(axis="y", alpha=0.3)
+    for bar, val in zip(bars_dmg, avg_benign_col_dmg):
+        if np.isfinite(val):
+            axes[2].text(
+                bar.get_x() + bar.get_width() / 2,
+                float(bar.get_height()),
+                f"{float(val):.3f}",
+                ha="center",
+                va="bottom",
+                fontsize=9,
+            )
 
     plt.tight_layout()
     plt.savefig(outpath, dpi=200)
     plt.close()
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -424,15 +544,24 @@ def main():
     ap.add_argument("--scale_step", type=float, default=0.5)
     ap.add_argument("--ids_cpu_min", type=float, default=0.5)
 
-    # ap.add_argument("--rl_ckpt", type=str, default="checkpoints/penv4*4_anneal/ckpt_iter_000600.pt")
-    # ap.add_argument("--rl_ckpt", type=str, default="checkpoints/atari_cfg/ckpt_iter_000400.pt")
-    ap.add_argument("--rl_ckpt", type=str, default="checkpoints/atk1_noSO_2048_ev4_e10_t045_noema/ckpt_iter_000750.pt")
-    # ap.add_argument("--rl_ckpt", type=str, default="checkpoints/ppo_simulation_0/ckpt_epoch20.pt")
-    # ap.add_argument("--rl_ckpt", type=str, default="checkpoints/ppo_simulation_0/ckpt_ema_000900.pt")
-    ap.add_argument("--rl_device", type=str, default="cuda")
-    ap.add_argument("--rl_greedy", action="store_true")
-
     args = ap.parse_args()
+
+    RL_POLICIES = [
+        # {
+        #     "name": "rl_mlp",
+        #     "policy_type": "mlp",
+        #     "ckpt_path": "checkpoints/atari_cfg/ckpt_iter_000250.pt",
+        #     "device": "cuda",
+        #     "greedy": True,
+        # },
+        {
+            "name": "rl_lstm",
+            "policy_type": "lstm",
+            "ckpt_path": "checkpoints/lstm_ep_20_so_obs_e8/ckpt_iter_000750.pt",
+            "device": "cuda",
+            "greedy": True,
+        },
+    ]
 
     with open(args.cfg, "r") as f:
         cfg = yaml.safe_load(f)
@@ -445,55 +574,56 @@ def main():
     obs_keys = [
         "local_num_req",
         "attack_in_rate",
-        # "ema_mom",
+        "ema_mom",
         "cpu_to_ids_ratio",
         "ids_cpu_utilization",
-        # "overhead"
+        "overhead"
     ]
     obs_dim = len(obs_keys)
 
-    # compute obs_size exactly like training: n_edges * obs_dim
     tmp_env = build_env_base(args.cfg)
     n_edges = len(tmp_env.edge_areas)
     obs_size = n_edges * obs_dim
 
-    rl_policy = None
-    if args.rl_ckpt:
-        rl_policy = RLPolicy(
-            ckpt_path=args.rl_ckpt,
+    rl_policies: Dict[str, RLPolicy] = {}
+    for spec in RL_POLICIES:
+        rl_policies[spec["name"]] = RLPolicy(
+            policy_type=spec["policy_type"],
+            ckpt_path=spec["ckpt_path"],
             obs_size=obs_size,
-            device=args.rl_device,
-            greedy=args.rl_greedy,
+            device=spec.get("device", "cpu"),
+            greedy=spec.get("greedy", True),
         )
 
-    methods = ["random", "constant_0.5","constant_1.5", "reactive"]
-    if rl_policy is not None:
-        methods = methods + ["rl"]
-    methods = ["constant_0.5","constant_1.5", "constant_4.0"]
+    methods = ["random", "constant_0.5", "constant_1.5", "reactive"] + list(rl_policies.keys())
 
     results: Dict[str, Dict[str, np.ndarray]] = {m: {} for m in methods}
     for m in methods:
         results[m] = {
             "qoe": np.array([], dtype=np.float32),
+            "benign_col_dmg": np.array([], dtype=np.float32),
             "cpu_util": np.array([], dtype=np.float32),
             "local_num_req": np.array([], dtype=np.float32),
             "attack_in_rate": np.array([], dtype=np.float32),
+            "ema_mom": np.array([], dtype=np.float32),
             "cpu_to_ids_ratio": np.array([], dtype=np.float32),
         }
 
     for ep in tqdm(range(args.episodes)):
         ep_seed = base_seed + ep * 1000
         for m in methods:
+            this_policy = rl_policies.get(m, None)
+
             q = run_episode(
                 cfg=cfg,
                 cfg_path=args.cfg,
-                method=m,
+                method="rl" if this_policy is not None else m,
                 decision_interval=args.decision_interval,
                 obs_keys=obs_keys,
                 scale_step=args.scale_step,
                 ids_cpu_min=args.ids_cpu_min,
                 seed=ep_seed,
-                rl_policy=rl_policy if m == "rl" else None,
+                rl_policy=this_policy,
             )
             for k, v in q.items():
                 results[m][k] = np.concatenate([results[m][k], v])

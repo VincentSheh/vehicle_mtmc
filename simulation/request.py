@@ -34,6 +34,7 @@ class Attacker:
     ):
         self.attacker_id = attacker_id
         self.attack_type = attack_type
+        self.episode_active = True
         self.latency_per_flow = latency_per_flow
         self.cycle_per_flow = latency_per_flow * float(cpu_cycle_per_ms) * int(cpu_cores)
         self.bw_per_flow = bw_per_flow
@@ -110,13 +111,13 @@ class Attacker:
             ema = self.df[ema_col].astype(float).ewm(alpha=alpha, adjust=False).mean()
 
         self.df["flows_per_sec_ema"] = ema
-        self.df["flows_per_sec_ema_mom"] = self.df[f"flows_per_sec_ema"].diff().fillna(0.0)
+        # self.df["flows_per_sec_ema_mom"] = self.df[f"flows_per_sec_ema"].diff().fillna(0.0)
         # self.df["flows_per_sec_ema_mom"] = self.df[f"flows_per_sec_ema"].diff(hl).fillna(0.0) / (hl)          
-        mom_raw = self.df["flows_per_sec_ema"].diff().fillna(0.0)
-        self.df["flows_per_sec_ema_mom"] = mom_raw.ewm(alpha=alpha, adjust=False).mean()        
+        # mom_raw = self.df["flows_per_sec_ema"].diff().fillna(0.0)
+        # self.df["flows_per_sec_ema_mom"] = mom_raw.ewm(alpha=alpha, adjust=False).mean()        
         self._flows = self.df["flows_per_sec"].to_numpy(dtype=np.float32)
         self._flows_ema = self.df["flows_per_sec_ema"].to_numpy(dtype=np.float32)
-        self._flows_ema_mom = self.df["flows_per_sec_ema_mom"].to_numpy(dtype=np.float32)
+        # self._flows_ema_mom = self.df["flows_per_sec_ema_mom"].to_numpy(dtype=np.float32)
 
                 
         self.base_seed = seed
@@ -131,12 +132,12 @@ class Attacker:
             self.rep = max(1, int(self.rng.poisson(lam=self.mean_rep)))
 
         # random scaling per episode
-        self.scaling = float(self.rng.uniform(0.2, 2.0))
+        self.scaling = float(self.rng.uniform(0.8, 2.0))
 
         # random gap duration between repetitions (in steps)
         self.gap_steps = int(self.rng.integers(
-            low=400 * self.steps_per_sec,      # 5 sec
-            high=800 * self.steps_per_sec     # 30 sec
+            low=400 * self.steps_per_sec,
+            high=800 * self.steps_per_sec
         ))
 
         total_len = self.rep * trace_len_steps + (self.rep - 1) * self.gap_steps
@@ -177,10 +178,9 @@ class Attacker:
             "attacker_id": self.attacker_id,
             "attack_type": self.attack_type,
             "flows_per_sec": float(self._flows[sec_idx]) * self.scaling,
-            "flows_per_sec_ema": float(self._flows_ema[sec_idx]) * self.scaling,
-            "flows_per_sec_ema_mom": float(self._flows_ema_mom[sec_idx]) * self.scaling,
+            # "flows_per_sec_ema": float(self._flows_ema[sec_idx]) * self.scaling,
+            # "flows_per_sec_ema_mom": float(self._flows_ema_mom[sec_idx]) * self.scaling,
         }
-
 
 class User:
     """

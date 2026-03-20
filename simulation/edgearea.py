@@ -170,6 +170,24 @@ class EdgeArea:
         self.va_cpu = self.budget.cpu - self.ids_cpu
 
         self._last_action: Optional[Tuple[str, int]] = None
+        
+        # --- running attack EMA/momentum computed from *actual received* workload ---
+        self._atk_ema_inited = False
+        self._atk_ema = 0.0
+        self._atk_mom_ema = 0.0  # smoothed momentum
+
+        # half-life in seconds for smoothing (same spirit as your Attacker hl=50.0)
+        hl_sec = 50.0
+        hl_steps = max(1.0, hl_sec / (self.slot_ms / 1000.0))
+        self._atk_alpha = 1.0 - math.exp(math.log(0.5) / hl_steps)
+
+        # momentum smoothing can be same or a bit faster, here same
+        self._atk_mom_alpha = self._atk_alpha  
+        
+    def reset_running_attack_stats(self):
+        self._atk_ema_inited = False
+        self._atk_ema = 0.0
+        self._atk_mom_ema = 0.0                    
 
     def reset(self, seed: int | None = None):
         """
@@ -212,7 +230,11 @@ class EdgeArea:
         mom = 0.0
 
         for atk in self.cur_attacker:
-            r = atk.load_at(t)
+         
+            if not getattr(atk, "episode_active", True):
+                continue
+            r = atk.load_at(t)            
+            
             if r is None:
                 continue
 
@@ -613,8 +635,27 @@ class EdgeArea:
         attack_uplink_in = attack_dict["bw_in"] * atk_pass_frac
         attack_cycles_per_ms = (attack_dict["cycles_per_s"] * atk_pass_frac) / 1000.0
 
-        attack_ema = attack_dict["ema"]
-        attack_mom = attack_dict["mom"]
+        # -------------------------------------------------
+        # Attack EMA / momentum based on admitted attack load
+        # -------------------------------------------------
+        atk_signal = float(atk_in)
+
+        if not getattr(self, "_atk_ema_inited", False):
+            self._atk_ema_inited = True
+            self._atk_ema = atk_signal
+            self._atk_mom_ema = 0.0
+        else:
+            prev_ema = float(self._atk_ema)
+            a = float(self._atk_alpha)
+
+            self._atk_ema = a * atk_signal + (1.0 - a) * prev_ema
+
+            mom_raw = float(self._atk_ema) - prev_ema
+            ma = float(self._atk_mom_alpha)
+            self._atk_mom_ema = ma * mom_raw + (1.0 - ma) * float(self._atk_mom_ema)
+
+        attack_ema = float(self._atk_ema)
+        attack_mom = float(self._atk_mom_ema)
 
         uplink_total_mb = self.budget.uplink / (1000.0 / self.slot_ms)
 

@@ -17,6 +17,7 @@ from torchrl.data import (
 from pathlib import Path
 import yaml
 import os
+import copy
 import numpy as np
 import pandas as pd
 from matplotlib import pyplot as plt
@@ -45,6 +46,8 @@ class StepMetrics:
 
     # QoE
     qoe_mean: float
+    qoe_mean_ideal: float
+    benign_col_dmg: float
 
     # Requests (OD-only pipeline)
     local_num_req: int                  # served (after IDS + uplink + compute)
@@ -199,100 +202,131 @@ class Environment:
         I_net = I_in - I_out  # shape: (n,)
         return states, decisions, I_net
     
+    def _snapshot_edges(self):
+        return copy.deepcopy(self.edge_areas)
+
+    def _restore_edges(self, snapshot):
+        self.edge_areas = snapshot    
+    
+    
     def step(self, ids_cpus, overhead=0):
-        offload_states = []
+        snapshot = self._snapshot_edges()
+
+        # 1. ideal from pre-step state
+        ideal_ids_cpus = [0.0] * len(self.edge_areas)
+        ideal_cache = self._run_step_once(
+            ids_cpus=ideal_ids_cpus,
+            overhead=0.0,
+            disable_attack=True,
+        )
+
+        # 2. restore pre-step state
+        self._restore_edges(snapshot)
+
+        # 3. actual from the same pre-step state
+        real_cache = self._run_step_once(
+            ids_cpus=ids_cpus,
+            overhead=overhead,
+            disable_attack=False,
+        )    
+        for edge in self.edge_areas:
+            cache = real_cache[edge.area_id]
+            cache_ideal = ideal_cache[edge.area_id]
+            ids_out = cache["ids_out"]
+
+            self.history.append(
+                StepMetrics(
+                    t=self.t,
+                    area_id=edge.area_id,
+                    qoe_mean=float(cache["qoe"]),
+                    qoe_mean_ideal=float(cache_ideal["qoe"]),
+                    benign_col_dmg=float(cache_ideal["qoe"] - cache["qoe"]),
+
+                    ids_coverage=float(ids_out.get("coverage", 0.0)),
+                    attack_in_rate=float(ids_out.get("attack_in_rate", 0.0)),
+                    user_drop_rate=float(ids_out.get("user_drop_rate", 0.0)),
+                    attack_drop_rate=float(ids_out.get("attack_drop_rate", 0.0)),
+                    od_plan=cache["od_plan"],
+
+                    local_num_req=int(cache["local_num_request"]),
+                    ema=float(cache["ema"]),
+                    ema_mom=float(cache["ema_mom"]),
+                    cpu_to_ids_ratio=edge.ids_cpu / edge.budget.cpu,
+                    va_cpu_utilization=float(cache["va_cpu_utilization"]),
+                    ids_cpu_utilization=float(ids_out["ids_cpu_util"]),
+                    bw_utilization=float(cache["uplink_util"]),
+
+                    overhead=float(overhead),
+                )
+            )
+
+        self.t += 1
+
+        if self.t >= self.t_max:
+            qoe_slo = []
+            for edge in self.edge_areas:
+                h = [m for m in self.history if m.area_id == edge.area_id]
+                if len(h) == 0:
+                    continue
+
+                last_block = h[-self.t_max:]
+                qoes = np.asarray([float(m.qoe_mean) for m in last_block], dtype=np.float32)
+
+                viol = (qoes < edge.slo_threshold).astype(np.float32)
+                viol_rate = float(viol.mean()) if len(viol) > 0 else 0.0
+                V_edge = np.exp(-edge.slo_beta * viol_rate)
+
+                qoe_slo.append(float(qoes.mean()) * V_edge)
+
+            self.final_qoe = np.mean(qoe_slo) if len(qoe_slo) > 0 else 0.0        
+        
+        
+    def _run_step_once(self, ids_cpus, overhead=0.0, disable_attack=False):
         local_cache = {}
+
         if isinstance(ids_cpus, torch.Tensor):
-            ids_cpus = ids_cpus.detach().cpu().tolist() 
+            ids_cpus = ids_cpus.detach().cpu().tolist()
+
         for i, edge in enumerate(self.edge_areas):
             val = float(ids_cpus[i])
 
             overhead_ids = float(overhead) if overhead > 0.0 else 0.0
-            overhead_va  = float(-overhead) if overhead < 0.0 else 0.0  # abs(overhead) but faster
+            overhead_va  = float(-overhead) if overhead < 0.0 else 0.0
 
             ids_cpu_eff = val - overhead_ids
             va_cpu_eff  = edge.budget.cpu - val - overhead_va
 
-            # clamp to keep invariants, leave at least 0.5 for each side
-            ids_cpu_eff = float(np.clip(ids_cpu_eff, 0.5, edge.budget.cpu - 0.5))
-            va_cpu_eff  = float(np.clip(va_cpu_eff,  0.5, edge.budget.cpu - 0.5))
+            ids_cpu_eff = float(np.clip(ids_cpu_eff, 0.0, edge.budget.cpu))
+            va_cpu_eff  = float(np.clip(va_cpu_eff,  0.0, edge.budget.cpu))
 
-            # enforce total budget too (in case both got clamped up)
             total = ids_cpu_eff + va_cpu_eff
             if total > edge.budget.cpu:
-                # reduce the side that was "penalized" less, simplest is shrink VA
                 excess = total - edge.budget.cpu
                 va_cpu_eff = max(0.5, va_cpu_eff - excess)
 
             edge.ids_cpu = ids_cpu_eff
             edge.va_cpu  = va_cpu_eff
 
+            if disable_attack:
+                for atk in getattr(edge, "attackers", []):
+                    atk_active_prev = getattr(atk, "episode_active", True)
+                    atk._tmp_prev_episode_active = atk_active_prev
+                    atk.episode_active = False
+
             cache = edge.step_local(self.t)
             local_cache[edge.area_id] = cache
 
-            # keep asserts if you want, they should never trigger now
-            assert edge.ids_cpu >= 0.5
-            assert edge.va_cpu >= 0.5
+            if disable_attack:
+                for atk in getattr(edge, "attackers", []):
+                    if hasattr(atk, "_tmp_prev_episode_active"):
+                        atk.episode_active = atk._tmp_prev_episode_active
+                        del atk._tmp_prev_episode_active
+
+            assert edge.ids_cpu >= 0.0
+            assert edge.va_cpu >= 0.0
             assert edge.ids_cpu + edge.va_cpu <= edge.budget.cpu + 1e-6
 
-        # 3) Final QoE computation per edge
-        for edge in self.edge_areas:
-            cache = local_cache[edge.area_id]
-            
-            D_Max = edge.constraints["D_Max"]
- 
-            ids_out = cache["ids_out"]
-            # I_net_e = I_net[state.idx]
-            self.history.append(
-                StepMetrics(
-                    t=self.t,
-                    area_id=edge.area_id,
-                    qoe_mean=float(cache["qoe"]),
-                    
-                    ids_coverage=float(ids_out.get("coverage", 0.0)),
-                    attack_in_rate=float(ids_out.get("attack_in_rate", 0.0)),
-                    user_drop_rate=float(ids_out.get("user_drop_rate", 0.0)),
-                    od_plan = cache["od_plan"],
-                    
-                    # RL Observation
-                    local_num_req = cache["local_num_request"],
-                    ema = cache["ema"],
-                    ema_mom = cache["ema_mom"],
-                    attack_drop_rate=float(ids_out.get("attack_drop_rate", 0.0)),
-                    cpu_to_ids_ratio = edge.ids_cpu / edge.budget.cpu, #Note this is the target not actual
-                    va_cpu_utilization = cache["va_cpu_utilization"],
-                    ids_cpu_utilization = ids_out["ids_cpu_util"],
-                    bw_utilization = cache["uplink_util"],
-                    overhead = overhead,
-                    # I_net = I_net_e,
-                    # od_plan = od_plan,
-                )
-            )
-
-        self.t += 1
-        qoe_slo = []
-        if self.t >= self.t_max:
-            # Calculate the QoE with SLO Violation Rate
-            for i,edge in enumerate(self.edge_areas):
-                h = [m for m in self.history if m.area_id == edge.area_id]
-                if len(h) == 0:
-                    continue
-
-                last_block = h[-self.t_max:]  # sliding window at the end
-                qoes = np.asarray([float(m.qoe_mean) for m in last_block], dtype=np.float32)
-
-                # violation indicator: 1 if QoE below threshold else 0
-                viol = (qoes < edge.slo_threshold).astype(np.float32)
-
-                # violation rate in [0,1]
-                viol_rate = float(viol.mean()) if len(viol) > 0 else 0.0
-
-                # SLO term V in (0,1]
-                V_edge = np.exp(-edge.slo_beta * viol_rate)
-
-                # If you want "final QoE with SLO" for this edge:
-                qoe_slo.append(float(qoes.mean()) * V_edge)
-            self.final_qoe = np.mean(qoe_slo)
+        return local_cache
                 
         
         
@@ -729,11 +763,11 @@ def test_environment_run(cfg_path: str, plot=False):
     env = build_env_base(cfg_path)
 
     dfs = []
-    for i in range(5):
+    for i in range(3):
         env.reset(seed=1000 + i)
 
         for _ in range(env.t_max):
-            env.step([0.5])
+            env.step([0.0])
 
         df = pd.DataFrame([m.__dict__ for m in env.history])
         df["episode"] = i
@@ -751,7 +785,7 @@ def test_environment_run(cfg_path: str, plot=False):
 
     # QoE over time
     (
-        all_df.pivot(index="t", columns="area_id", values="qoe_mean")
+        all_df.pivot(index="t", columns="area_id", values=["qoe_mean", "qoe_mean_ideal", "benign_col_dmg"])
         .plot(figsize=(10, 4), title="QoE over time")
         .get_figure()
         .savefig(f"{out_dir}/qoe_over_time.png", bbox_inches="tight")
@@ -789,6 +823,7 @@ def test_environment_run(cfg_path: str, plot=False):
     )
     avg_qoe = df["qoe_mean"].mean()
     print(f"Average QoE (qoe_mean): {avg_qoe:.4f}")
+    print(f"Average QoE (benign_col_dmg): {df['benign_col_dmg'].mean():.4f}")
     print(f"Plots saved to {out_dir}/")    
         
 if __name__ == "__main__":
