@@ -32,8 +32,9 @@ globals:
       latency_per_flow: 0.0
       bw_per_flow: 0.0205 # 0.0205 #original max_bw when scaling=1.0 is 190mb
       non_defendable_bw_const: 0.0
-      scaling: 1.0
+      scaling: 0.7
       mean_rep: 0
+      pattern_type: "yoyo"
 
     atk_03:
       type: drdos_ssdp
@@ -222,8 +223,8 @@ edge_areas:
 
     attackers:
       # - attacker_type: "atk_01"
-      # - attacker_type: "atk_02"
-      - attacker_type: "atk_03"
+      - attacker_type: "atk_02"
+      # - attacker_type: "atk_03"
       # - attacker_type: "atk_04"
       # - attacker_type: "atk_05"
 

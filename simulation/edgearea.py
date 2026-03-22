@@ -612,6 +612,20 @@ class EdgeArea:
         attack_dict = self._attack_agg_at(t)
 
         ids_out = self.aggregate_load_after_ids(t, attack_dict)  # update signature
+        
+        # Calculate Yo-Yo provisioning state and update attackers
+        util = float(ids_out.get("ids_cpu_util", 0.0))
+        if util > 0.8 :
+            z_t = 1
+        elif util < 0.2 and self.ids_cpu < 1.0:
+            z_t = -1
+        else:
+            z_t = 0
+            
+        for atk in self.attackers:
+            if hasattr(atk, "z_t"):
+                atk.z_t = z_t
+
         user_pass_rate = float(ids_out.get("user_pass_rate", total_req_in))
         passed_req_pre_uplink = int(np.ceil(max(0.0, user_pass_rate)))
 

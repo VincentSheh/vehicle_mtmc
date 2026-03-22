@@ -640,7 +640,7 @@ class TorchRLEnvWrapper(EnvBase):
             min=self.ids_cpu_min,
             max=edge.budget.cpu - 0.5,
         )
-        
+
         delta_eff = float((self.ids_cpu[0] - prev_ids).item())
         ids_cpu = self.ids_cpu.clone()
 
@@ -772,7 +772,7 @@ def test_environment_run(cfg_path: str, plot=False):
         env.reset(seed=1000 + i)
 
         for _ in range(env.t_max):
-            env.step([1.5])
+            env.step([0.5])
 
         df = pd.DataFrame([m.__dict__ for m in env.history])
         df["episode"] = i
@@ -798,10 +798,10 @@ def test_environment_run(cfg_path: str, plot=False):
 
     # Latency over time
     (
-        all_df.pivot(index="t", columns="area_id", values="bw_utilization")
-        .plot(figsize=(10, 4), title="Utilized uplink over time")
+        all_df.pivot(index="t", columns="area_id", values="ids_cpu_utilization")
+        .plot(figsize=(10, 4), title="IDS CPU Utilization")
         .get_figure()
-        .savefig(f"{out_dir}/uplink_utilization.png", bbox_inches="tight")
+        .savefig(f"{out_dir}/ids_cpu_utilization.png", bbox_inches="tight")
     )
 
     (
@@ -821,7 +821,7 @@ def test_environment_run(cfg_path: str, plot=False):
     
     # Attack in 
     (
-        all_df.pivot(index="t", columns="area_id", values=["attack_in_rate", "ema"])
+        all_df.pivot(index="t", columns="area_id", values=["attack_in_rate", "attack_drop_rate"])
         .plot(figsize=(10, 4), title="Attack In Rate")
         .get_figure()
         .savefig(f"{out_dir}/attack_in_rate.png", bbox_inches="tight")

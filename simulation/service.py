@@ -91,8 +91,8 @@ class IDS:
 
         ids_cycles_available = self.effective_cycles_per_step(ids_cpu)
         ids_used_cycles = min(total_in * self.cycles_per_packet, ids_cycles_available)
-        ids_cpu_util = min(1.0, ids_used_cycles / (ids_cycles_available + 1e-6))
-
+        ids_cpu_util = min(1.0, ids_used_cycles / (ids_cycles_available + 1e-6)) if ids_cycles_available > 0 else 1.0
+        # ids_cpu_util = 1 - coverage
         return {
             "coverage": coverage,
             "attack_in_rate": total_attack,
@@ -101,6 +101,8 @@ class IDS:
             "user_drop_rate": user_drop,
             "user_pass_rate": user_pass,
             "ids_cpu_util": ids_cpu_util,
+            "total_in": total_in,
+            "speed": speed,
         }
 
 class VideoPipeline:

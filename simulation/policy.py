@@ -400,7 +400,7 @@ def run_episode(
 
 
 def plot_ts_continuous(results: Dict[str, Dict[str, np.ndarray]], outpath: Path, slo_qoe_min: float = 0.2, beta=3):
-    fig, axes = plt.subplots(8, 1, figsize=(9, 9), sharex=True)
+    fig, axes = plt.subplots(8, 1, figsize=(15,15), sharex=True)
 
     panels = [
         ("qoe", "QoE"),
@@ -638,6 +638,7 @@ def main():
         )
 
     methods = ["random", "constant_0.5", "constant_1.5", "reactive"] + list(rl_policies.keys())
+    methods = ["constant_1.5", "reactive"] + list(rl_policies.keys())
 
     results: Dict[str, Dict[str, np.ndarray]] = {m: {} for m in methods}
     for m in methods:

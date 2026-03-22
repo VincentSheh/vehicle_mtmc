@@ -59,6 +59,9 @@ class Attacker:
         self.mean_rep = mean_rep
         self.rep = 1
         self.scaling = 1
+        self.z_t = 0
+        self.tau = 0
+        self.tau_threshold = 4000
 
         self.pattern_type = pattern_type
         self.t_min_pattern = t_min
@@ -189,7 +192,7 @@ class Attacker:
             T_eff = max(end - cursor, dt)
 
             # Random scaling per peak (segment)
-            local_peak_scaling = float(self.rng.uniform(0.8, 1.2))
+            local_peak_scaling = float(self.rng.uniform(0.8, 1.2)) # if self.pattern_type != "yoyo" else 0.8,1.2
             g[mask] = pattern_fn(t_local, T_eff) * local_peak_scaling
             cursor = end
 
@@ -215,6 +218,7 @@ class Attacker:
         self.start = int(self.rng.integers(0, max_start + 1)) if max_start > 0 else 0
         self.rep = 1
         self.scaling = float(self.rng.uniform(0.8, 2.0))
+        self.tau = 0
 
 
 
@@ -229,12 +233,38 @@ class Attacker:
             return None
 
         local_step = t - self.start
+        
+        if self.pattern_type == "yoyo":
+            # Update tau
+            if self.z_t == 1:
+                self.tau = 0
+                intensity = float(self.lambda_base)
+            elif self.z_t == -1:
+                self.tau = 0
+                intensity = float(self.lambda_base)
+            else:
+                self.tau += 1
+                if self.tau > self.tau_threshold:
+                    intensity = float(self.lambda_base)
+                else:
+                    intensity = 0
+                # intensity = 200
+            intensity *= self.scaling
+            
+            dt = self.slot_ms / 1000.0
+            flows = self.rng.poisson(lam=intensity * dt)
+            
+            return {
+                "attacker_id": self.attacker_id,
+                "attack_type": self.attack_type,
+                "flows_per_sec": float(flows) * self.scaling,
+            }
 
         if local_step < len(self._flows):
             return {
                 "attacker_id": self.attacker_id,
                 "attack_type": self.attack_type,
-                "flows_per_sec": float(self._flows[local_step]) * self.scaling * (1000.0 / self.slot_ms),
+                "flows_per_sec": float(self._flows[local_step]) * self.scaling,
             }
         return None
 
