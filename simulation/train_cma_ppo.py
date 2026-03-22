@@ -259,46 +259,59 @@ class EdgeIDSParallelEnv(PZooParallelEnv):
     #     return r
     
     def _build_reward_per_agent(self) -> np.ndarray:
-        if len(self.env.history) < self.n_edges:
+        if not getattr(self.env, "history", None) or len(self.env.history) < self.decision_interval * self.n_edges:
             return np.zeros(self.n_edges, dtype=np.float32)
 
-        # 1. Get local QoE for each edge (maintains area_id order)
-        last_block = self.env.history[-self.n_edges:]
-        q_local = np.asarray([float(m.qoe_mean) for m in last_block], dtype=np.float32)
-        
-        # 2. Calculate local penalty: how far is THIS specific agent below the threshold?
-        # Use np.maximum for element-wise comparison
-        viol = np.maximum(0.0, self.threshold - q_local)
-        penalty = (self.alpha * (viol ** 2)).astype(np.float32)
+        # Grab the whole decision interval block
+        block = self.env.history[-self.decision_interval * self.n_edges :]
+        local_rewards = np.zeros(self.n_edges, dtype=np.float32)
 
-        local_rewards = q_local - penalty
-        # Return the average reward to all agents (Global Reward)
-        global_rew = np.mean(local_rewards)
+        for i, edge in enumerate(self.env.edge_areas):
+            h = [m for m in block if m.area_id == edge.area_id]
+            if not h:
+                continue
+                
+            # 1. Get raw QoE for every micro-step in the interval
+            q_arr = np.asarray([float(m.qoe_mean) for m in h], dtype=np.float32)
+            if q_arr.size == 0:
+                continue
+            
+            # 2. Get edge-specific SLO parameters (falling back to class defaults)
+            slo_thr = float(getattr(edge, "slo_threshold", self.threshold))
+            slo_beta = float(getattr(edge, "slo_beta", self.alpha))
+            
+            # 3. Calculate violation rate over the interval
+            viol_rate = float((q_arr < slo_thr).mean())
+            
+            # 4. Apply the exponential SLO penalty to the mean QoE to get LOCAL reward
+            v_edge = float(np.exp(-slo_beta * viol_rate))
+            local_rewards[i] = float(q_arr.mean()) * v_edge
+
+        # CTDE: Return the average reward to all agents (Global Reward)
+        global_rew = float(np.mean(local_rewards))
         return np.full(self.n_edges, global_rew, dtype=np.float32)
-        
+
     def _qoe_vec(self) -> np.ndarray:
-        # qoe = np.asarray(getattr(self.env, "final_qoe", 0.0), dtype=np.float32)
-        # if qoe.ndim == 0:
-        #     qoe = np.full((self.n_edges,), float(qoe), dtype=np.float32)
-        # return qoe * 30.0
-        
-        if not getattr(self.env, "history", None) or len(self.env.history) == 0:
+        # Wait until we have enough history for a full decision interval block
+        if not getattr(self.env, "history", None) or len(self.env.history) < self.decision_interval * self.n_edges:
             return np.zeros(self.n_edges, dtype=np.float32)
 
         q_vec = np.zeros(self.n_edges, dtype=np.float32)
+        
+        # Isolate the records strictly from the current decision interval
+        block = self.env.history[-self.decision_interval * self.n_edges :]
 
         for i, edge in enumerate(self.env.edge_areas):
-            # all history entries for this edge over the whole episode
-            h = [m for m in self.env.history if m.area_id == edge.area_id]
+            # Filter the recent block for this specific edge
+            h = [m for m in block if m.area_id == edge.area_id]
             if not h:
-                q_vec[i] = 0.0
                 continue
 
             q = np.asarray([float(m.qoe_mean) for m in h], dtype=np.float32)
             if q.size == 0:
-                q_vec[i] = 0.0
                 continue
 
+            # Calculate penalties based ONLY on this interval's ticks
             slo_thr = float(getattr(edge, "slo_threshold", self.threshold))
             slo_beta = float(getattr(edge, "slo_beta", self.alpha))
 
@@ -308,7 +321,6 @@ class EdgeIDSParallelEnv(PZooParallelEnv):
             q_vec[i] = float(q.mean()) * V_edge
 
         return q_vec
-
 
 # =========================================================
 # Transforms

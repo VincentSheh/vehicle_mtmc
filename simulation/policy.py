@@ -863,7 +863,7 @@ def main():
     ap.add_argument("--scale_step", type=float, default=0.5)
     ap.add_argument("--ids_cpu_min", type=float, default=0.5)
     ap.add_argument("--threshold", type=float, default=0.5)
-    ap.add_argument("--slo_threshold", type=float, default=0.4)
+    ap.add_argument("--slo_threshold", type=float, default=0.35)
     ap.add_argument("--alpha", type=float, default=0.6)
     ap.add_argument("--rl_device", type=str, default="cuda")
     ap.add_argument("--rl_greedy", action="store_true")
@@ -900,8 +900,9 @@ def main():
     edge_names = [str(e.area_id) for e in tmp_env.edge_areas]
 
     rl_candidates = [
-        ("mlp_best", "mlp", "checkpoints/atksc2_a01_ima_ppo_frew/ckpt_iter_000100.pt"),
-        ("lstm_best", "lstm", "checkpoints/atksc2_a01_ima_lstm_frew/ckpt_iter_000100.pt"),
+        ("mlp_best", "mlp", "checkpoints/oneatk_cma_ppo/ckpt_iter_000100.pt"),
+        # ("mlp_best_ids4", "mlp", "checkpoints/oneatk_cma_ppo_ids4/ckpt_iter_000100.pt"),
+        # ("lstm_best", "lstm", "checkpoints/atksc2_a01_ima_lstm_frew/ckpt_iter_000100.pt"),
     ]
 
     if args.rl_specs.strip():
@@ -922,7 +923,7 @@ def main():
                         # "constant_2.0", 
                         # "constant_3.0",
                         "reactive"]
-    # baseline_methods = []
+    # baseline_methods = ["reactive"]
     rl_method_keys = [f"rl_{name}" for (name, _mode, _ckpt) in rl_candidates]
     all_methods = baseline_methods + rl_method_keys
 

@@ -143,6 +143,7 @@ class Environment:
         # reset edges
         for i, edge in enumerate(self.edge_areas):
             edge.reset(seed=seed + i * 99)
+            # edge.ids_cpu = 4.0
 
         # ---- enforce: only ONE attacker active in this episode ----
         # gather all attacker instances across all edges
@@ -298,7 +299,10 @@ class Environment:
             admitted_user_exec[e_exec] = int(ids_out_exec[e_exec].get("user_pass_cnt", exec_user_in[e_exec]))
             admitted_atk_exec[e_exec]  = int(ids_out_exec[e_exec].get("atk_pass_cnt", 0))
 
-        W_va_src = {eid: float(admitted_user_exec[eid]) for eid in area_ids}
+        W_va_src = {
+            eid: float(admitted_user_exec[eid] + admitted_atk_exec[eid])
+            for eid in area_ids
+        }
         c_va_dst = {eid: float(edges[eid].va_cpu) for eid in area_ids}
         tau_loc  = self._compute_tau_loc(W_va_src, c_va_dst)
 
@@ -318,6 +322,21 @@ class Environment:
             tau_loc=tau_loc,
         )
         va_in_dst = plan_va.assigned_dst
+        va_user_in_dst = {e: 0 for e in area_ids}
+        va_atk_in_dst  = {e: 0 for e in area_ids}
+
+        for e_src in area_ids:
+            u = float(admitted_user_exec[e_src])
+            a = float(admitted_atk_exec[e_src])
+            tot = max(u + a, 1.0)
+
+            u_share = u / tot
+            a_share = a / tot
+
+            for e_dst, n_sent in plan_va.flow.get(e_src, {}).items():
+                n_sent = float(n_sent)
+                va_user_in_dst[e_dst] += int(round(n_sent * u_share))
+                va_atk_in_dst[e_dst]  += int(round(n_sent * a_share))        
 
         # execute VA at each destination edge
         local_cache = {}
@@ -326,7 +345,8 @@ class Environment:
             edge = edges[e_exec]
             cache = edge.process_va(
                 t=self.t,
-                admitted_user_req_in=int(va_in_dst.get(e_exec, 0)),
+                admitted_user_req_in=int(va_user_in_dst.get(e_exec, 0)),
+                admitted_atk_req_in=int(va_atk_in_dst.get(e_exec, 0)),
                 attack_dict=obs[e_exec]["attack_dict"],
                 ids_out=ids_out_exec[e_exec],
             )
@@ -352,7 +372,9 @@ class Environment:
                     qoe_mean=float(cache["qoe"]),
                     qoe_weighted=qoe_weighted * len(self.edge_areas),
                     ids_coverage=float(ids_out.get("coverage")),
-                    attack_in_rate=float(ids_out.get("atk_in_cnt")),
+                    # attack_in_rate=float(ids_out.get("atk_in_cnt")),
+                    attack_in_rate=va_atk_in_dst[eid],
+                    # attack_in_rate=va_atk_in_dst[eid] + ids_out.get("atk_drop_cnt", 0),
                     user_drop_rate=float(ids_out.get("user_drop_cnt")),
                     od_plan=cache["od_plan"],
                     local_num_req=n,

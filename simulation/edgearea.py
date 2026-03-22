@@ -133,15 +133,20 @@ class EdgeArea:
         total_cycles_per_s = 0.0   # flows * cycle_per_flow
         ema = 0.0
         mom = 0.0
-
+        bw_per_flow = 0.0
+        cycle_per_flow = 0.0
+        
+        bw_per_flow += self.attackers[0].bw_per_flow
+        cycle_per_flow += self.attackers[0].cycle_per_flow
         for atk in self.cur_attacker:
-            # r = atk.load_at(t)
+         
             if not getattr(atk, "episode_active", True):
                 continue
             r = atk.load_at(t)            
             
             if r is None:
                 continue
+            
 
             flows = float(r["flows_per_sec"])
             total_flows += flows
@@ -163,6 +168,8 @@ class EdgeArea:
             "cycles_per_s": total_cycles_per_s,
             "ema": ema,
             "mom": mom,
+            "bw_per_flow": bw_per_flow,
+            "cycle_per_flow": cycle_per_flow
         }
 
     def aggregate_load_after_ids(
@@ -600,31 +607,58 @@ class EdgeArea:
         self,
         t: int,
         admitted_user_req_in: int,
+        admitted_atk_req_in: int,
         attack_dict: Dict,
         ids_out: Dict,
     ) -> Dict:
         """
-        Executes VA pipeline for a given admitted workload count.
+        Execute VA pipeline under mixed admitted workload.
 
-        Updated to work with new IDS outputs:
-        - Prefer count-style keys: atk_in_cnt / atk_pass_cnt
-        - Fallback to legacy rate-style keys: attack_in_rate / attack_pass_rate
+        Inputs
+        - admitted_user_req_in: benign requests arriving at this VA executor
+        - admitted_atk_req_in: false-negative / admitted attack requests arriving at this VA executor
+
+        Modeling
+        - Both benign and attack requests consume uplink and compute resources
+        - QoE is evaluated only on benign requests
+        - Attack traffic reduces available resources and may indirectly reduce benign QoE
         """
-        total_req_in = float(admitted_user_req_in)
-        local_num_request = int(admitted_user_req_in)
 
-        # --- UPDATED: compute attack pass fraction robustly ---
-        atk_in = float(ids_out.get("atk_in_cnt", ids_out.get("attack_in_rate", 0.0)))
-        atk_pass = float(ids_out.get("atk_pass_cnt", ids_out.get("attack_pass_rate", 0.0)))
-        atk_pass_frac = (atk_pass / atk_in) if atk_in > 0 else 0.0
+        benign_req_in = int(admitted_user_req_in)
+        attack_req_in = int(admitted_atk_req_in)
+        total_req_in = float(benign_req_in + attack_req_in)
+
+        # For logging / final QoE weighting, keep this as benign workload only
+        local_num_request = benign_req_in
+
+        # -------------------------------------------------
+        # Infer per-attack-request resource footprint
+        # -------------------------------------------------
+        # attack_dict should describe attack resource profile for the admitted attack type mix.
+        # We use it only for per-request scaling, not for total attack volume anymore.
+        atk_in_ref = float(ids_out.get("atk_in_cnt", ids_out.get("attack_in_rate", 0.0)))
+        atk_pass_ref = float(ids_out.get("atk_pass_cnt", ids_out.get("attack_pass_rate", 0.0)))
+
+        # robust pass fraction, only as fallback reference
+        atk_pass_frac = (atk_pass_ref / atk_in_ref) if atk_in_ref > 0 else 0.0
         atk_pass_frac = float(np.clip(atk_pass_frac, 0.0, 1.0))
 
-        # attack pressure that survives IDS and reaches VA/uplink
-        attack_uplink_in = float(attack_dict.get("bw_in", 0.0)) * atk_pass_frac
-        attack_cycles_per_ms = (float(attack_dict.get("cycles_per_s", 0.0)) * atk_pass_frac) / 1000.0
+        # Prefer deriving per-attack-request resource cost from total pre-IDS attack profile.
+        # If atk_in_ref is unavailable, fall back safely to zero.
+        bw_in_total = float(attack_dict.get("bw_in", 0.0))
+        cycles_per_s_total = float(attack_dict.get("cycles_per_s", 0.0))
 
-        # --- Compute Attack EMA Momentum ---
-        atk_signal = float(atk_in)  # choose pressure that matters to VA/uplink
+        atk_bw_per_req = attack_dict.get("bw_per_flow", 0.0)
+        atk_cycles_per_req = attack_dict.get("cycle_per_flow", 0.0)
+
+        # actual admitted attack resource load at THIS VA executor
+        attack_uplink_in = float(attack_req_in) * float(atk_bw_per_req)
+        attack_cycles_per_ms = float(attack_req_in) * float(atk_cycles_per_req)
+
+        # -------------------------------------------------
+        # Attack EMA / momentum based on admitted attack load
+        # -------------------------------------------------
+        atk_signal = float(attack_req_in)
 
         if not getattr(self, "_atk_ema_inited", False):
             self._atk_ema_inited = True
@@ -634,10 +668,8 @@ class EdgeArea:
             prev_ema = float(self._atk_ema)
             a = float(self._atk_alpha)
 
-            # EMA update
             self._atk_ema = a * atk_signal + (1.0 - a) * prev_ema
 
-            # momentum = delta EMA, then smooth it (optional but recommended)
             mom_raw = float(self._atk_ema) - prev_ema
             ma = float(self._atk_mom_alpha)
             self._atk_mom_ema = ma * mom_raw + (1.0 - ma) * float(self._atk_mom_ema)
@@ -645,8 +677,11 @@ class EdgeArea:
         attack_ema = float(self._atk_ema)
         attack_mom = float(self._atk_mom_ema)
 
+        # -------------------------------------------------
+        # Resource availability after admitted attacks
+        # -------------------------------------------------
         uplink_total_mb = self.budget.uplink / (1000.0 / self.slot_ms)
-        uplink_attack_used = attack_uplink_in
+        uplink_attack_used = float(attack_uplink_in)
         uplink_available = max(0.0, uplink_total_mb - uplink_attack_used)
 
         total_cycles_per_ms = self.cpu_cycle_per_ms * self.budget.cpu
@@ -654,24 +689,33 @@ class EdgeArea:
         avail_cycles_aft_atk_per_ms = max(0.0, avail_cycles_per_ms - attack_cycles_per_ms)
 
         if avail_cycles_aft_atk_per_ms <= 1e-12 or uplink_available <= 1e-12:
+            benign_dropped_uplink = benign_req_in
+            benign_dropped_compute = benign_req_in
+
             return {
                 "ids_out": ids_out,
                 "local_num_request": local_num_request,
                 "ema": attack_ema,
                 "ema_mom": attack_mom,
-                "dropped_uplink": int(total_req_in),
+                "dropped_uplink": int(benign_dropped_uplink),
                 "od_plan": {},
                 "served_req": 0,
-                "dropped_compute": int(total_req_in),
+                "dropped_compute": int(benign_dropped_compute),
                 "va_cpu_utilization": (total_cycles_per_ms - avail_cycles_aft_atk_per_ms)
                 / max(total_cycles_per_ms, 1e-9),
                 "uplink_util": 1.0,
                 "mean_latency_ms": float("inf"),
                 "qoe": 0.0,
+                "admitted_user_req_in": int(benign_req_in),
+                "admitted_atk_req_in": int(attack_req_in),
+                "total_req_in": float(total_req_in),
             }
 
-        # treat admitted_user_req_in as "passed pre uplink"
-        passed_req_pre_uplink = int(admitted_user_req_in)
+        # -------------------------------------------------
+        # Uplink scheduling for benign requests only
+        # Attacks already consumed part of uplink budget above
+        # -------------------------------------------------
+        passed_req_pre_uplink = benign_req_in
 
         upload_plan, served_req_uplink, dropped_uplink, uplink_util, per_req_by_h = self.select_resolution(
             passed_req_pre_uplink=int(passed_req_pre_uplink),
@@ -681,6 +725,10 @@ class EdgeArea:
             upload_hs=(224, 320, 412),
         )
 
+        # -------------------------------------------------
+        # Detector allocation for benign requests only
+        # Attacks already consumed part of compute budget above
+        # -------------------------------------------------
         gamma = float(self.constraints.get("Gamma", 0.0))
 
         dets = []
@@ -709,10 +757,13 @@ class EdgeArea:
         served_compute = int(sum(od_plan.values()))
         assert served_compute + int(dropped_compute) == int(served_req_uplink)
 
-        if total_req_in <= 0:
+        # -------------------------------------------------
+        # Final QoE: normalize by benign demand only
+        # -------------------------------------------------
+        if benign_req_in <= 0:
             qoe = 1.0
         else:
-            qoe = float(qoe) * (served_compute / total_req_in)
+            qoe = float(qoe) * (served_compute / float(benign_req_in))
 
         return {
             "ids_out": ids_out,
@@ -727,4 +778,7 @@ class EdgeArea:
             "uplink_util": float(uplink_util),
             "mean_latency_ms": float(mean_latency_ms),
             "qoe": float(qoe),
+            "admitted_user_req_in": int(benign_req_in),
+            "admitted_atk_req_in": int(attack_req_in),
+            "total_req_in": float(total_req_in),
         }

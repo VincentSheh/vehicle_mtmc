@@ -75,7 +75,8 @@ def balance_with_caps_and_prop_filter(
     W = {e: float(W_src[e]) for e in area_ids}
 
     # headroom if this edge were to receive tasks
-    headroom = {e: max(0.0, float(N_max[e]) - W[e]) for e in area_ids}
+    # headroom = {e: max(0.0, float(N_max[e]) - W[e]) for e in area_ids}
+    headroom = {e: 1e6 for e in area_ids} #! No cap for receiving task
 
     # 4) supply and demand relative to balanced target, demand capped by headroom
     supply = {e: max(0.0, W[e] - N_star[e]) for e in area_ids}
