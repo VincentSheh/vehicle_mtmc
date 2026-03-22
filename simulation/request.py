@@ -7,6 +7,17 @@ from dataclasses import dataclass
 from typing import Optional, Union
 import math
 
+def sinus_local(t_local: np.ndarray, T: float) -> np.ndarray:
+    return 0.5 * (1.0 + np.sin(2.0 * np.pi * t_local / T))
+
+def expo_local(t_local: np.ndarray, T: float) -> np.ndarray:
+    x = np.exp(-3.0 * t_local / T)
+    x = (x - np.exp(-3.0)) / (1.0 - np.exp(-3.0))
+    return np.clip(x, 0.0, 1.0)
+
+def pulse_wave_local(t_local: np.ndarray, T: float) -> np.ndarray:
+    return (t_local < T / 2).astype(float)
+
 class Attacker:
     """
     Attacker time series df must include at least:
@@ -31,6 +42,10 @@ class Attacker:
         seed,
         cpu_cycle_per_ms: float,
         cpu_cores: int,        
+        pattern_type: str = "sinus",
+        t_min: float = 15.0,
+        t_max_pattern: float = 45.0,
+        smooth_window: int = 10,
     ):
         self.attacker_id = attacker_id
         self.attack_type = attack_type
@@ -44,6 +59,11 @@ class Attacker:
         self.mean_rep = mean_rep
         self.rep = 1
         self.scaling = 1
+
+        self.pattern_type = pattern_type
+        self.t_min_pattern = t_min
+        self.t_max_pattern = t_max_pattern
+        self.smooth_window = smooth_window
         
         # -----------------------------
         # Prepare dataframe
@@ -64,6 +84,9 @@ class Attacker:
         if not required.issubset(self.df.columns):
             raise ValueError(f"Attack trace missing columns: {required}")        
 
+        if self.pattern_type != "trace":
+            self._estimate_baseline()
+
         step_scale = slot_ms / 1000.0  # seconds per step
         for col in (
             "flows_per_sec",
@@ -83,7 +106,7 @@ class Attacker:
 
         trace_len_steps = trace_len_sec * self.steps_per_sec
 
-        if trace_len_steps > t_max:
+        if self.pattern_type == "trace" and trace_len_steps > t_max:
             raise ValueError(
                 f"Attack trace longer than episode: "
                 f"{trace_len_steps} > {t_max}"
@@ -123,27 +146,77 @@ class Attacker:
         self.base_seed = seed
         self.rng = np.random.default_rng(seed)
         self._init_start()
+
+    def _estimate_baseline(self):
+        flows = self.df["flows_per_sec"].values
+        flows = flows[flows > 0]
+        if len(flows) == 0:
+            self.lambda_base = 1.0
+            self.noise_std = 0.1
+            return
+
+        trend = (
+            pd.Series(flows)
+            .rolling(window=self.smooth_window, min_periods=1, center=True)
+            .mean()
+            .values
+        )
+        residual = flows / np.maximum(trend, 1e-6)
+        self.lambda_base = float(np.mean(trend))
+        self.noise_std = float(np.std(residual - 1.0))
+        self.noise_std = min(self.noise_std, 1.0) / 2
+
+    def _generate_patterned_trace(self):
+        self.active_len = self.t_max // 2
+        dt = self.slot_ms / 1000.0
+        t_full = np.arange(0, self.active_len * dt, dt)
+        g = np.zeros_like(t_full, dtype=float)
         
+        pattern_fn = {
+            "sinus": sinus_local,
+            "expo": expo_local,
+            "pw": pulse_wave_local
+        }.get(self.pattern_type, sinus_local)
+
+        cursor = 0.0
+        total_time = self.active_len * dt
+        while cursor < total_time:
+            T_k = float(self.rng.uniform(self.t_min_pattern, self.t_max_pattern))
+            end = min(cursor + T_k, total_time)
+
+            mask = (t_full >= cursor) & (t_full < end)
+            t_local = t_full[mask] - cursor
+            T_eff = max(end - cursor, dt)
+
+            # Random scaling per peak (segment)
+            local_peak_scaling = float(self.rng.uniform(0.8, 1.2))
+            g[mask] = pattern_fn(t_local, T_eff) * local_peak_scaling
+            cursor = end
+
+        noise = self.rng.normal(loc=1.0, scale=self.noise_std, size=len(g))
+        noise = np.clip(noise, 0.05, None)
+        
+        # lambda_t is flows per second
+        lambda_t = self.lambda_base * g * noise
+        
+        # Convert to flows per step for Poisson sampling
+        self._flows = self.rng.poisson(lam=lambda_t * dt).astype(np.float32)
+        
+        # Re-compute EMA on the generated flows
+        hl = float(50.0)
+        alpha = 1.0 - math.exp(math.log(0.5) / hl) if hl > 0 else 1.0
+        self._flows_ema = pd.Series(self._flows).ewm(alpha=alpha, adjust=False).mean().to_numpy(dtype=np.float32)
+
     def _init_start(self):
-        trace_len_steps = len(self.df) * self.steps_per_sec
+        self.active_len = self.t_max // 2
 
-        # number of repetitions (Poisson around mean_rep)
-        if self.mean_rep != 0:
-            self.rep = max(1, int(self.rng.poisson(lam=self.mean_rep)))
-
-        # random scaling per episode
+        self._generate_patterned_trace()
+        max_start = self.t_max - self.active_len
+        self.start = int(self.rng.integers(0, max_start + 1)) if max_start > 0 else 0
+        self.rep = 1
         self.scaling = float(self.rng.uniform(0.8, 2.0))
 
-        # random gap duration between repetitions (in steps)
-        self.gap_steps = int(self.rng.integers(
-            low=400 * self.steps_per_sec,
-            high=800 * self.steps_per_sec
-        ))
 
-        total_len = self.rep * trace_len_steps + (self.rep - 1) * self.gap_steps
-
-        max_start = self.t_max - total_len
-        self.start = int(self.rng.integers(0, max_start + 1)) if max_start > 0 else 0
 
     def reset(self, seed=None):
         if seed is not None:
@@ -152,36 +225,18 @@ class Attacker:
 
 
     def load_at(self, t: int):
+        if not (self.start <= t < self.start + self.active_len):
+            return None
+
         local_step = t - self.start
-        if local_step < 0:
-            return None
 
-        trace_len_steps = len(self.df) * self.steps_per_sec
-        cycle_len = trace_len_steps + self.gap_steps
-
-        rep_idx = local_step // cycle_len
-
-        if rep_idx >= self.rep:
-            return None
-
-        within_cycle = local_step % cycle_len
-        if within_cycle == 0:
-            self.scaling = max(0.2, self.scaling + float(self.rng.uniform(-0.2, 0.2)))
-
-        # inside gap
-        if within_cycle >= trace_len_steps:
-            return None
-
-        sec_idx = within_cycle // self.steps_per_sec
-
-        return {
-            "attacker_id": self.attacker_id,
-            "attack_type": self.attack_type,
-            "flows_per_sec": float(self._flows[sec_idx]) * self.scaling,
-            # "flows_per_sec": float(self._flows[sec_idx]) * self.scaling,
-            # "flows_per_sec_ema": float(self._flows_ema[sec_idx]) * self.scaling,
-            # "flows_per_sec_ema_mom": float(self._flows_ema_mom[sec_idx]) * self.scaling,
-        }
+        if local_step < len(self._flows):
+            return {
+                "attacker_id": self.attacker_id,
+                "attack_type": self.attack_type,
+                "flows_per_sec": float(self._flows[local_step]) * self.scaling * (1000.0 / self.slot_ms),
+            }
+        return None
 
 class User:
     """
@@ -314,4 +369,3 @@ class User:
         if t < 0 or t >= self._req.shape[0]:
             return 0
         return int(self._req[t])
-

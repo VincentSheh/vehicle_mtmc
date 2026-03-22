@@ -245,12 +245,9 @@ class EdgeArea:
 
             # if multiple attackers: pick one policy
             # option A: sum (most consistent if you treat as total intensity)
+            # Use 0.0 if not provided by the attacker (e.g. in patterned mode)
             ema += float(r.get("flows_per_sec_ema", 0.0))
             mom += float(r.get("flows_per_sec_ema_mom", 0.0))
-
-            # option B: max magnitude for mom (if you want “worst burst”)
-            # m = float(r.get("flows_per_sec_ema_mom", 0.0))
-            # if abs(m) > abs(mom): mom = m
 
         return {
             "flows": total_flows,

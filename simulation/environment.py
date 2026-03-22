@@ -399,6 +399,10 @@ def build_env_base(cfg_path: str):
                     seed=cfg["run"]["seed"],
                     cpu_cycle_per_ms=globals_cfg.cpu_cycle_per_ms,
                     cpu_cores=globals_cfg.cpu_cores,                      
+                    pattern_type=atk_cfg.get("pattern_type", "trace"),
+                    t_min=float(atk_cfg.get("t_min", 15.0)),
+                    t_max_pattern=float(atk_cfg.get("t_max_pattern", 45.0)),
+                    smooth_window=int(atk_cfg.get("smooth_window", 10)),
                 )
             )
 
@@ -768,7 +772,7 @@ def test_environment_run(cfg_path: str, plot=False):
         env.reset(seed=1000 + i)
 
         for _ in range(env.t_max):
-            env.step([0.0])
+            env.step([1.5])
 
         df = pd.DataFrame([m.__dict__ for m in env.history])
         df["episode"] = i
