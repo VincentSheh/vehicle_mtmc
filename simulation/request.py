@@ -268,10 +268,18 @@ class Attacker:
             }
         return None
 
+import numpy as np
+import pandas as pd
+from typing import Union, Optional
+
+
 class User:
     """
     User request arrival time series.
-    Input CSV is one row per second.
+
+    Modes:
+    - synthetic: generate arrivals from a synthetic stochastic process
+    - trace: load arrivals from a reconstructed CSV and slice a chunk of length t_max
     """
 
     def __init__(
@@ -280,8 +288,11 @@ class User:
         slot_ms: float,
         t_max: int,
         seed: int = 0,
-        arrival_col: str = "num_objects",   # rename later if you want
         synth_cfg=None,
+        source_mode: str = "synthetic",   # "synthetic" or "trace"
+        csv_path: Optional[str] = "output/job_count_reconstructed.csv",
+        arrival_col: str = "recon_value",
+        random_slice: bool = True,
     ):
         self.user_id = str(user_id)
         self.slot_ms = float(slot_ms)
@@ -289,21 +300,48 @@ class User:
         self.base_seed = int(seed)
         self.rng = np.random.default_rng(self.base_seed)
 
-        self.arrival_col = str(arrival_col)
-        
         self.synth_cfg = synth_cfg
-        self._init_from_synthetic()        
+        self.source_mode = str(source_mode)
+        self.csv_path = csv_path
+        self.arrival_col = str(arrival_col)
+        self.random_slice = bool(random_slice)
 
-    def _init_from_synthetic(self):
-        cfg = self.synth_cfg
         self.steps_per_sec = int(round(1000.0 / self.slot_ms))
         if self.steps_per_sec <= 0:
             raise ValueError(f"Invalid slot_ms={self.slot_ms}")
 
+        self.full_trace = None
+        if self.source_mode == "trace":
+            if not self.csv_path:
+                raise ValueError("csv_path must be provided when source_mode='trace'")
+            self.full_trace = self._load_full_trace()
+
+        self._init_source()
+
+    def _init_source(self):
+        if self.source_mode == "synthetic":
+            self._init_from_synthetic()
+        elif self.source_mode == "trace":
+            self._init_from_trace()
+        else:
+            raise ValueError(
+                f"Unsupported source_mode={self.source_mode}. "
+                f"Use 'synthetic' or 'trace'."
+            )
+
+    # =========================================================
+    # Synthetic mode
+    # =========================================================
+    def _init_from_synthetic(self):
+        if self.synth_cfg is None:
+            raise ValueError("synth_cfg must be provided when source_mode='synthetic'")
+
+        cfg = self.synth_cfg
+
         df = self.generate_req_trace(
             t_steps=self.t_max,
             slot_ms=self.slot_ms,
-            rng=self.rng,                # key: uses User rng so reset controls mu0
+            rng=self.rng,
             rw_sigma_per_sqrt_sec=cfg["rw_sigma_per_sqrt_sec"],
             mu_min=cfg["mu_min"],
             mu_max=cfg["mu_max"],
@@ -311,7 +349,10 @@ class User:
             sigma=cfg["sigma"],
         )
 
-        per_step = np.maximum(df["num_requests_per_step"].to_numpy(dtype=int), 0.0)
+        per_step = np.maximum(
+            np.rint(df["num_requests_per_step"].to_numpy(dtype=float)),
+            0
+        ).astype(np.int32)
 
         self.df = pd.DataFrame(
             {
@@ -320,41 +361,36 @@ class User:
                 "num_requests_per_step": per_step,
                 "mu0": df["mu0"].to_numpy(dtype=float),
                 "mu_t": df["mu_t"].to_numpy(dtype=float),
-                "req_per_sec": df["req_per_sec"].to_numpy(dtype=int),
+                "req_per_sec": df["req_per_sec"].to_numpy(dtype=float),
                 "req_per_step_expected": df["req_per_step_expected"].to_numpy(dtype=float),
             }
         )
-        self._req = self.df["num_requests_per_step"].to_numpy(dtype=np.int32)
-        
+
+        self.slice_start = None
+        self.slice_end = None
+        self._req = per_step
 
     def generate_req_trace(
         self,
         t_steps: int,
         slot_ms: float,
         rng: np.random.Generator,
-
-        # random-walk mean params
         rw_sigma_per_sqrt_sec: float = 0.8,
         mu_min: float = 5.0,
         mu_max: float = 40.0,
-
-        # OU-like arrival params
         kappa: float = 0.02,
         sigma: float = 0.9,
     ):
         dt = slot_ms / 1000.0
 
-        # 1) randomize mu0
         mu0 = float(rng.uniform(mu_min, mu_max))
 
-        # 2) make mu random walk
         mu_series = np.empty(t_steps, dtype=float)
         mu_series[0] = mu0
         for t in range(1, t_steps):
-            step =  rw_sigma_per_sqrt_sec * np.sqrt(dt) * rng.standard_normal()
+            step = rw_sigma_per_sqrt_sec * np.sqrt(dt) * rng.standard_normal()
             mu_series[t] = np.clip(mu_series[t - 1] + step, mu_min, mu_max)
 
-        # 3) generate arrival rate with mean-reverting dynamics toward mu_t
         x = float(mu_series[0])
         req_per_sec = np.zeros(t_steps, dtype=float)
 
@@ -364,11 +400,10 @@ class User:
             x = max(0.0, x)
             req_per_sec[t] = x
 
-        # convert per-second rate to per-step expectation
         req_per_step_expected = req_per_sec
         req_per_step = np.maximum(req_per_step_expected, 0.0)
 
-        df = pd.DataFrame(
+        return pd.DataFrame(
             {
                 "t": np.arange(t_steps, dtype=int),
                 "mu0": mu0,
@@ -378,14 +413,47 @@ class User:
                 "num_requests_per_step": req_per_step,
             }
         )
-        return df        
 
+    # =========================================================
+    # Trace mode
+    # =========================================================
+    def _load_full_trace(self) -> np.ndarray:
+        values = pd.read_csv(self.csv_path, usecols=[self.arrival_col])[self.arrival_col]
+        values = pd.to_numeric(values, errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
+        return np.maximum(values, 0.0)
 
-    def reset(self, seed: int | None = None):
+    def _sample_start_index(self) -> int:
+        n = self.full_trace.shape[0]
+        if n < self.t_max:
+            raise ValueError(
+                f"Trace length ({n}) is smaller than requested t_max ({self.t_max})."
+            )
+
+        max_start = n - self.t_max
+        if not self.random_slice or max_start == 0:
+            return 0
+        return int(self.rng.integers(0, max_start + 1))
+
+    def _init_from_trace(self):
+        start_idx = self._sample_start_index()
+        end_idx = start_idx + self.t_max
+
+        chunk = self.full_trace[start_idx:end_idx]
+        self._req = np.maximum(np.rint(chunk), 0).astype(np.int32)
+
+        self.slice_start = start_idx
+        self.slice_end = end_idx
+        self.df = None
+
+    # =========================================================
+    # Public methods
+    # =========================================================
+    def reset(self, seed: Optional[int] = None):
         if seed is not None:
             self.base_seed = int(seed)
             self.rng = np.random.default_rng(self.base_seed)
-        self._init_from_synthetic()
+
+        self._init_source()
 
     def load_at(self, t: int):
         if t < 0 or t >= self._req.shape[0]:

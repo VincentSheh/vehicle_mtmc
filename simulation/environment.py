@@ -768,7 +768,7 @@ def test_environment_run(cfg_path: str, plot=False):
     env = build_env_base(cfg_path)
 
     dfs = []
-    for i in range(3):
+    for i in range(5):
         env.reset(seed=1000 + i)
 
         for _ in range(env.t_max):
@@ -804,13 +804,18 @@ def test_environment_run(cfg_path: str, plot=False):
         .savefig(f"{out_dir}/ids_cpu_utilization.png", bbox_inches="tight")
     )
 
-    (
-        all_df.pivot(index="t", columns="area_id", values="local_num_req")
-        .plot(figsize=(10, 4), title="Num Request")
-        .get_figure()
-        .savefig(f"{out_dir}/local_num_req.png", bbox_inches="tight")
+    ax = all_df.pivot(index="t", columns="area_id", values="local_num_req").plot(
+        figsize=(10, 4),
+        title="Num Request",
+        alpha=0.25,
     )
 
+    all_df.pivot(index="t", columns="area_id", values="local_num_req") \
+        .rolling(500, min_periods=1) \
+        .mean() \
+        .plot(ax=ax, linewidth=2)
+
+    ax.get_figure().savefig(f"{out_dir}/local_num_req_combined.png", bbox_inches="tight")
     # Ema mom
     (
         all_df.pivot(index="t", columns="area_id", values="ema_mom")
