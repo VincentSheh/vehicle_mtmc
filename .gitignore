@@ -15,4 +15,6 @@ __py*
 .venv
 .jedi
 simulation/wandb/
+simulation/eval_out/
+simulation/logs/
 *.csv

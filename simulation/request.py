@@ -18,6 +18,9 @@ def expo_local(t_local: np.ndarray, T: float) -> np.ndarray:
 def pulse_wave_local(t_local: np.ndarray, T: float) -> np.ndarray:
     return (t_local < T / 2).astype(float)
 
+def static_local(t_local: np.ndarray, T: float) -> np.ndarray:
+    return np.ones_like(t_local, dtype=float)
+
 class Attacker:
     """
     Attacker time series df must include at least:
@@ -178,7 +181,8 @@ class Attacker:
         pattern_fn = {
             "sinus": sinus_local,
             "expo": expo_local,
-            "pw": pulse_wave_local
+            "pw": pulse_wave_local,
+            "static": static_local,
         }.get(self.pattern_type, sinus_local)
 
         cursor = 0.0
@@ -191,9 +195,13 @@ class Attacker:
             t_local = t_full[mask] - cursor
             T_eff = max(end - cursor, dt)
 
-            # Random scaling per peak (segment)
-            local_peak_scaling = float(self.rng.uniform(0.8, 1.2)) # if self.pattern_type != "yoyo" else 0.8,1.2
-            g[mask] = pattern_fn(t_local, T_eff) * local_peak_scaling
+            # Random scaling per peak (segment) — always draw to keep RNG state consistent,
+            # but don't apply for "static" (only per-step noise should contribute there).
+            local_peak_scaling = float(self.rng.uniform(0.8, 1.2))
+            if self.pattern_type != "static":
+                g[mask] = pattern_fn(t_local, T_eff) * local_peak_scaling
+            else:
+                g[mask] = pattern_fn(t_local, T_eff)
             cursor = end
 
         noise = self.rng.normal(loc=1.0, scale=self.noise_std, size=len(g))
@@ -212,13 +220,14 @@ class Attacker:
 
     def _init_start(self):
         self.active_len = self.t_max // 2
-
-        self._generate_patterned_trace()
         max_start = self.t_max - self.active_len
+        # Sample start and scaling BEFORE trace generation so these are
+        # identical across pattern types for the same seed.
         self.start = int(self.rng.integers(0, max_start + 1)) if max_start > 0 else 0
-        self.rep = 1
         self.scaling = float(self.rng.uniform(0.8, 2.0))
+        self.rep = 1
         self.tau = 0
+        self._generate_patterned_trace()
 
 
 
@@ -227,6 +236,13 @@ class Attacker:
             self.rng = np.random.default_rng(seed)
         self._init_start()        
 
+    def get_state(self) -> dict:
+        return {
+            "z_t": self.z_t,
+        }
+
+    def set_state(self, state: dict):
+        self.z_t = state["z_t"]
 
     def load_at(self, t: int):
         if not (self.start <= t < self.start + self.active_len):
@@ -249,15 +265,15 @@ class Attacker:
                 else:
                     intensity = 0
                 # intensity = 200
-            intensity *= self.scaling
             
             dt = self.slot_ms / 1000.0
-            flows = self.rng.poisson(lam=intensity * dt)
+            noise = float(np.clip(self.rng.normal(loc=1.0, scale=self.noise_std), 0.05, None))
+            flows = self.rng.poisson(lam=intensity * noise * dt)
             
             return {
                 "attacker_id": self.attacker_id,
                 "attack_type": self.attack_type,
-                "flows_per_sec": float(flows) * self.scaling,
+                "flows_per_sec": float(flows * self.scaling),
             }
 
         if local_step < len(self._flows):
@@ -265,6 +281,7 @@ class Attacker:
                 "attacker_id": self.attacker_id,
                 "attack_type": self.attack_type,
                 "flows_per_sec": float(self._flows[local_step]) * self.scaling,
+                # "flows_per_sec": float(self._flows[local_step]),
             }
         return None
 

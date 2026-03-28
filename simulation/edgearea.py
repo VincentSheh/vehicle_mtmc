@@ -166,7 +166,7 @@ class EdgeArea:
         
         self.pipeline = pipeline
 
-        self.ids_cpu = self.budget.cpu - 0.5
+        self.ids_cpu = 0.5
         self.va_cpu = self.budget.cpu - self.ids_cpu
 
         self._last_action: Optional[Tuple[str, int]] = None
@@ -216,6 +216,25 @@ class EdgeArea:
             atk.reset(seed=atk_seed)     
         idx = int(self.rng.integers(0, len(self.attackers)))
         self.attackers = [self.attackers[idx]]
+
+    def get_state(self) -> dict:
+        return {
+            "ids_cpu": self.ids_cpu,
+            "va_cpu": self.va_cpu,
+            "_atk_ema_inited": self._atk_ema_inited,
+            "_atk_ema": self._atk_ema,
+            "_atk_mom_ema": self._atk_mom_ema,
+            "attacker_states": [atk.get_state() for atk in self.attackers],
+        }
+
+    def set_state(self, state: dict):
+        self.ids_cpu = state["ids_cpu"]
+        self.va_cpu = state["va_cpu"]
+        self._atk_ema_inited = state["_atk_ema_inited"]
+        self._atk_ema = state["_atk_ema"]
+        self._atk_mom_ema = state["_atk_mom_ema"]
+        for i, atk_state in enumerate(state["attacker_states"]):
+            self.attackers[i].set_state(atk_state)
 
     # --------------------------
     # Load aggregation

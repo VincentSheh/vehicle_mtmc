@@ -25,6 +25,7 @@ globals:
       non_defendable_bw_const: 0.0 
       scaling: 1.0 # base_scaling for flows_per_sec
       mean_rep: 0
+      pattern_type: "static"
 
     atk_02:
       type: drdos_snmp
@@ -42,7 +43,7 @@ globals:
       latency_per_flow: 0.0
       bw_per_flow: 0.0303 # 0.0103 #original max_bw when scaling=1.0 is 100mb
       non_defendable_bw_const: 0.0
-      scaling: 1.0
+      scaling: 1.5
       mean_rep: 0
       pattern_type: "pw"
       t_min: 400
@@ -222,8 +223,8 @@ edge_areas:
           sigma: 0.9
 
     attackers:
-      # - attacker_type: "atk_01"
-      - attacker_type: "atk_02"
+      - attacker_type: "atk_01"
+      # - attacker_type: "atk_02"
       # - attacker_type: "atk_03"
       # - attacker_type: "atk_04"
       # - attacker_type: "atk_05"
