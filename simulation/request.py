@@ -227,6 +227,13 @@ class Attacker:
             self.rng = np.random.default_rng(seed)
         self._init_start()        
 
+    def get_state(self) -> dict:
+        return {
+            "z_t": self.z_t,
+        }
+
+    def set_state(self, state: dict):
+        self.z_t = state["z_t"]
 
     def load_at(self, t: int):
         if not (self.start <= t < self.start + self.active_len):

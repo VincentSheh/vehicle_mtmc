@@ -203,11 +203,13 @@ class Environment:
         return states, decisions, I_net
     
     def _snapshot_edges(self):
-        return copy.deepcopy(self.edge_areas)
+        return [edge.get_state() for edge in self.edge_areas], np.random.get_state()
 
     def _restore_edges(self, snapshot):
-        self.edge_areas = snapshot    
-    
+        edge_states, rng_state = snapshot
+        np.random.set_state(rng_state)
+        for i, edge in enumerate(self.edge_areas):
+            edge.set_state(edge_states[i])
     
     def step(self, ids_cpus, overhead=0):
         snapshot = self._snapshot_edges()
