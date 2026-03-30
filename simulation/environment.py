@@ -332,10 +332,7 @@ class Environment:
                 
         
         
-def build_env_base(cfg_path: str):
-    cfg_text = Path(cfg_path).read_text(encoding="utf-8")
-    cfg = yaml.safe_load(cfg_text)
-
+def build_env_from_cfg(cfg: dict):
     globals_cfg = load_globals(cfg)
 
     # --------------------------------------------------
@@ -360,8 +357,8 @@ def build_env_base(cfg_path: str):
                 for k, v in area_cfg["ids_config"]["accuracy_by_type"].items()
             },
             cpu_cycle_per_ms=globals_cfg.cpu_cycle_per_ms,
-            cpu_cores=globals_cfg.cpu_cores,       
-            slot_ms=globals_cfg.slot_ms,  
+            cpu_cores=globals_cfg.cpu_cores,
+            slot_ms=globals_cfg.slot_ms,
         )
 
         users = []
@@ -400,7 +397,7 @@ def build_env_base(cfg_path: str):
                     t_max=cfg["run"]["t_max"],
                     seed=cfg["run"]["seed"],
                     cpu_cycle_per_ms=globals_cfg.cpu_cycle_per_ms,
-                    cpu_cores=globals_cfg.cpu_cores,                      
+                    cpu_cores=globals_cfg.cpu_cores,
                     pattern_type=atk_cfg.get("pattern_type", "trace"),
                     t_min=float(atk_cfg.get("t_min", 15.0)),
                     t_max_pattern=float(atk_cfg.get("t_max_pattern", 45.0)),
@@ -423,7 +420,7 @@ def build_env_base(cfg_path: str):
         )
 
         edge_areas.append(edge)
-        
+
 
     # Build delay matrix (simple symmetric test case)
     n = len(edge_areas)
@@ -441,6 +438,12 @@ def build_env_base(cfg_path: str):
     )
     env.reset(cfg["run"]["seed"])
     return env
+
+
+def build_env_base(cfg_path: str):
+    cfg_text = Path(cfg_path).read_text(encoding="utf-8")
+    cfg = yaml.safe_load(cfg_text)
+    return build_env_from_cfg(cfg)
 
 
 class TorchRLEnvWrapper(EnvBase):
@@ -766,15 +769,69 @@ class TorchRLEnvWrapper(EnvBase):
         reward = float(np.mean(reward_per_edge))
         return torch.tensor([reward], dtype=torch.float32, device=self.device)
             
-def test_environment_run(cfg_path: str, plot=False):
+def _reactive_ids_cpu(env, ids_cpu: np.ndarray, decision_interval: int,
+                       scale_step: float = 0.5, ids_cpu_min: float = 0.5) -> np.ndarray:
+    """Compute new ids_cpu allocation using reactive thresholding on IDS utilization."""
+    n_edges = len(env.edge_areas)
+    ids_cpu_max = np.array([e.budget.cpu - 0.5 for e in env.edge_areas], dtype=np.float32)
+
+    if len(env.history) < decision_interval * n_edges:
+        return ids_cpu.copy()
+
+    block = env.history[-decision_interval * n_edges:]
+    df = pd.DataFrame([m.__dict__ for m in block])
+
+    utils = []
+    for edge in env.edge_areas:
+        g = df[df["area_id"] == edge.area_id]
+        if g.empty or "ids_cpu_utilization" not in g.columns:
+            continue
+        utils.append(float(np.clip(np.mean(g["ids_cpu_utilization"].values), 0.0, 1.0)))
+
+    util = float(max(utils)) if utils else 0.0
+
+    if util >= 0.80:
+        delta = np.ones(n_edges, dtype=np.float32)
+    elif util <= 0.20:
+        delta = -np.ones(n_edges, dtype=np.float32)
+    else:
+        delta = np.zeros(n_edges, dtype=np.float32)
+
+    new_ids_cpu = ids_cpu + delta * scale_step
+    new_ids_cpu = np.clip(new_ids_cpu, ids_cpu_min, ids_cpu_max)
+    return new_ids_cpu
+
+
+def test_environment_run(cfg_path: str, plot=False, decision_interval: int = 500,
+                         method: str = "reactive", constant_cpu: float = 0.5):
+    """
+    method: "reactive"    - threshold-based IDS CPU adjustment every decision_interval steps
+            "constant"    - fixed ids_cpu = constant_cpu for all steps
+    """
     env = build_env_base(cfg_path)
 
     dfs = []
-    for i in range(5):
+    for i in range(1):
         env.reset(seed=1000 + i)
 
-        for _ in range(env.t_max):
-            env.step([0.5])
+        n_edges = len(env.edge_areas)
+        ids_cpu_max = np.array([e.budget.cpu - 0.5 for e in env.edge_areas], dtype=np.float32)
+
+        if method == "constant":
+            ids_cpu = np.clip(np.full(n_edges, constant_cpu, dtype=np.float32), 0.5, ids_cpu_max)
+        else:
+            ids_cpu = np.array([e.ids_cpu for e in env.edge_areas], dtype=np.float32)
+
+        t = 0
+        while t < env.t_max:
+            if method == "reactive":
+                ids_cpu = _reactive_ids_cpu(env, ids_cpu, decision_interval)
+
+            for _ in range(decision_interval):
+                env.step(ids_cpu.tolist())
+                t += 1
+                if t >= env.t_max:
+                    break
 
         df = pd.DataFrame([m.__dict__ for m in env.history])
         df["episode"] = i
@@ -833,10 +890,20 @@ def test_environment_run(cfg_path: str, plot=False):
         .get_figure()
         .savefig(f"{out_dir}/attack_in_rate.png", bbox_inches="tight")
     )
+
+    all_df["machine_count"] = all_df["cpu_to_ids_ratio"] * 16
+
+    (
+        all_df.pivot(index="t", columns="area_id", values="machine_count")
+        .plot(figsize=(10, 4), title="Machine Count")
+        .get_figure()
+        .savefig(f"{out_dir}/machine_count.png", bbox_inches="tight")
+    )    
+
     avg_qoe = df["qoe_mean"].mean()
     print(f"Average QoE (qoe_mean): {avg_qoe:.4f}")
     print(f"Average QoE (benign_col_dmg): {df['benign_col_dmg'].mean():.4f}")
     print(f"Plots saved to {out_dir}/")    
         
 if __name__ == "__main__":
-    test_environment_run("./configs/simulation_0.yaml", plot=True)
+    test_environment_run("./configs/simulation_0.yaml", plot=True, method="reactive")

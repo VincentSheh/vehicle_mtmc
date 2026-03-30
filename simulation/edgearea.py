@@ -166,7 +166,7 @@ class EdgeArea:
         
         self.pipeline = pipeline
 
-        self.ids_cpu = self.budget.cpu - 0.5
+        self.ids_cpu = 0.5
         self.va_cpu = self.budget.cpu - self.ids_cpu
 
         self._last_action: Optional[Tuple[str, int]] = None

@@ -638,7 +638,7 @@ def main():
         )
 
     methods = ["random", "constant_0.5", "constant_1.5", "reactive"] + list(rl_policies.keys())
-    methods = ["reactive"]
+    # methods = ["reactive"]
 
     results: Dict[str, Dict[str, np.ndarray]] = {m: {} for m in methods}
     for m in methods:
