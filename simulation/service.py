@@ -62,23 +62,20 @@ class IDS:
         # attacks: expected dropped = coverage * TPR * rate
         attack_drop = 0.0
         by_type = attack_dict.get("by_type", {})
+        default_entry = self.acc_tpr_fpr.get("default", (0.9, 0.01))
+        default_tpr, default_fpr = default_entry
+
         if by_type:
             for atk_type, lam in by_type.items():
-                tpr, _fpr = self.acc_tpr_fpr[str(atk_type)]
+                tpr, _ = self.acc_tpr_fpr.get(str(atk_type), default_entry)
                 attack_drop += coverage * tpr * float(lam)
         else:
-            # if you choose not to track by_type, you need a fallback
-            # simplest: assume average TPR across all types
-            if self.acc_tpr_fpr:
-                avg_tpr = float(np.mean([v[0] for v in self.acc_tpr_fpr.values()]))
-            else:
-                avg_tpr = 0.0
-            attack_drop = coverage * avg_tpr * total_attack
+            attack_drop = coverage * default_tpr * total_attack
 
         attack_pass = max(0.0, total_attack - attack_drop)
 
-        # users: expected false drops
-        avg_fpr = float(np.mean([v[1] for v in self.acc_tpr_fpr.values()])) if self.acc_tpr_fpr else 0.0
+        # users: expected false drops (single global FPR)
+        avg_fpr = default_fpr
 
         # effective drop probability for a benign user request
         p_drop = float(np.clip(coverage * avg_fpr, 0.0, 1.0))

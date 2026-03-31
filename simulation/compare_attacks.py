@@ -122,8 +122,8 @@ def plot_comparison(results: dict, outdir: str, smooth: int = 200):
     axes[2].legend(loc="upper right")
     axes[2].grid(True, alpha=0.3)
 
-    for ax in axes:
-        ax.set_xlim(0, 20000)
+    # for ax in axes:
+    #     ax.set_xlim(0, 20000)
 
     plt.tight_layout()
     plt.savefig(out_path, dpi=200, bbox_inches="tight")
@@ -134,7 +134,7 @@ def plot_comparison(results: dict, outdir: str, smooth: int = 200):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cfg", default="./configs/simulation_0.yaml")
-    ap.add_argument("--episodes", type=int, default=1)
+    ap.add_argument("--episodes", type=int, default=3)
     ap.add_argument("--decision_interval", type=int, default=500)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--smooth", type=int, default=200,
