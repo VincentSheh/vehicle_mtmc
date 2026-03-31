@@ -8,7 +8,7 @@ import math
 
 from service import IDS, VideoPipeline
 
-from request import User, Attacker
+from request import User, Attacker, AttackTypeLibrary
 
 from offload import (
     OffloadState,
@@ -146,6 +146,9 @@ class EdgeArea:
         users: List[User],
         attackers: List[Attacker],
         pipeline: VideoPipeline,
+        attack_type_library: Optional[AttackTypeLibrary] = None,
+        t_max: int = 30000,
+        dirichlet_alpha: float = 1.0,
     ):
         self.area_id = str(area_id)
         self.cpu_cycle_per_ms = float(cpu_cycle_per_ms)
@@ -162,9 +165,24 @@ class EdgeArea:
 
         self.ids = ids
         self.users = list(users)
+        self._all_attackers = list(attackers)  # original static list (legacy)
         self.attackers = list(attackers)
-        
+
+        self.attack_type_library = attack_type_library
+        self._t_max = t_max
+        self.dirichlet_alpha = dirichlet_alpha
+
         self.pipeline = pipeline
+
+        if attack_type_library is not None:
+            print(f"\n[{area_id}] Attack type library (fixed for this run):")
+            print(f"  {'ID':<4} {'pattern':<8} {'λ_base':>8} {'noise_σ':>8} "
+                  f"{'t_min(s)':>9} {'t_max(s)':>9} {'lat_ms':>7} {'bw_Mbps':>8}")
+            for tid in range(attack_type_library.n_types):
+                s = attack_type_library.get(tid)
+                print(f"  {tid:<4} {s.pattern_type:<8} {s.lambda_base:>8.1f} {s.noise_std:>8.3f} "
+                      f"{s.t_min_pattern:>9.1f} {s.t_max_pattern:>9.1f} "
+                      f"{s.latency_per_flow:>7.3f} {s.bw_per_flow:>8.4f}")
 
         self.ids_cpu = 0.5
         self.va_cpu = self.budget.cpu - self.ids_cpu
@@ -210,12 +228,54 @@ class EdgeArea:
             user_seed = int(self.rng.integers(0, 2**32))
             user.reset(seed=user_seed)
 
-        # 3) Reset attackers (independent seeds)
-        for i, atk in enumerate(self.attackers):
+        # 3) Sample a new attack type from the library for this episode
+        if self.attack_type_library is not None:
+            n = self.attack_type_library.n_types
+            concentration = np.ones(n) * self.dirichlet_alpha
+            p_attack_type = self.rng.dirichlet(concentration)
+
+            chosen_type_id = int(self.rng.choice(n, p=p_attack_type))
+            spec = self.attack_type_library.get(chosen_type_id)
+
+            print(f"[{self.area_id}] Sampled type_{chosen_type_id} "
+                  f"(pattern={spec.pattern_type}, λ_base={spec.lambda_base:.1f})")
+
             atk_seed = int(self.rng.integers(0, 2**32))
-            atk.reset(seed=atk_seed)     
-        idx = int(self.rng.integers(0, len(self.attackers)))
-        self.attackers = [self.attackers[idx]]
+            self.attackers = [Attacker(
+                attacker_id=f"atk_type_{chosen_type_id}",
+                spec=spec,
+                slot_ms=self.slot_ms,
+                t_max=self._t_max,
+                seed=atk_seed,
+                cpu_cycle_per_ms=self.cpu_cycle_per_ms,
+                cpu_cores=int(self.budget.cpu),
+            )]
+        else:
+            # Legacy path: select one from the static attacker list
+            for atk in self._all_attackers:
+                atk_seed = int(self.rng.integers(0, 2**32))
+                atk.reset(seed=atk_seed)
+            idx = int(self.rng.integers(0, len(self._all_attackers)))
+            self.attackers = [self._all_attackers[idx]]
+
+    def get_state(self) -> dict:
+        return {
+            "ids_cpu": self.ids_cpu,
+            "va_cpu": self.va_cpu,
+            "_atk_ema_inited": self._atk_ema_inited,
+            "_atk_ema": self._atk_ema,
+            "_atk_mom_ema": self._atk_mom_ema,
+            "attacker_states": [atk.get_state() for atk in self.attackers],
+        }
+
+    def set_state(self, state: dict):
+        self.ids_cpu = state["ids_cpu"]
+        self.va_cpu = state["va_cpu"]
+        self._atk_ema_inited = state["_atk_ema_inited"]
+        self._atk_ema = state["_atk_ema"]
+        self._atk_mom_ema = state["_atk_mom_ema"]
+        for i, atk_state in enumerate(state["attacker_states"]):
+            self.attackers[i].set_state(atk_state)
 
     def get_state(self) -> dict:
         return {

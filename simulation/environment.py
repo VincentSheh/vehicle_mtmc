@@ -24,7 +24,7 @@ from matplotlib import pyplot as plt
 
 from service import IDS, VideoPipeline
 
-from request import User, Attacker
+from request import User, Attacker, AttackTypeLibrary
 
 from edgearea import ResourceBudget, EdgeArea
 
@@ -336,6 +336,20 @@ def build_env_from_cfg(cfg: dict):
     globals_cfg = load_globals(cfg)
 
     # --------------------------------------------------
+    # Build AttackTypeLibrary (if attack_sampler block present)
+    # --------------------------------------------------
+    sampler_cfg = cfg["globals"].get("attack_sampler")
+    if sampler_cfg:
+        lib_rng = np.random.default_rng(cfg["run"]["seed"])
+        attack_type_library = AttackTypeLibrary(
+            n_types=int(sampler_cfg.get("n_types", 10)),
+            sampler_cfg=sampler_cfg,
+            rng=lib_rng,
+        )
+    else:
+        attack_type_library = None
+
+    # --------------------------------------------------
     # Build shared VideoPipeline
     # --------------------------------------------------
     video_pipeline = VideoPipeline(
@@ -373,37 +387,8 @@ def build_env_from_cfg(cfg: dict):
                 )
             )
 
+        # With attack_type_library, attackers are built dynamically at episode reset
         attackers = []
-
-        for atk_ref in area_cfg.get("attackers", []):
-            atk_type = atk_ref["attacker_type"]
-
-            if atk_type not in cfg["globals"]["attack"]:
-                raise KeyError(f"Unknown attacker_type: {atk_type}")
-
-            atk_cfg = cfg["globals"]["attack"][atk_type]
-
-            attackers.append(
-                Attacker(
-                    attacker_id=atk_type,
-                    attack_type=atk_cfg["type"],
-                    ts_df=pd.read_csv(atk_cfg["ts_path"]),
-                    latency_per_flow=atk_cfg["latency_per_flow"],
-                    bw_per_flow=atk_cfg["bw_per_flow"],
-                    base_scaling=atk_cfg["scaling"],
-                    mean_rep=atk_cfg["mean_rep"],
-                    non_defendable_bw_const=atk_cfg["non_defendable_bw_const"],
-                    slot_ms=globals_cfg.slot_ms,
-                    t_max=cfg["run"]["t_max"],
-                    seed=cfg["run"]["seed"],
-                    cpu_cycle_per_ms=globals_cfg.cpu_cycle_per_ms,
-                    cpu_cores=globals_cfg.cpu_cores,
-                    pattern_type=atk_cfg.get("pattern_type", "trace"),
-                    t_min=float(atk_cfg.get("t_min", 15.0)),
-                    t_max_pattern=float(atk_cfg.get("t_max_pattern", 45.0)),
-                    smooth_window=int(atk_cfg.get("smooth_window", 10)),
-                )
-            )
 
         edge = EdgeArea(
             area_id=area_cfg["area_id"],
@@ -417,6 +402,9 @@ def build_env_from_cfg(cfg: dict):
             users=users,
             attackers=attackers,
             pipeline=video_pipeline,
+            attack_type_library=attack_type_library,
+            t_max=cfg["run"]["t_max"],
+            dirichlet_alpha=float(area_cfg.get("dirichlet_concentration", 1.0)),
         )
 
         edge_areas.append(edge)
@@ -811,7 +799,7 @@ def test_environment_run(cfg_path: str, plot=False, decision_interval: int = 500
     env = build_env_base(cfg_path)
 
     dfs = []
-    for i in range(1):
+    for i in range(3):
         env.reset(seed=1000 + i)
 
         n_edges = len(env.edge_areas)
@@ -906,4 +894,4 @@ def test_environment_run(cfg_path: str, plot=False, decision_interval: int = 500
     print(f"Plots saved to {out_dir}/")    
         
 if __name__ == "__main__":
-    test_environment_run("./configs/simulation_0.yaml", plot=True, method="reactive")
+    test_environment_run("./configs/simulation_0.yaml", plot=True, method="reactive", constant_cpu=1.0)

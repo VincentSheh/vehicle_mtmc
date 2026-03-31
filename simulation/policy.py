@@ -290,8 +290,8 @@ def apply_delta(ids_cpu: np.ndarray, delta: np.ndarray, scale_step: float, ids_c
 
 
 def run_episode(
+    env,
     cfg: dict,
-    cfg_path: str,
     method: str,
     decision_interval: int,
     obs_keys: List[str],
@@ -300,12 +300,10 @@ def run_episode(
     seed: int,
     rl_policy: Optional[RLPolicy],
 ) -> Dict[str, np.ndarray]:
-    env = build_env_base(cfg_path)
     env.reset(seed)
 
-    for i, edge in enumerate(env.edge_areas):
+    for edge in env.edge_areas:
         edge.ids_cpu = 4.0
-        edge.reset(seed=seed + 100 * i)
 
     rng = np.random.default_rng(seed)
 
@@ -623,8 +621,8 @@ def main():
     ]
     obs_dim = len(obs_keys)
 
-    tmp_env = build_env_base(args.cfg)
-    n_edges = len(tmp_env.edge_areas)
+    env = build_env_base(args.cfg)
+    n_edges = len(env.edge_areas)
     obs_size = n_edges * obs_dim
 
     rl_policies: Dict[str, RLPolicy] = {}
@@ -638,7 +636,7 @@ def main():
         )
 
     methods = ["random", "constant_0.5", "constant_1.5", "reactive"] + list(rl_policies.keys())
-    # methods = ["reactive"]
+    # methods = ["reactive"] + list(rl_policies.keys())
 
     results: Dict[str, Dict[str, np.ndarray]] = {m: {} for m in methods}
     for m in methods:
@@ -659,8 +657,8 @@ def main():
             this_policy = rl_policies.get(m, None)
 
             q = run_episode(
+                env=env,
                 cfg=cfg,
-                cfg_path=args.cfg,
                 method="rl" if this_policy is not None else m,
                 decision_interval=args.decision_interval,
                 obs_keys=obs_keys,

@@ -1,6 +1,6 @@
 run:
   t_max: 30000
-  seed: 21
+  seed: 22
 
 eval:
   episode: 30
@@ -16,137 +16,18 @@ globals:
     latency_ms: 0.0357 #0.357
     cycles_ms: 0.0
   
-  attack:
-    atk_01:
-      type: drdos_dns
-      ts_path: output/cicddos2019_1_pruned/DrDoS_DNS.csv
-      latency_per_flow: 0.0
-      bw_per_flow: 0.0371 # 0.0371 #original max_bw when scaling=1.0 is 190mb
-      non_defendable_bw_const: 0.0 
-      scaling: 1.0 # base_scaling for flows_per_sec
-      mean_rep: 0
-      pattern_type: "static"
-
-    atk_02:
-      type: drdos_snmp
-      ts_path: output/cicddos2019_1_pruned/DrDoS_SNMP.csv
-      latency_per_flow: 0.0
-      bw_per_flow: 0.0205 # 0.0205 #original max_bw when scaling=1.0 is 190mb
-      non_defendable_bw_const: 0.0
-      scaling: 0.7
-      mean_rep: 0
-      pattern_type: "yoyo"
-
-    atk_03:
-      type: drdos_ssdp
-      ts_path: output/cicddos2019_1_pruned/DrDoS_SSDP.csv
-      latency_per_flow: 0.0
-      bw_per_flow: 0.0303 # 0.0103 #original max_bw when scaling=1.0 is 100mb
-      non_defendable_bw_const: 0.0
-      scaling: 1.5
-      mean_rep: 0
-      pattern_type: "pw"
-      t_min: 400
-      t_max_pattern: 800
-      smooth_window: 10
-
-    atk_04:
-      type: drdos_netbios
-      ts_path: output/cicddos2019_1_pruned/DrDoS_NetBIOS.csv
-      latency_per_flow: 1.8 
-      bw_per_flow: 0.00331 #original max_bw when scaling=1.0 is 27mb
-      non_defendable_bw_const: 0.0
-      scaling: 1.0
-      mean_rep: 0
-
-    atk_05:
-      type: syn_flood
-      ts_path: output/cicddos2019_1_pruned/Syn.csv
-      latency_per_flow: 8.0
-      bw_per_flow: 0.0 #original max_bw when scaling=1.0 is 0mb
-      non_defendable_bw_const: 0.0
-      scaling: 8.0
-      mean_rep: 8.0
-
-    atk_06:
-      type: drdos_ntp
-      ts_path: output/cicddos2019_1_pruned/DrDoS_NTP.csv
-      latency_per_flow: 0.5 
-      bw_per_flow: 0.203 #original max_bw when scaling=1.0 is 600mb
-      non_defendable_bw_const: 0.0
-      scaling: 1.0
-
-    atk_07:
-      type: tftp
-      ts_path: output/cicddos2019_1_pruned/TFTP.csv
-      latency_per_flow: 0.9
-      bw_per_flow: 0.0381 #original max_bw when scaling=1.0 is 100mb
-      non_defendable_bw_const: 0.0
-      scaling: 1.0
-
-    atk_08:
-      type: drdos_mssql
-      ts_path: output/cicddos2019_1_pruned/DrDoS_MSSQL.csv
-      latency_per_flow: 1.0
-      bw_per_flow: 0.00845 #original max_bw when scaling=1.0 is 80mb
-      non_defendable_bw_const: 0.0
-      scaling: 1.0
-
-    atk_09:
-      type: drdos_ldap
-      ts_path: output/cicddos2019_1_pruned/DrDoS_LDAP.csv
-      latency_per_flow: 0.8 
-      bw_per_flow: 0.0224 #original max_bw when scaling=1.0 is 90mb
-      non_defendable_bw_const: 0.0
-      scaling: 1.0
-
-    atk_10:
-      type: drdos_udp
-      ts_path: output/cicddos2019_1_pruned/DrDoS_UDP.csv
-      latency_per_flow: 0.4
-      bw_per_flow: 0.00985 #original max_bw when scaling=1.0 is 80mb
-      non_defendable_bw_const: 0.0
-      scaling: 1.0
-
-    atk_11: 
-      type: udp
-      ts_path: output/cicddos2019_1_pruned/UDP.csv
-      latency_per_flow: 0.4
-      bw_per_flow: 0.00965 #original max_bw when scaling=1.0 is 106mb
-      non_defendable_bw_const: 0.0
-      scaling: 1.0 
-
-    atk_12: 
-      type: netbios
-      ts_path: output/cicddos2019_1_pruned/NetBIOS.csv
-      latency_per_flow: 0.7
-      bw_per_flow: 0.00334 #original max_bw when scaling=1.0 is 30mb
-      non_defendable_bw_const: 0.0
-      scaling: 1.0
-
-    atk_13: 
-      type: syn_flood
-      ts_path: output/cicddos2019_1_pruned/Syn.csv
-      latency_per_flow: 0.3
-      bw_per_flow: 0.000463 #original max_bw when scaling=1.0 is 3mb
-      non_defendable_bw_const: 0.0
-      scaling: 1.0
-
-    atk_14:
-      type: mssql 
-      ts_path: output/cicddos2019_1_pruned/MSSQL.csv
-      latency_per_flow: 1.0
-      bw_per_flow: 0.00772 #original max_bw when scaling=1.0 is 105mb
-      non_defendable_bw_const: 0.0
-      scaling: 1.0
-
-    atk_15:
-      type: ldap
-      ts_path: output/cicddos2019_1_pruned/LDAP.csv
-      latency_per_flow: 0.8
-      bw_per_flow: 0.0218 #original max_bw when scaling=1.0 is 91mb
-      non_defendable_bw_const: 0.0
-      scaling: 1.0      
+  attack_sampler:
+    n_types: 10
+    # pattern_types: [ "sinus", "pw", "expo", "yoyo"]
+    pattern_types: ["pw", "yoyo"]
+    lambda_base:      [7000, 14000]   # flows/sec
+    noise_std:        [0.05, 0.10]
+    t_cycle_min:      [300, 500]     # seconds (lower bound on cycle duration)
+    t_cycle_delta:    [300, 800]   # seconds added to t_min to get t_max
+    latency_per_flow: [0,0.1]      # ms per flow
+    bw_per_flow:      [0.02, 0.04]   # Mbps per flow
+    non_defendable_bw_const: 0.0
+  
 
   video_pipeline:
     reid_latency: 20 #! Should consider batch processing
@@ -207,11 +88,11 @@ edge_areas:
       MOTA_min: 0.1  
       Gamma: 0.0005 
 
+    dirichlet_concentration: 1.0  # Dirichlet alpha for P(a|e); 1.0 = uniform over attack types
+
     ids_config:
       accuracy_by_type:
-        drdos_dns: [0.01, 0.05]   # FPR, FNR
-        drdos_netbios: [0.01, 0.02]
-        drdos_ssdp: [0.01, 0.03]
+        default: [0.01, 0.05]   # single global [FPR, FNR] applied to all attack types
 
     users:
       - user_id: 0
@@ -237,6 +118,7 @@ edge_areas:
   #     MOTA_min: 0.40    
   #     Gamma: 0.0005 
   #   ids_config:
-  #     accuracy_by_type: {}
+  #     accuracy_by_type:
+  #       default: [0.01, 0.05]
   #   users: []
   #   attackers: []
