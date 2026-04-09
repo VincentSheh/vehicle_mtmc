@@ -219,7 +219,7 @@ class Environment:
         ideal_ids_cpus = [0.0] * len(self.edge_areas)
         ideal_cache = self._run_step_once(
             ids_cpus=ideal_ids_cpus,
-            overhead=0.0,
+            overhead=overhead,
             disable_attack=True,
         )
 

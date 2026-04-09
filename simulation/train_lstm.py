@@ -59,41 +59,6 @@ class FeatureNet(nn.Module):
     def forward(self, x):
         return self.net(x)
 
-class ActorNet(nn.Module):
-    def __init__(self, obs_dim, n_actions=3, hidden=64):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(obs_dim, hidden),
-            nn.Tanh(),
-            nn.Linear(hidden, hidden),
-            nn.Tanh(),
-            nn.Linear(hidden, hidden),
-            nn.Tanh(),
-            nn.Linear(hidden, n_actions),
-        )
-        self.apply(lambda m: orthogonal_init(m, gain=nn.init.calculate_gain("tanh")))
-        orthogonal_init(self.net[-1], gain=0.01)
-
-    def forward(self, obs):
-        return self.net(obs)
-
-class CriticNet(nn.Module):
-    def __init__(self, obs_dim, hidden=64):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(obs_dim, hidden),
-            nn.Tanh(),
-            nn.Linear(hidden, hidden),
-            nn.Tanh(),
-            nn.Linear(hidden, hidden),
-            nn.Tanh(),
-            nn.Linear(hidden, 1),
-        )
-        self.apply(lambda m: orthogonal_init(m, gain=nn.init.calculate_gain("tanh")))
-        orthogonal_init(self.net[-1], gain=1.0)
-
-    def forward(self, obs):
-        return self.net(obs).squeeze(-1)
 
 def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/train.yaml", device="cuda"):
     with open(env_cfg_path, "r") as f:
@@ -287,9 +252,6 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
     iters_total = max(1, total_frames // frames_per_batch)
     num_network_updates = 0
 
-    def _num_minibatches(B: int) -> int:
-        return (B + minibatch_size - 1) // minibatch_size
-
     def _apply_anneal(alpha: float):
         if bool(train_cfg["optim"]["anneal_lr"]):
             lr_now = train_cfg["optim"]["lr"] * alpha
@@ -304,26 +266,6 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
 
     env.reset()
     
-    sampler = SliceSampler(
-        slice_len=seq_len,
-        end_key="done",
-        cache_values=True,
-        strict_length=False,
-    )
-
-    # PPO is on-policy, so we reuse a rollout buffer and overwrite it every iteration
-    # Store on GPU to avoid cpu<->gpu ping-pong
-    rollout_storage = LazyTensorStorage(
-        max_size=num_envs,   # store B trajectories, each item is [T,...]
-        device=device,
-    )
-
-    rb = TensorDictReplayBuffer(
-        storage=rollout_storage,
-        sampler=sampler,
-        batch_size=minibatch_size,  # sequences per minibatch
-    )    
-
     for it, batch in enumerate(collector):
         assert_finite(batch, "BATCH")
         assert_finite(batch["next"], "NEXT")
@@ -397,10 +339,6 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
 
         valid_idx = valid.nonzero(as_tuple=False)  # [N,2] = (b, t0)
         if valid_idx.numel() == 0:
-            all_b = torch.arange(B, device=device).repeat_interleave(max_t0 + 1)
-            all_t0 = torch.arange(max_t0 + 1, device=device).repeat(B)
-            valid_idx = torch.stack([all_b, all_t0], dim=1)
-        if valid_idx.numel() == 0:
             # fallback: allow all starts
             all_b = torch.arange(B, device=device).repeat_interleave(max_t0 + 1)
             all_t0 = torch.arange(max_t0 + 1, device=device).repeat(B)
@@ -434,9 +372,6 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
                 for k in range(seq_len_eff):
                     seq_list.append(data[t0_idx + k, b_idx])
                 mb_td = torch.stack(seq_list, dim=0).detach()
-                mb_td = torch.stack(seq_list, dim=0)  # TensorDict stacked on time dim
-
-                mb_td = mb_td.detach()
 
                 alpha = 1.0 - (num_network_updates / total_network_updates)
                 if alpha < 0.0:

@@ -25,7 +25,7 @@ from train_lstm import FeatureNet as LSTMFeatureNet
 from tensordict import TensorDict
 from tensordict.nn import TensorDictModule, TensorDictSequential
 from torchrl.modules import LSTMModule
-
+from tbsa_offline import TBSAPolicy
 
 # =========================================================
 # Policy wrappers
@@ -299,6 +299,7 @@ def run_episode(
     ids_cpu_min: float,
     seed: int,
     rl_policy: Optional[RLPolicy],
+    tbsa_policy: Optional[TBSAPolicy] = None,
 ) -> Dict[str, np.ndarray]:
     env.reset(seed)
 
@@ -360,6 +361,27 @@ def run_episode(
                 obs_flat = rl_policy.normalize_obs_flat(obs_flat)
 
             delta = rl_policy.act_from_obs_flat(obs_flat)
+
+        elif method == "tbsa":
+            if tbsa_policy is None:
+                raise ValueError("tbsa_policy is None but method == 'tbsa'")
+
+            # Read attack rate and request rate from the last tick only
+            if env.history:
+                last_records = env.history[-n_edges:]
+                last_attack = float(np.mean([r.attack_drop_rate for r in last_records]))
+                last_req = float(np.mean([r.local_num_req for r in last_records]))
+            else:
+                last_attack = 0.0
+                last_req = 0.0
+
+            target_cpu = tbsa_policy.select_ids_cpu(last_attack, last_req)
+            ids_cpu = np.clip(
+                np.full(n_edges, target_cpu, dtype=np.float32),
+                ids_cpu_min,
+                ids_cpu_max,
+            )
+            delta = np.zeros(n_edges, dtype=np.int64)  # ids_cpu already set
 
         else:
             raise ValueError(method)
@@ -583,6 +605,8 @@ def main():
     ap.add_argument("--decision_interval", type=int, default=500)
     ap.add_argument("--scale_step", type=float, default=0.5)
     ap.add_argument("--ids_cpu_min", type=float, default=0.5)
+    ap.add_argument("--tbsa_table", type=str, default="tbsa_table.npz",
+                    help="Path to TBSA lookup table (from tbsa_offline.py)")
 
     args = ap.parse_args()
 
@@ -635,7 +659,20 @@ def main():
             greedy=spec.get("greedy", True),
         )
 
-    methods = ["random", "constant_0.5", "constant_1.5", "reactive"] + list(rl_policies.keys())
+    # Load TBSA table if it exists
+    tbsa_policy: Optional[TBSAPolicy] = None
+    tbsa_table_path = Path(args.tbsa_table)
+    if tbsa_table_path.exists():
+        tbsa_policy = TBSAPolicy(str(tbsa_table_path))
+        print(f"Loaded TBSA table from {tbsa_table_path}")
+    else:
+        print(
+            f"TBSA table not found at {tbsa_table_path}. "
+            "Run tbsa_offline.py first to include the 'tbsa' method."
+        )
+
+    methods = ["random", "constant_0.5", "constant_1.5", "reactive", "tbsa"] + list(rl_policies.keys())
+
     # methods = ["reactive"] + list(rl_policies.keys())
 
     results: Dict[str, Dict[str, np.ndarray]] = {m: {} for m in methods}
@@ -666,6 +703,7 @@ def main():
                 ids_cpu_min=args.ids_cpu_min,
                 seed=ep_seed,
                 rl_policy=this_policy,
+                tbsa_policy=tbsa_policy,
             )
             for k, v in q.items():
                 results[m][k] = np.concatenate([results[m][k], v])

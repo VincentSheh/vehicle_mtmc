@@ -31,7 +31,7 @@ def _fix_attack_lambda(env, cfg_path: str):
             ]
 
 
-def _fix_users(env, mu0 = 40):
+def _fix_users(env, mu0 = 20):
     """Scale mu_min/mu_max/sigma from the config's per-step intent to per-sec
     so that generate_req_trace (which multiplies by dt=slot_ms/1000) produces
     the originally intended per-step request rates."""
