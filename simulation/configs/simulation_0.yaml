@@ -19,13 +19,14 @@ globals:
   attack_sampler:
     n_types: 10
     # pattern_types: [ "sinus", "pw", "expo", "yoyo"]
-    pattern_types: ["pw", "yoyo"]
-    lambda_base:      [7000, 14000]   # flows/sec
+    pattern_types: ["pw"]
+    lambda_base:      [7000, 7000]   # flows/sec
     noise_std:        [0.05, 0.10]
     t_cycle_min:      [300, 500]     # seconds (lower bound on cycle duration)
     t_cycle_delta:    [300, 800]   # seconds added to t_min to get t_max
-    latency_per_flow: [0,0.1]      # ms per flow
-    bw_per_flow:      [0.02, 0.04]   # Mbps per flow
+    latency_per_flow: [0.01,0.01]      # ms per flow  (latency_per_flow * 1000 * va_cpu / lambda_base)
+    bw_per_flow:      [0.0, 0.0]   # Mbps per flow
+    # bw_per_flow:      [0.15, 0.30]   # Mbps per flow
     non_defendable_bw_const: 0.0
   
 
@@ -92,16 +93,16 @@ edge_areas:
 
     ids_config:
       accuracy_by_type:
-        default: [0.01, 0.05]   # single global [FPR, FNR] applied to all attack types
+        default: [0.00, 0.02]   # single global [FPR, FNR] applied to all attack types
 
     users:
       - user_id: 0
         synthetic:
-          rw_sigma_per_sqrt_sec: 0.8
-          mu_min: 5.0
-          mu_max: 60.0
-          kappa: 0.02
-          sigma: 0.9
+          rw_sigma_per_sqrt_sec: 1.2
+          mu_min: 20.0 # Before Conversion to per step request = 5.0
+          mu_max: 200.0 # Before Conversion to per step request = 40.0
+          kappa: 0.25 
+          sigma: 8 # Before Conversion to per step request = 0.9
 
     attackers:
       - attacker_type: "atk_01"

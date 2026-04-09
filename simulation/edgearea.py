@@ -303,35 +303,32 @@ class EdgeArea:
     def _attack_agg_at(self, t: int) -> dict:
         # aggregate only what you use later
         total_flows = 0.0
-        total_bw_in = 0.0          # flows * bw_per_flow
-        total_cycles_per_s = 0.0   # flows * cycle_per_flow
+        total_bw_in = 0.0           # flows_per_step * bw_per_flow
+        total_cycles_per_step = 0.0  # flows_per_step * cycle_per_flow
         ema = 0.0
         mom = 0.0
 
         for atk in self.attackers:
-         
+
             if not getattr(atk, "episode_active", True):
                 continue
-            r = atk.load_at(t)            
-            
+            r = atk.load_at(t)
+
             if r is None:
                 continue
 
-            flows = float(r["flows_per_sec"])
+            flows = float(r["flows_per_step"])
             total_flows += flows
-            total_bw_in += flows * float(atk.bw_per_flow)
-            total_cycles_per_s += flows * float(atk.cycle_per_flow)
+            total_bw_in += flows * float(atk.bw_per_flow) * (self.slot_ms / 1000.0)
+            total_cycles_per_step += flows * float(atk.cycle_per_flow) * (self.slot_ms / 1000.0)
 
-            # if multiple attackers: pick one policy
-            # option A: sum (most consistent if you treat as total intensity)
-            # Use 0.0 if not provided by the attacker (e.g. in patterned mode)
-            ema += float(r.get("flows_per_sec_ema", 0.0))
-            mom += float(r.get("flows_per_sec_ema_mom", 0.0))
+            ema += float(r.get("flows_per_step_ema", 0.0))
+            mom += float(r.get("flows_per_step_ema_mom", 0.0))
 
         return {
             "flows": total_flows,
             "bw_in": total_bw_in,
-            "cycles_per_s": total_cycles_per_s,
+            "cycles_per_step": total_cycles_per_step,
             "ema": ema,
             "mom": mom,
         }
@@ -712,7 +709,7 @@ class EdgeArea:
         atk_pass = float(ids_out.get("attack_pass_rate", 0.0))
         atk_pass_frac = atk_pass / atk_in if atk_in > 0 else 0.0
         attack_uplink_in = attack_dict["bw_in"] * atk_pass_frac
-        attack_cycles_per_ms = (attack_dict["cycles_per_s"] * atk_pass_frac) / 1000.0
+        attack_cycles_per_ms = (attack_dict["cycles_per_step"] * atk_pass_frac)
 
         # -------------------------------------------------
         # Attack EMA / momentum based on admitted attack load
@@ -760,6 +757,7 @@ class EdgeArea:
                 "served_req": 0,
                 "dropped_compute": int(total_req_in),
                 "va_cpu_utilization": min(1,(attack_cycles_per_ms + self.ids_cpu * self.cpu_cycle_per_ms) / avail_cycles_per_ms),
+                "attack_cpu_frac": min(1.0, attack_cycles_per_ms / avail_cycles_per_ms),
                 "uplink_util": 1,
                 "mean_latency_ms": float("inf"),
                 "qoe": 0.0,
@@ -811,7 +809,8 @@ class EdgeArea:
         if total_req_in <= 0:
             qoe = 1.0
         else:
-            qoe =  qoe * (served_compute / total_req_in)
+            drop_frac = 1.0 - served_compute / total_req_in
+            qoe = qoe * (1.0 - drop_frac) ** 2
         cache = {
             "ids_out": ids_out,
             "local_num_request": local_num_request,
@@ -822,6 +821,7 @@ class EdgeArea:
             "served_req": int(served_compute),
             "dropped_compute": int(dropped_compute),
             "va_cpu_utilization": float(va_cpu_utilization),
+            "attack_cpu_frac": min(1.0, attack_cycles_per_ms / avail_cycles_per_ms),
             "uplink_util": uplink_util,
             "mean_latency_ms": float(mean_latency_ms),
             "qoe": float(qoe),

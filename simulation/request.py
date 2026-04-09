@@ -228,16 +228,14 @@ class Attacker:
             return {
                 "attacker_id": self.attacker_id,
                 "attack_type": self.attack_type,
-                "flows_per_sec": float(flows)  * self.scaling,
-                # "flows_per_sec": float(flows),
+                "flows_per_step": float(flows) * self.scaling,
             }
 
         if local_step < len(self._flows):
             return {
                 "attacker_id": self.attacker_id,
                 "attack_type": self.attack_type,
-                "flows_per_sec": float(self._flows[local_step]) * self.scaling,
-                # "flows_per_sec": float(self._flows[local_step]),
+                "flows_per_step": float(self._flows[local_step]) * self.scaling,
             }
         return None
 
@@ -373,7 +371,7 @@ class User:
             x = max(0.0, x)
             req_per_sec[t] = x
 
-        req_per_step_expected = req_per_sec
+        req_per_step_expected = req_per_sec * dt
         req_per_step = np.maximum(req_per_step_expected, 0.0)
 
         return pd.DataFrame(

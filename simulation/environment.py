@@ -64,6 +64,7 @@ class StepMetrics:
 
     # VA / BW
     va_cpu_utilization: float
+    attack_cpu_frac: float           # fraction of total CPU budget consumed by attacker
     bw_utilization: float
 
     overhead: float
@@ -255,6 +256,7 @@ class Environment:
                     ema_mom=float(cache["ema_mom"]),
                     cpu_to_ids_ratio=edge.ids_cpu / edge.budget.cpu,
                     va_cpu_utilization=float(cache["va_cpu_utilization"]),
+                    attack_cpu_frac=float(cache["attack_cpu_frac"]),
                     ids_cpu_utilization=float(ids_out["ids_cpu_util"]),
                     bw_utilization=float(cache["uplink_util"]),
 
@@ -799,14 +801,14 @@ def test_environment_run(cfg_path: str, plot=False, decision_interval: int = 500
     env = build_env_base(cfg_path)
 
     dfs = []
-    for i in range(3):
+    for i in range(5):
         env.reset(seed=1000 + i)
 
         n_edges = len(env.edge_areas)
         ids_cpu_max = np.array([e.budget.cpu - 0.5 for e in env.edge_areas], dtype=np.float32)
 
         if method == "constant":
-            ids_cpu = np.clip(np.full(n_edges, constant_cpu, dtype=np.float32), 0.5, ids_cpu_max)
+            ids_cpu = np.clip(np.full(n_edges, constant_cpu, dtype=np.float32), 0.0, ids_cpu_max)
         else:
             ids_cpu = np.array([e.ids_cpu for e in env.edge_areas], dtype=np.float32)
 
@@ -894,4 +896,4 @@ def test_environment_run(cfg_path: str, plot=False, decision_interval: int = 500
     print(f"Plots saved to {out_dir}/")    
         
 if __name__ == "__main__":
-    test_environment_run("./configs/simulation_0.yaml", plot=True, method="reactive", constant_cpu=1.0)
+    test_environment_run("./configs/simulation_0.yaml", plot=True, method="constant", constant_cpu=0.0)
