@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import os
+import sys
 import dataclasses
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import yaml
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from environment import build_env_base
 
 
@@ -31,7 +33,7 @@ def _fix_attack_lambda(env, cfg_path: str):
             ]
 
 
-def _fix_users(env, mu0 = 20):
+def _fix_users(env, mu0 = 10):
     """Scale mu_min/mu_max/sigma from the config's per-step intent to per-sec
     so that generate_req_trace (which multiplies by dt=slot_ms/1000) produces
     the originally intended per-step request rates."""
@@ -217,4 +219,5 @@ def run_sweep(cfg_path: str, plot: bool = False, out_dir: str = "./output/env_sw
 
 
 if __name__ == "__main__":
-    run_sweep("./configs/simulation_0.yaml", plot=True)
+    _default_cfg = os.path.join(os.path.dirname(__file__), "..", "configs", "simulation_0.yaml")
+    run_sweep(_default_cfg, plot=True)

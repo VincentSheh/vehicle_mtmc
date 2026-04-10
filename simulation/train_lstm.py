@@ -24,6 +24,30 @@ from logger import *
 
 from pathlib import Path
 
+# First N_TEMPORAL_PER_EDGE features per edge (local_num_req, attack_in_rate)
+# are fed through the LSTM. The remaining features bypass directly to the
+# actor/critic heads, avoiding injecting slowly-changing scalars into the
+# temporal state.
+N_TEMPORAL_PER_EDGE = 2
+
+
+class SplitObsModule(nn.Module):
+    """Split normalised observation_flat into temporal and static portions."""
+    def __init__(self, temporal_idx: list, static_idx: list):
+        super().__init__()
+        self.register_buffer("t_idx", torch.tensor(temporal_idx, dtype=torch.long))
+        self.register_buffer("s_idx", torch.tensor(static_idx, dtype=torch.long))
+
+    def forward(self, obs_flat: torch.Tensor):
+        return obs_flat[..., self.t_idx], obs_flat[..., self.s_idx]
+
+
+class MergeModule(nn.Module):
+    """Concatenate LSTM output with static bypass along the last dimension."""
+    def forward(self, lstm_out: torch.Tensor, static: torch.Tensor) -> torch.Tensor:
+        return torch.cat([lstm_out, static], dim=-1)
+
+
 def save_ckpt(path, policy, value, optim, env_cfg, train_cfg, it, device, env):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -85,19 +109,47 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
     feature_dim = train_cfg["model"]["hidden_dim"]
     seq_len = int(train_cfg["loss"].get("seq_len", 32))  # 16/32/64 common
 
-    lstm = LSTMModule(
-        input_size=feature_dim,
-        hidden_size=feature_dim,
-        in_key="features",
-        out_key="features",
-        device=device,
-    )
-
     base_env = TorchRLEnvWrapper(
         cfg_path=env_cfg_path,
         seed=env_cfg["run"]["seed"],
         device=device,
-        decision_interval=decision_interval
+        decision_interval=decision_interval,
+    )
+
+    n_temporal = N_TEMPORAL_PER_EDGE * base_env.n_edges
+    n_static   = base_env.obs_dim * base_env.n_edges - n_temporal
+    temporal_idx = [e * base_env.obs_dim + f
+                    for e in range(base_env.n_edges)
+                    for f in range(N_TEMPORAL_PER_EDGE)]
+    static_idx   = [e * base_env.obs_dim + f
+                    for e in range(base_env.n_edges)
+                    for f in range(N_TEMPORAL_PER_EDGE, base_env.obs_dim)]
+
+    # persist split layout in checkpoint so policy.py can reconstruct faithfully
+    train_cfg["model"].update({
+        "n_temporal":          n_temporal,
+        "n_static":            n_static,
+        "temporal_idx":        temporal_idx,
+        "static_idx":          static_idx,
+        "n_temporal_per_edge": N_TEMPORAL_PER_EDGE,
+    })
+
+    # push obs / model split info to wandb now that base_env is available
+    wandb.config.update({
+        "model/n_temporal":          n_temporal,
+        "model/n_static":            n_static,
+        "model/n_temporal_per_edge": N_TEMPORAL_PER_EDGE,
+        "env/obs_keys":              str(base_env.obs_keys),
+        "env/obs_dim":               base_env.obs_dim,
+        "env/obs_size":              base_env.obs_size,
+    }, allow_val_change=True)
+
+    lstm = LSTMModule(
+        input_size=n_temporal,
+        hidden_size=feature_dim,
+        in_key="temporal_obs",
+        out_key="lstm_out",
+        device=device,
     )
 
     def make_env(seed_offset):
@@ -138,27 +190,32 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
     )
     env.transform.eval()
 
-    obs_size = int(env.observation_spec["observation_flat"].shape[-1])
-
-    
-    # ---- actor ----
-    feature_module = TensorDictModule(
-        FeatureNet(obs_size, feature_dim).to(device),
+    # ---- split → LSTM (temporal only) → merge with static bypass ----
+    split_module = TensorDictModule(
+        SplitObsModule(temporal_idx, static_idx).to(device),
         in_keys=["observation_flat"],
-        out_keys=["features"],
+        out_keys=["temporal_obs", "static_obs"],
     )
 
-    shared_core = TensorDictSequential(feature_module, lstm)
+    merge_module = TensorDictModule(
+        MergeModule(),
+        in_keys=["lstm_out", "static_obs"],
+        out_keys=["features_merged"],
+    )
+
+    shared_core = TensorDictSequential(split_module, lstm, merge_module)
+
+    merged_dim = feature_dim + n_static
 
     actor_head = TensorDictModule(
-        nn.Linear(feature_dim, train_cfg["model"]["n_actions"]).to(device),
-        in_keys=["features"],
+        nn.Linear(merged_dim, train_cfg["model"]["n_actions"]).to(device),
+        in_keys=["features_merged"],
         out_keys=["logits"],
     )
 
     critic_head = TensorDictModule(
-        nn.Linear(feature_dim, 1).to(device),
-        in_keys=["features"],
+        nn.Linear(merged_dim, 1).to(device),
+        in_keys=["features_merged"],
         out_keys=["state_value"],
     )
 
@@ -173,7 +230,7 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
 
     # actor for loss, head-only
     loss_actor = ProbabilisticActor(
-        module=actor_head,          # reads "features" -> writes "logits"
+        module=actor_head,          # reads "features_merged" -> writes "logits"
         in_keys=["logits"],
         out_keys=["action"],
         distribution_class=Categorical,
@@ -251,6 +308,7 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
     # -----------------------
     iters_total = max(1, total_frames // frames_per_batch)
     num_network_updates = 0
+    global_decision_step = 0  # cumulative decision intervals across all iters
 
     def _apply_anneal(alpha: float):
         if bool(train_cfg["optim"]["anneal_lr"]):
@@ -275,6 +333,20 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
             print("batch['observation_flat'].shape:", batch['observation_flat'].shape)
             print("batch['next','reward'].shape:", batch['next','reward'].shape)
             print("batch keys:", batch.keys(True, True))        
+
+        # ---- per-decision-step obs logging ----
+        # Each T step in the batch = one action taken by the agent.
+        # Log obs values individually so wandb renders a curve at decision-interval resolution.
+        obs_keys_full = base_env.obs_keys + ["scaling_pending"]
+        _obs_flat = batch["observation"].float()          # [B, T, obs_dim]
+        _obs_flat = _obs_flat.mean(0).cpu()               # [T, obs_dim]  (mean over envs)
+        _T = _obs_flat.shape[0]
+        for _t in range(_T):
+            _step_log = {}
+            for _j, _name in enumerate(obs_keys_full):
+                _step_log[f"obs/{_name}"] = float(_obs_flat[_t, _j].item())
+            wandb.log(_step_log, step=global_decision_step + _t)
+        global_decision_step += _T
 
         # ---- build PPO traj ----
         traj = batch.clone(False)
@@ -419,20 +491,37 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
                 collector_policy, value, optim, env_cfg, train_cfg, it + 1, device, env,
             )
 
-        print(f"Iteration={it} reward_mean={batch['next','reward'].mean().item():.4f} qoe_mean={batch['next','qoe_mean'].mean().item():.4f}")
-        print("after norm T,B:", T, B, "done shape:", done.shape, "done_bt shape:", done_bt.shape)
+        _r_lres = float(batch["next", "reward_lambda_res"].mean().item())
+        _r_bcd  = float(batch["next", "reward_benign_col_dmg"].mean().item())
+        _r_qoe  = float(batch["next", "reward_qoe_penalty"].mean().item())
+        _vio    = float(batch["next", "qoe_vio_rate"].mean().item())
+
+        # atk_pass_frac = 1 - drop/in = lambda_res (fraction of attack that passed IDS)
+        print(
+            f"Iter={it:4d} | rew={batch['next','reward'].mean().item():+.4f} "
+            f"| atk_pass={_r_lres:.3f} bcd={_r_bcd:.3f} qoe_sf={_r_qoe:.3f} "
+            f"| qoe_vio={_vio:.1%}"
+        )
 
         if last_out is not None and last_total_loss is not None:
             wandb.log(
                 {
                     "iter": it,
-                    "qoe/mean": float(batch["next", "qoe_mean"].mean().item()),
-                    "reward/mean": float(batch["next", "reward"].mean().item()),
-                    "loss/total": float(last_total_loss.detach().item()),
-                    "loss/policy": float(last_out["loss_objective"].detach().item()),
-                    "loss/critic": float(last_out["loss_critic"].detach().item()),
+                    # --- QoE / reward ---
+                    "qoe/mean":     float(batch["next", "qoe_mean"].mean().item()),
+                    "qoe/vio_rate": _vio,
+                    "reward/mean":  float(batch["next", "reward"].mean().item()),
+                    # --- raw reward components (unweighted, positive) ---
+                    "reward/lambda_res":     _r_lres,
+                    "reward/benign_col_dmg": _r_bcd,
+                    "reward/qoe_penalty":    _r_qoe,
+                    # --- losses ---
+                    "loss/total":   float(last_total_loss.detach().item()),
+                    "loss/policy":  float(last_out["loss_objective"].detach().item()),
+                    "loss/critic":  float(last_out["loss_critic"].detach().item()),
                     "loss/entropy": float(last_out.get("loss_entropy", torch.tensor(0.0, device=device)).detach().item()),
                 },
+                step=global_decision_step - 1,  # align with last decision step of this batch
             )
 
         collector.update_policy_weights_()

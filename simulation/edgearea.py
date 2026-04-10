@@ -237,8 +237,8 @@ class EdgeArea:
             chosen_type_id = int(self.rng.choice(n, p=p_attack_type))
             spec = self.attack_type_library.get(chosen_type_id)
 
-            print(f"[{self.area_id}] Sampled type_{chosen_type_id} "
-                  f"(pattern={spec.pattern_type}, λ_base={spec.lambda_base:.1f})")
+            # print(f"[{self.area_id}] Sampled type_{chosen_type_id} "
+            #       f"(pattern={spec.pattern_type}, λ_base={spec.lambda_base:.1f})")
 
             atk_seed = int(self.rng.integers(0, 2**32))
             self.attackers = [Attacker(

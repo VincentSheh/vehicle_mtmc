@@ -30,7 +30,7 @@ from edgearea import ResourceBudget, EdgeArea
 
 from offload import OffloadDecision, OffloadState
 
-N_ACTION = 3
+N_ACTION = 9
 
 @dataclass(frozen=True)
 class GlobalConfig:
@@ -448,7 +448,7 @@ class TorchRLEnvWrapper(EnvBase):
     def __init__(
         self,
         cfg_path: str,
-        decision_interval: int = 3000,
+        decision_interval: int = 300,
         seed: int = 0,
         device: str | torch.device = "cpu",
     ):
@@ -470,12 +470,28 @@ class TorchRLEnvWrapper(EnvBase):
             "cpu_to_ids_ratio",
             # "va_cpu_utilization",
             "ids_cpu_utilization",
-            # "overhead",
             # "bw_utilization",
             # "I_net",
         ]
-        
-        self.obs_dim = len(self.obs_keys)
+
+        # Scaling state: pending signed CPU units of overhead remaining
+        _cfg = yaml.safe_load(Path(cfg_path).read_text(encoding="utf-8"))
+        self.scaling_time_steps: List[int] = list(
+            _cfg["globals"].get("scaling_time_step", [300, 450, 498, 544])
+        )
+
+        # Reward weights — read from config so they're tracked and reproducible
+        _reward_cfg = _cfg["globals"].get("reward", {})
+        self.reward_alpha = 1.0 / float(_reward_cfg.get("alpha_inv", 0.10))
+        self.reward_beta  = 1.0 / float(_reward_cfg.get("beta_inv",  0.20))
+        self.reward_gamma = 1.0 / float(_reward_cfg.get("gamma_inv", 0.12))
+        self.reward_q_th  = float(_reward_cfg.get("q_th", 0.20))
+        self.scaling_quanta: List[float] = [0.5, 1.0, 1.5, 2.0]
+        self.scaling_K: float = 2.0          # max accumulated pending (CPU units)
+        self.scaling_pending: float = 0.0    # signed; positive=scaling up, negative=down
+        self.overhead_rate: float = 0.0      # CPU units consumed per tick
+
+        self.obs_dim = len(self.obs_keys) + 1   # +1 for scaling_pending feature
         self.obs_size = self.n_edges * self.obs_dim
 
         self.action_dim = self.n_edges
@@ -491,6 +507,22 @@ class TorchRLEnvWrapper(EnvBase):
 
         self._set_seed(seed)
         self._make_specs()
+
+    # ---------------- Scaling helpers ----------------
+
+    def _lookup_scaling_duration(self, magnitude: float) -> int:
+        """Return ticks to drain `magnitude` CPU units of scaling work."""
+        for i, q in enumerate(self.scaling_quanta):
+            if magnitude <= q + 1e-9:
+                return self.scaling_time_steps[i]
+        return self.scaling_time_steps[-1]
+
+    def _compute_overhead_rate(self, pending: float) -> float:
+        """CPU units consumed per tick given current signed pending."""
+        abs_p = abs(pending)
+        if abs_p < 1e-9:
+            return 0.0
+        return abs_p / self._lookup_scaling_duration(abs_p)
 
     # ---------------- TorchRL required ----------------
 
@@ -514,15 +546,28 @@ class TorchRLEnvWrapper(EnvBase):
                 device=self.device,
             ),
 
-            # add these so they survive rollout collection
+            # extra keys that survive rollout collection
             qoe_mean=UnboundedContinuousTensorSpec(
                 shape=(1,),
                 dtype=torch.float32,
                 device=self.device,
             ),
+            # reward component breakdown (β·λ_res, γ·bcd, α·qoe_shortfall)
+            reward_lambda_res=UnboundedContinuousTensorSpec(
+                shape=(1,), dtype=torch.float32, device=self.device,
+            ),
+            reward_benign_col_dmg=UnboundedContinuousTensorSpec(
+                shape=(1,), dtype=torch.float32, device=self.device,
+            ),
+            reward_qoe_penalty=UnboundedContinuousTensorSpec(
+                shape=(1,), dtype=torch.float32, device=self.device,
+            ),
+            qoe_vio_rate=UnboundedContinuousTensorSpec(
+                shape=(1,), dtype=torch.float32, device=self.device,
+            ),
             t_internal=BoundedTensorSpec(
                 low=0,
-                high=max(1, int(self.env.t_max)),   # or env.t_max if already built
+                high=max(1, int(self.env.t_max)),
                 shape=(1,),
                 dtype=torch.int64,
                 device=self.device,
@@ -580,19 +625,28 @@ class TorchRLEnvWrapper(EnvBase):
         # Reset env with explicit seeds
         self.env.reset(episode_seed)
 
+        # Clear scaling state
+        self.scaling_pending = 0.0
+        self.overhead_rate = 0.0
+
 
         obs = self._build_observation().to(self.device)
         obs_flat = obs.reshape(-1)
 
+        _zero1 = torch.zeros(1, dtype=torch.float32, device=self.device)
         return TensorDict(
             {
                 "observation": obs,
                 "observation_flat": obs_flat,
-                "qoe_mean": torch.zeros(1, dtype=torch.float32, device=self.device),
-                "t_internal": torch.tensor([int(self.env.t)], dtype=torch.int64, device=self.device),                
-                "done": torch.zeros(1, dtype=torch.bool, device=self.device),
+                "qoe_mean":              _zero1.clone(),
+                "reward_lambda_res":     _zero1.clone(),
+                "reward_benign_col_dmg": _zero1.clone(),
+                "reward_qoe_penalty":    _zero1.clone(),
+                "qoe_vio_rate":          _zero1.clone(),
+                "t_internal": torch.tensor([int(self.env.t)], dtype=torch.int64, device=self.device),
+                "done":       torch.zeros(1, dtype=torch.bool, device=self.device),
                 "terminated": torch.zeros(1, dtype=torch.bool, device=self.device),
-                "truncated": torch.zeros(1, dtype=torch.bool, device=self.device),
+                "truncated":  torch.zeros(1, dtype=torch.bool, device=self.device),
             },
             batch_size=[],
             device=self.device,
@@ -639,27 +693,53 @@ class TorchRLEnvWrapper(EnvBase):
         delta_eff = float((self.ids_cpu[0] - prev_ids).item())
         ids_cpu = self.ids_cpu.clone()
 
-        # ids_cpu = [1.5]
-        # overhead is nonnegative and charged because you changed allocation
-        overhead = delta_eff
+        # Accumulate scaling work; same direction stacks, opposite subtracts.
+        # Clamped to [-K, K] so the lookup table stays valid.
+        self.scaling_pending = float(np.clip(
+            self.scaling_pending + delta_eff, -self.scaling_K, self.scaling_K
+        ))
+        self.overhead_rate = self._compute_overhead_rate(self.scaling_pending)
 
         total_reward = 0.0
+        total_lambda_res = 0.0
+        total_benign_col_dmg = 0.0
+        total_qoe_penalty = 0.0
         terminated_flag = False
         steps = 0
 
         # 2) Simulate decision_interval internal timesteps
         for i in range(self.decision_interval):
-            self.env.step(ids_cpu, overhead)
-            total_reward += float(self._build_reward())
+            # Drain scaling overhead one tick at a time, independent of window length
+            if abs(self.scaling_pending) > 1e-9:
+                consumed = float(np.sign(self.scaling_pending)) * min(
+                    abs(self.scaling_pending), self.overhead_rate
+                )
+                self.scaling_pending -= consumed
+                step_overhead = consumed
+            else:
+                step_overhead = 0.0
+
+            self.env.step(ids_cpu, step_overhead)
+            r = self._build_reward()
+            total_reward           += float(r["reward"].item())
+            total_lambda_res       += r["lambda_res"]
+            total_benign_col_dmg   += r["benign_col_dmg"]
+            total_qoe_penalty      += r["qoe_penalty"]
             steps += 1
             if self.env.t >= self.env.t_max:
                 terminated_flag = True
                 break
 
-        reward = torch.tensor([
-            total_reward 
-            / max(1, steps)
-            ], dtype=torch.float32, device=self.device)
+        n = max(1, steps)
+        reward = torch.tensor([total_reward / n], dtype=torch.float32, device=self.device)
+
+        # QoE violation rate over the decision window
+        window = self.env.history[-self.decision_interval * self.n_edges:]
+        if window:
+            qoes = np.asarray([m.qoe_mean for m in window], dtype=np.float32)
+            qoe_vio_rate = float(np.mean(qoes < self.reward_q_th))
+        else:
+            qoe_vio_rate = 0.0
 
         # 3) Build aggregated outputs
         obs = self._build_observation().to(self.device)
@@ -671,23 +751,24 @@ class TorchRLEnvWrapper(EnvBase):
         truncated = torch.zeros(1, dtype=torch.bool, device=self.device)
         done = terminated | truncated
 
-        t_internal_end = int(self.env.t)  # end-of-window index (exclusive)
-
+        t_internal_end = int(self.env.t)
         qoe_mean = float(self.env.final_qoe)
 
+        _f32 = lambda v: torch.tensor([v], dtype=torch.float32, device=self.device)
         return TensorDict(
             {
-                "observation": obs,
+                "observation":      obs,
                 "observation_flat": obs_flat,
-                "reward": reward,
-
-                # logging keys that ParallelEnv can batch safely
-                "qoe_mean": torch.tensor([qoe_mean*30], dtype=torch.float32, device=self.device),
+                "reward":           reward,
+                "qoe_mean":              _f32(qoe_mean * 30),
+                "reward_lambda_res":     _f32(total_lambda_res    / n),
+                "reward_benign_col_dmg": _f32(total_benign_col_dmg / n),
+                "reward_qoe_penalty":    _f32(total_qoe_penalty   / n),
+                "qoe_vio_rate":          _f32(qoe_vio_rate),
                 "t_internal": torch.tensor([t_internal_end], dtype=torch.int64, device=self.device),
-
-                "done": done,
+                "done":       done,
                 "terminated": terminated,
-                "truncated": truncated,
+                "truncated":  truncated,
             },
             batch_size=[],
             device=self.device,
@@ -712,52 +793,58 @@ class TorchRLEnvWrapper(EnvBase):
                 vals = g[k].values
                 if k == "I_net":
                     obs[i, j] = float(np.sum(vals))
-                elif k == "cpu_to_ids_ratio" or k=="overhead":
+                elif k == "cpu_to_ids_ratio":
                     obs[i, j] = float(vals[-1])
                 elif k == "ema_mom":
                     vals_nz = vals[vals != 0.0]
                     if len(vals_nz) == 0:
                         obs[i, j] = 0.0
                         continue
-                    obs[i, j] = float(np.mean(vals_nz))  
+                    obs[i, j] = float(np.mean(vals_nz))
                 else:
                     obs[i, j] = float(np.mean(vals))
 
+        # Last feature: normalized signed scaling_pending in [-1, 1]
+        obs[:, -1] = float(np.clip(self.scaling_pending / self.scaling_K, -1.0, 1.0))
+
         return obs
 
-    def _build_reward(self) -> torch.Tensor:
+    def _build_reward(self) -> dict:
+        """Return reward scalar + the three scaled component magnitudes."""
+        _zero = {"reward": torch.zeros(1, dtype=torch.float32, device=self.device),
+                 "lambda_res": 0.0, "benign_col_dmg": 0.0, "qoe_penalty": 0.0}
         if not self.env.history:
-            return torch.zeros(1, dtype=torch.float32, device=self.device)
+            return _zero
 
         last_block = self.env.history[-self.n_edges:]
 
-        qoe = np.asarray([float(m.qoe_mean) for m in last_block], dtype=np.float32)
-        benign_col_dmg = np.asarray([float(m.benign_col_dmg) for m in last_block], dtype=np.float32)
-        attack_in = np.asarray([float(m.attack_in_rate) for m in last_block], dtype=np.float32)
+        qoe        = np.asarray([float(m.qoe_mean)        for m in last_block], dtype=np.float32)
+        bcd        = np.asarray([float(m.benign_col_dmg)  for m in last_block], dtype=np.float32)
+        attack_in  = np.asarray([float(m.attack_in_rate)  for m in last_block], dtype=np.float32)
         attack_drop = np.asarray([float(m.attack_drop_rate) for m in last_block], dtype=np.float32)
 
-        # coefficients
-        alpha = 1.0 / 0.20
-        beta = 1.0 / 0.12
-        gamma = 1.0 / 0.10
-        q_th = 0.55
+        alpha = self.reward_alpha
+        beta  = self.reward_beta
+        gamma = self.reward_gamma
+        q_th  = self.reward_q_th
 
-        # Λ_res,e^t = total attack pass / total attack in
         attack_pass = np.maximum(0.0, attack_in - attack_drop)
-        lambda_res = np.where(attack_in > 1e-6, attack_pass / attack_in, 0.0).astype(np.float32)
+        lambda_res  = np.where(attack_in > 1e-6, attack_pass / attack_in, 0.0).astype(np.float32)
 
-        # QoE shortfall penalty
         qoe_shortfall = np.maximum(0.0, q_th - qoe) / max(q_th, 1e-6)
-        qoe_penalty = qoe_shortfall
 
-        reward_per_edge = (
-            - alpha * lambda_res
-            - beta * benign_col_dmg
-            - gamma * qoe_penalty
-        )
+        # raw (unweighted) components — used for tracking and print
+        r_lambda_res  = float(np.mean(lambda_res))      # fraction [0, 1]
+        r_bcd         = float(np.mean(bcd))             # QoE units
+        r_qoe_penalty = float(np.mean(qoe_shortfall))   # normalised shortfall [0, 1]
 
-        reward = float(np.mean(reward_per_edge))
-        return torch.tensor([reward], dtype=torch.float32, device=self.device)
+        reward = -(alpha * r_qoe_penalty + beta * r_lambda_res + gamma * r_bcd)
+        return {
+            "reward":          torch.tensor([reward], dtype=torch.float32, device=self.device),
+            "lambda_res":      r_lambda_res,
+            "benign_col_dmg":  r_bcd,
+            "qoe_penalty":     r_qoe_penalty,
+        }
             
 def _reactive_ids_cpu(env, ids_cpu: np.ndarray, decision_interval: int,
                        scale_step: float = 0.5, ids_cpu_min: float = 0.5) -> np.ndarray:

@@ -177,7 +177,7 @@ class Attacker:
         max_start = self.t_max - self.active_len
         # Sample start and scaling BEFORE trace generation so these are
         # identical across pattern types for the same seed.
-        self.start = 500
+        self.start = int(self.rng.uniform(500, self.active_len))
         self.scaling = float(self.rng.uniform(0.8, 1.4))
         self.rep = 1
         self.tau = 0

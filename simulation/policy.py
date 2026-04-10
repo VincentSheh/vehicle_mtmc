@@ -20,12 +20,13 @@ from environment import build_env_base
 from train_mlp import ActorNet as MLPActorNet
 
 # LSTM training code
-from train_lstm import FeatureNet as LSTMFeatureNet
+from train_lstm import SplitObsModule, MergeModule
 
 from tensordict import TensorDict
 from tensordict.nn import TensorDictModule, TensorDictSequential
 from torchrl.modules import LSTMModule
 from tbsa_offline import TBSAPolicy
+from method_policy import BaselinePolicy, ActContext, make_baseline_policy
 
 # =========================================================
 # Policy wrappers
@@ -86,49 +87,71 @@ class MLPPolicy(BaseRLPolicy):
 
 
 class LSTMPolicy(BaseRLPolicy):
-    def __init__(self, ckpt_path: str, obs_size: int, device: str = "cpu", greedy: bool = True):
+    def __init__(self, ckpt_path: str, obs_size: int = 0, device: str = "cpu", greedy: bool = True):  # obs_size unused; dims read from checkpoint
         self.device = torch.device(device)
         self.greedy = greedy
 
         state = torch.load(ckpt_path, map_location=self.device)
         self.obsnorm = state.get("obsnorm", None)
 
-        feature_dim = state["train_cfg"]["model"]["hidden_dim"]
-        n_actions = state["train_cfg"]["model"]["n_actions"]
+        model_cfg  = state["train_cfg"]["model"]
+        feature_dim = model_cfg["hidden_dim"]
+        n_actions   = model_cfg["n_actions"]
+        n_temporal  = model_cfg["n_temporal"]
+        n_static    = model_cfg["n_static"]
+        temporal_idx = model_cfg["temporal_idx"]
+        static_idx   = model_cfg["static_idx"]
 
         self.h_size = feature_dim
         self.n_layers = 1
 
-        feature_module = TensorDictModule(
-            LSTMFeatureNet(obs_size, feature_dim).to(self.device),
+        # ---- mirror architecture from train_lstm.py ----
+        split_module = TensorDictModule(
+            SplitObsModule(temporal_idx, static_idx).to(self.device),
             in_keys=["observation_flat"],
-            out_keys=["features"],
+            out_keys=["temporal_obs", "static_obs"],
         )
 
         self.lstm = LSTMModule(
-            input_size=feature_dim,
+            input_size=n_temporal,
             hidden_size=feature_dim,
-            in_key="features",
-            out_key="features",
+            in_key="temporal_obs",
+            out_key="lstm_out",
             device=self.device,
         )
 
+        merge_module = TensorDictModule(
+            MergeModule().to(self.device),
+            in_keys=["lstm_out", "static_obs"],
+            out_keys=["features_merged"],
+        )
+
         actor_head = TensorDictModule(
-            nn.Linear(feature_dim, n_actions).to(self.device),
-            in_keys=["features"],
+            nn.Linear(feature_dim + n_static, n_actions).to(self.device),
+            in_keys=["features_merged"],
             out_keys=["logits"],
         )
 
-        self.actor = TensorDictSequential(feature_module, self.lstm, actor_head).to(self.device)
+        self.actor = TensorDictSequential(
+            split_module, self.lstm, merge_module, actor_head
+        ).to(self.device)
 
+        # Key remapping: checkpoint saves collector_policy whose module wraps
+        # TDSequential(shared_core, actor_head) with shared_core=TDSeq(split,lstm,merge).
+        # Flatten that nesting to match self.actor = TDSeq(split,lstm,merge,head).
         policy_sd = state["policy"]
-
         mapped_sd = {}
         for k, v in policy_sd.items():
-            new_k = k
-            new_k = new_k.replace("module.0.module.0.module.0.", "module.0.")
-            new_k = new_k.replace("module.0.module.0.module.1.", "module.1.")
-            new_k = new_k.replace("module.0.module.1.", "module.2.")
+            if k.startswith("module.0.module.0.module."):
+                new_k = "module.0.module." + k[len("module.0.module.0.module."):]
+            elif k.startswith("module.0.module.1."):
+                new_k = "module.1." + k[len("module.0.module.1."):]
+            elif k.startswith("module.0.module.2."):
+                new_k = "module.2." + k[len("module.0.module.2."):]
+            elif k.startswith("module.1."):
+                new_k = "module.3." + k[len("module.1."):]
+            else:
+                new_k = k
             mapped_sd[new_k] = v
 
         self.actor.load_state_dict(mapped_sd, strict=False)
@@ -221,9 +244,24 @@ class RLPolicy(BaseRLPolicy):
         self.impl.reset()
 
 
-def build_observation_from_history(env, decision_interval: int, obs_keys: List[str]) -> np.ndarray:
+def _lookup_overhead_rate(pending: float, scaling_time_steps: List[int],
+                           scaling_quanta: List[float]) -> float:
+    """CPU units consumed per tick given current signed pending."""
+    abs_p = abs(pending)
+    if abs_p < 1e-9:
+        return 0.0
+    for i, q in enumerate(scaling_quanta):
+        if abs_p <= q + 1e-9:
+            duration = scaling_time_steps[i]
+            return abs_p / duration
+    return abs_p / scaling_time_steps[-1]
+
+
+def build_observation_from_history(env, decision_interval: int, obs_keys: List[str],
+                                    scaling_pending: float = 0.0,
+                                    scaling_K: float = 2.0) -> np.ndarray:
     n_edges = len(env.edge_areas)
-    obs_dim = len(obs_keys)
+    obs_dim = len(obs_keys) + 1  # +1 for scaling_pending feature
     obs = np.zeros((n_edges, obs_dim), dtype=np.float32)
 
     if not env.history:
@@ -238,6 +276,10 @@ def build_observation_from_history(env, decision_interval: int, obs_keys: List[s
         if g.empty:
             continue
         for j, k in enumerate(obs_keys):
+            if k == "attack_in_rate_std":
+                if "attack_in_rate" in g.columns:
+                    obs[i, j] = float(np.std(g["attack_in_rate"].values))
+                continue
             if k not in g.columns:
                 continue
             vals = g[k].values
@@ -247,6 +289,9 @@ def build_observation_from_history(env, decision_interval: int, obs_keys: List[s
                 obs[i, j] = float(vals[-1])
             else:
                 obs[i, j] = float(np.mean(vals))
+
+    # Last feature: normalized signed scaling_pending in [-1, 1]
+    obs[:, -1] = float(np.clip(scaling_pending / scaling_K, -1.0, 1.0))
     return obs
 
 
@@ -292,13 +337,15 @@ def apply_delta(ids_cpu: np.ndarray, delta: np.ndarray, scale_step: float, ids_c
 def run_episode(
     env,
     cfg: dict,
-    method: str,
+    policy,                        # BaselinePolicy | RLPolicy
     decision_interval: int,
     obs_keys: List[str],
     scale_step: float,
     ids_cpu_min: float,
     seed: int,
-    rl_policy: Optional[RLPolicy],
+    # Legacy keyword args kept for backwards-compat with main() callers
+    method: Optional[str] = None,
+    rl_policy: Optional[RLPolicy] = None,
     tbsa_policy: Optional[TBSAPolicy] = None,
 ) -> Dict[str, np.ndarray]:
     env.reset(seed)
@@ -317,79 +364,74 @@ def run_episode(
 
     decisions = math.ceil(t_max / decision_interval)
 
-    if method == "rl" and rl_policy is not None:
-        rl_policy.reset()
+    if hasattr(policy, "reset"):
+        policy.reset()
+
+    # Scaling overhead state (mirrors TorchRLEnvWrapper)
+    scaling_time_steps: List[int] = list(cfg["globals"].get("scaling_time_step", [300, 450, 498, 544]))
+    scaling_quanta: List[float] = [0.5, 1.0, 1.5, 2.0]
+    scaling_K: float = 2.0
+    scaling_pending: float = 0.0
+    overhead_rate: float = 0.0
 
     qoe_ts = []
     benign_col_dmg_ts = []
     cpu_util_ts = []
     local_num_req_ts = []
     attack_in_rate_ts = []
+    attack_in_rate_std_ts = []
     attack_drop_rate_ts = []
     ema_mom_ts = []
     cpu_to_ids_ratio_ts = []
+    reward_lambda_res_ts = []
+    reward_benign_col_dmg_ts = []
+    reward_qoe_penalty_ts = []
 
     for _k in range(decisions):
         if env.t >= env.t_max:
             break
 
-        obs = build_observation_from_history(env, decision_interval, obs_keys)
+        obs = build_observation_from_history(env, decision_interval, obs_keys,
+                                             scaling_pending=scaling_pending, scaling_K=scaling_K)
         cpu_util = decision_cpu_util(env, decision_interval)
 
-        if method.startswith("constant_"):
-            constant_cpu = float(method.split("_", 1)[1])
-            ids_cpu = np.clip(np.full(n_edges, constant_cpu, dtype=np.float32), ids_cpu_min, ids_cpu_max)
-            delta = np.zeros(n_edges, dtype=np.int64)
-
-        elif method == "random":
-            delta = rng.integers(-1, 2, size=n_edges, dtype=np.int64)
-
-        elif method == "reactive":
-            if cpu_util >= 0.80:
-                delta = np.ones(n_edges, dtype=np.int64)
-            elif cpu_util <= 0.20:
-                delta = -np.ones(n_edges, dtype=np.int64)
-            else:
-                delta = np.zeros(n_edges, dtype=np.int64)
-
-        elif method == "rl":
-            if rl_policy is None:
-                raise ValueError("rl_policy is None but method == 'rl'")
-
-            obs_flat = obs.reshape(-1).astype(np.float32)
-            if rl_policy.obsnorm is not None:
-                obs_flat = rl_policy.normalize_obs_flat(obs_flat)
-
-            delta = rl_policy.act_from_obs_flat(obs_flat)
-
-        elif method == "tbsa":
-            if tbsa_policy is None:
-                raise ValueError("tbsa_policy is None but method == 'tbsa'")
-
-            # Read attack rate and request rate from the last tick only
-            if env.history:
-                last_records = env.history[-n_edges:]
-                last_attack = float(np.mean([r.attack_drop_rate for r in last_records]))
-                last_req = float(np.mean([r.local_num_req for r in last_records]))
-            else:
-                last_attack = 0.0
-                last_req = 0.0
-
-            target_cpu = tbsa_policy.select_ids_cpu(last_attack, last_req)
-            ids_cpu = np.clip(
-                np.full(n_edges, target_cpu, dtype=np.float32),
-                ids_cpu_min,
-                ids_cpu_max,
+        if isinstance(policy, BaselinePolicy):
+            ctx = ActContext(
+                env=env,
+                ids_cpu=ids_cpu,
+                ids_cpu_min=ids_cpu_min,
+                ids_cpu_max=ids_cpu_max,
+                cpu_util=cpu_util,
+                decision_interval=decision_interval,
+                rng=rng,
             )
-            delta = np.zeros(n_edges, dtype=np.int64)  # ids_cpu already set
-
+            ids_cpu_abs, delta = policy.act(ctx)
+            if ids_cpu_abs is not None:
+                ids_cpu = ids_cpu_abs
+                delta = np.zeros(n_edges, dtype=np.int64)
         else:
-            raise ValueError(method)
+            # RLPolicy
+            obs_flat = obs.reshape(-1).astype(np.float32)
+            if policy.obsnorm is not None:
+                obs_flat = policy.normalize_obs_flat(obs_flat)
+            delta = policy.act_from_obs_flat(obs_flat)
 
+        prev_ids_cpu = ids_cpu.copy()
         ids_cpu = apply_delta(ids_cpu, delta, scale_step, ids_cpu_min, ids_cpu_max)
 
+        # Update scaling pending; same direction stacks, opposite subtracts
+        delta_eff = float(ids_cpu[0] - prev_ids_cpu[0])
+        scaling_pending = float(np.clip(scaling_pending + delta_eff, -scaling_K, scaling_K))
+        overhead_rate = _lookup_overhead_rate(scaling_pending, scaling_time_steps, scaling_quanta)
+
         for _ in range(decision_interval):
-            env.step(ids_cpu)
+            if abs(scaling_pending) > 1e-9:
+                consumed = float(np.sign(scaling_pending)) * min(abs(scaling_pending), overhead_rate)
+                scaling_pending -= consumed
+                step_overhead = consumed
+            else:
+                step_overhead = 0.0
+            env.step(ids_cpu, step_overhead)
             if env.t >= env.t_max:
                 break
 
@@ -402,10 +444,29 @@ def run_episode(
         cpu_util_ts.append(cpu_util)
         local_num_req_ts.append(float(df["local_num_req"].mean()) if "local_num_req" in df.columns else 0.0)
         attack_in_rate_ts.append(float(df["attack_in_rate"].mean()) if "attack_in_rate" in df.columns else 0.0)
+        attack_in_rate_std_ts.append(float(df["attack_in_rate"].std()) if "attack_in_rate" in df.columns else 0.0)
         attack_drop_rate_ts.append(float(df["attack_drop_rate"].mean()) if "attack_drop_rate" in df.columns else 0.0)
         ema_mom_ts.append(float(df["ema_mom"].mean()) if "ema_mom" in df.columns else 0.0)
         ratios = ids_cpu / np.array([e.budget.cpu for e in env.edge_areas], dtype=np.float32)
         cpu_to_ids_ratio_ts.append(float(ratios.mean()))
+
+        # Reward component breakdown (same coefficients as _build_reward)
+        _alpha, _beta, _gamma, _q_th = 1.0 / 0.10, 1.0 / 0.20, 1.0 / 0.12, 0.2
+        if "attack_in_rate" in df.columns and "attack_drop_rate" in df.columns and "qoe_mean" in df.columns and "benign_col_dmg" in df.columns:
+            _atk_in = df["attack_in_rate"].values.astype(np.float32)
+            _atk_drop = df["attack_drop_rate"].values.astype(np.float32)
+            _atk_pass = np.maximum(0.0, _atk_in - _atk_drop)
+            _lres = np.where(_atk_in > 1e-6, _atk_pass / _atk_in, 0.0)
+            _qoes = df["qoe_mean"].values.astype(np.float32)
+            _shortfall = np.maximum(0.0, _q_th - _qoes) / max(_q_th, 1e-6)
+            _bcd = df["benign_col_dmg"].values.astype(np.float32)
+            reward_lambda_res_ts.append(float(_beta * np.mean(_lres)))
+            reward_benign_col_dmg_ts.append(float(_gamma * np.mean(_bcd)))
+            reward_qoe_penalty_ts.append(float(_alpha * np.mean(_shortfall)))
+        else:
+            reward_lambda_res_ts.append(0.0)
+            reward_benign_col_dmg_ts.append(0.0)
+            reward_qoe_penalty_ts.append(0.0)
 
     return {
         "qoe": np.asarray(qoe_ts, dtype=np.float32),
@@ -413,24 +474,32 @@ def run_episode(
         "cpu_util": np.asarray(cpu_util_ts, dtype=np.float32),
         "local_num_req": np.asarray(local_num_req_ts, dtype=np.float32),
         "attack_in_rate": np.asarray(attack_in_rate_ts, dtype=np.float32),
+        "attack_in_rate_std": np.asarray(attack_in_rate_std_ts, dtype=np.float32),
         "attack_drop_rate": np.asarray(attack_drop_rate_ts, dtype=np.float32),
         "ema_mom": np.asarray(ema_mom_ts, dtype=np.float32),
         "cpu_to_ids_ratio": np.asarray(cpu_to_ids_ratio_ts, dtype=np.float32),
+        "reward_lambda_res": np.asarray(reward_lambda_res_ts, dtype=np.float32),
+        "reward_benign_col_dmg": np.asarray(reward_benign_col_dmg_ts, dtype=np.float32),
+        "reward_qoe_penalty": np.asarray(reward_qoe_penalty_ts, dtype=np.float32),
     }
 
 
 def plot_ts_continuous(results: Dict[str, Dict[str, np.ndarray]], outpath: Path, slo_qoe_min: float = 0.2, beta=3):
-    fig, axes = plt.subplots(8, 1, figsize=(15,15), sharex=True)
+    fig, axes = plt.subplots(12, 1, figsize=(15, 22), sharex=True)
 
     panels = [
         ("qoe", "QoE"),
         ("benign_col_dmg", "Benign Collateral Damage"),
         ("local_num_req", "Local #Req"),
         ("attack_in_rate", "Attack in rate"),
+        ("attack_in_rate_std", "Attack in rate std"),
         ("attack_drop_rate", "Attack drop rate"),
         ("cpu_util", "CPU Utilization"),
         ("cpu_to_ids_ratio", "CPU→IDS Ratio"),
         ("ema_mom", "EMA Momentum"),
+        ("reward_lambda_res", "Reward: λ_res (attack residual)"),
+        ("reward_benign_col_dmg", "Reward: benign collateral dmg"),
+        ("reward_qoe_penalty", "Reward: QoE shortfall penalty"),
     ]
 
     for ax, (k, ylabel) in zip(axes, panels):
@@ -638,12 +707,12 @@ def main():
     obs_keys = [
         "local_num_req",
         "attack_in_rate",
+        # "attack_in_rate_std",
         "ema_mom",
         "cpu_to_ids_ratio",
         "ids_cpu_utilization",
-        "overhead"
     ]
-    obs_dim = len(obs_keys)
+    obs_dim = len(obs_keys)  # +1 for scaling_pending feature
 
     env = build_env_base(args.cfg)
     n_edges = len(env.edge_areas)
@@ -660,10 +729,9 @@ def main():
         )
 
     # Load TBSA table if it exists
-    tbsa_policy: Optional[TBSAPolicy] = None
     tbsa_table_path = Path(args.tbsa_table)
-    if tbsa_table_path.exists():
-        tbsa_policy = TBSAPolicy(str(tbsa_table_path))
+    tbsa_exists = tbsa_table_path.exists()
+    if tbsa_exists:
         print(f"Loaded TBSA table from {tbsa_table_path}")
     else:
         print(
@@ -671,39 +739,41 @@ def main():
             "Run tbsa_offline.py first to include the 'tbsa' method."
         )
 
-    methods = ["random", "constant_0.5", "constant_1.5", "reactive", "tbsa"] + list(rl_policies.keys())
+    # Build policy registry: name -> policy object
+    policy_registry: Dict[str, object] = {}
+    baseline_names = ["reactive", "tbsa"] if tbsa_exists else ["reactive"]
+    for bname in baseline_names:
+        tbsa_path_str = str(tbsa_table_path) if bname == "tbsa" else None
+        policy_registry[bname] = make_baseline_policy(bname, tbsa_table_path=tbsa_path_str)
+    for name, rp in rl_policies.items():
+        policy_registry[name] = rp
 
-    # methods = ["reactive"] + list(rl_policies.keys())
+    methods = list(policy_registry.keys())
 
-    results: Dict[str, Dict[str, np.ndarray]] = {m: {} for m in methods}
-    for m in methods:
-        results[m] = {
-            "qoe": np.array([], dtype=np.float32),
-            "benign_col_dmg": np.array([], dtype=np.float32),
-            "cpu_util": np.array([], dtype=np.float32),
-            "local_num_req": np.array([], dtype=np.float32),
-            "attack_in_rate": np.array([], dtype=np.float32),
-            "attack_drop_rate": np.array([], dtype=np.float32),
-            "ema_mom": np.array([], dtype=np.float32),
-            "cpu_to_ids_ratio": np.array([], dtype=np.float32),
-        }
+    # methods = ["random", "constant_0.5", "constant_1.5", "reactive", "tbsa"] + list(rl_policies.keys())
+
+    empty_arrays = {
+        k: np.array([], dtype=np.float32) for k in [
+            "qoe", "benign_col_dmg", "cpu_util", "local_num_req",
+            "attack_in_rate", "attack_in_rate_std", "attack_drop_rate",
+            "ema_mom", "cpu_to_ids_ratio",
+            "reward_lambda_res", "reward_benign_col_dmg", "reward_qoe_penalty",
+        ]
+    }
+    results: Dict[str, Dict[str, np.ndarray]] = {m: {k: v.copy() for k, v in empty_arrays.items()} for m in methods}
 
     for ep in tqdm(range(args.episodes)):
         ep_seed = base_seed + ep * 1000
         for m in methods:
-            this_policy = rl_policies.get(m, None)
-
             q = run_episode(
                 env=env,
                 cfg=cfg,
-                method="rl" if this_policy is not None else m,
+                policy=policy_registry[m],
                 decision_interval=args.decision_interval,
                 obs_keys=obs_keys,
                 scale_step=args.scale_step,
                 ids_cpu_min=args.ids_cpu_min,
                 seed=ep_seed,
-                rl_policy=this_policy,
-                tbsa_policy=tbsa_policy,
             )
             for k, v in q.items():
                 results[m][k] = np.concatenate([results[m][k], v])

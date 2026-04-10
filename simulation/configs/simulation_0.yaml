@@ -10,7 +10,8 @@ globals:
   cpu_clock_cycle: 3.8 # Used to convert detection latency to cycle
   cpu_cores: 8
   fps: 5
-  decision_interval: 500
+  decision_interval: 300
+  scaling_time_step: [300, 450, 498, 544] # for 0.5,1.0,1.5,2.0 scaling
 
   ids:
     latency_ms: 0.0357 #0.357
@@ -18,7 +19,7 @@ globals:
   
   attack_sampler:
     n_types: 10
-    pattern_types: [ "sinus", "pw", "expo", "yoyo"]
+    pattern_types: ["sinus", "pw", "expo" ] #, "yoyo"]
     # pattern_types: ["pw"]
     lambda_base:      [7000, 14000]   # flows/sec
     noise_std:        [0.05, 0.10]
@@ -29,6 +30,12 @@ globals:
     # bw_per_flow:      [0.15, 0.30]   # Mbps per flow
     non_defendable_bw_const: 0.0
   
+
+  reward:
+    alpha_inv: 0.10   # QoE shortfall normalizer        (alpha = 1/alpha_inv = 10)
+    beta_inv:  0.20   # Attack residual normalizer       (beta  = 1/beta_inv  =  5)
+    gamma_inv: 0.12   # Benign collateral normalizer     (gamma = 1/gamma_inv ≈  8.33)
+    q_th:      0.20   # QoE shortfall threshold
 
   video_pipeline:
     reid_latency: 20 #! Should consider batch processing
@@ -93,14 +100,15 @@ edge_areas:
 
     ids_config:
       accuracy_by_type:
-        default: [0.00, 0.02]   # single global [FPR, FNR] applied to all attack types
+        #! Explicitly set to 0 for training
+        default: [0.00, 0.00]   # single global [FPR, FNR] applied to all attack types
 
     users:
       - user_id: 0
         synthetic:
           rw_sigma_per_sqrt_sec: 1.2
           mu_min: 20.0 # Before Conversion to per step request = 5.0
-          mu_max: 160.0 # Before Conversion to per step request = 40.0
+          mu_max: 200.0 # Before Conversion to per step request = 40.0
           kappa: 0.25 
           sigma: 8 # Before Conversion to per step request = 0.9
 
