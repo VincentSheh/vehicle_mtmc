@@ -18,7 +18,7 @@ logger:
   backend: wandb
   entity: asture123-national-taiwan-university
   project_name: edgeids
-  exp_name: atk1_noSO_2048_ev4_e10_t030_055
+  exp_name: tdsc
   plots:
     enabled: true
     out_dir: logs/wandb_plots
@@ -55,7 +55,7 @@ loss:
 # =========================
 model:
   hidden_dim: 64           # ActorNet / CriticNet hidden size
-  n_actions: 3             # discrete {scale down, hold, scale up}
+  n_actions: 9             # discrete {scale down, hold, scale up}
 
 # =========================
 # Observation normalization

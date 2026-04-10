@@ -1,231 +1,360 @@
 """
-Evaluate baseline policies and upload results to wandb.
+Evaluate baseline policies and plot results (no wandb).
+
+Each method runs for --episodes episodes; per-decision metrics are
+concatenated across episodes and fed to the same plotting functions
+used by old_policy.py.
 
 Usage:
-    python eval_baselines.py --cfg configs/simulation_0.yaml --episodes 30
+    python eval_baselines.py --cfg configs/simulation_0.yaml --episodes 10
+    python eval_baselines.py --methods reactive random constant_4.0 lstm_rl \
+        --ckpt checkpoints/<run>/ckpt_best.pt --episodes 5
 """
 from __future__ import annotations
 
 import argparse
 import math
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import numpy as np
 import pandas as pd
 import yaml
-import wandb
 from tqdm import tqdm
 
-from environment import build_env_base
-from method_policy import make_baseline_policy, BaselinePolicy
-from policy import (
-    run_episode,
-    build_observation_from_history,
-    decision_cpu_util,
-    apply_delta,
-)
+from environment import build_env_base, TorchRLEnvWrapper
+from method_policy import ActContext, BaselinePolicy, make_baseline_policy
+from old_policy import plot_ts_continuous, plot_qoe_vio_bars
 
-BASELINE_METHODS = ["random", "constant_0.5", "constant_1.5", "reactive", "tbsa"]
+SCALING_K      = 2.0
+SCALING_QUANTA = [0.5, 1.0, 1.5, 2.0]
+
+DEFAULT_METHODS = ["random", "constant_0.5", "constant_1.5", "tbsa", "reactive"]
+DEFAULT_METHODS = ["tbsa", "reactive", "lstm_rl"]
 
 
-def _empty_arrays() -> Dict[str, np.ndarray]:
-    return {k: np.array([], dtype=np.float32) for k in [
-        "qoe", "benign_col_dmg", "cpu_util", "local_num_req",
-        "attack_in_rate", "attack_drop_rate",
-        "reward_lambda_res", "reward_benign_col_dmg", "reward_qoe_penalty",
-    ]}
+# ---------------------------------------------------------------------------
+# Helpers (mirror TorchRLEnvWrapper internals)
+# ---------------------------------------------------------------------------
 
+def _overhead_rate(pending: float, scaling_time_steps: List[int]) -> float:
+    abs_p = abs(pending)
+    if abs_p < 1e-9:
+        return 0.0
+    for i, q in enumerate(SCALING_QUANTA):
+        if abs_p <= q + 1e-9:
+            return abs_p / scaling_time_steps[i]
+    return abs_p / scaling_time_steps[-1]
+
+
+def _build_obs_flat(
+    env,
+    decision_interval: int,
+    obs_keys: List[str],
+    scaling_pending: float,
+) -> np.ndarray:
+    n_edges = len(env.edge_areas)
+    obs_dim = len(obs_keys) + 1
+    obs = np.zeros((n_edges, obs_dim), dtype=np.float32)
+
+    if env.history:
+        records = env.history[-decision_interval * n_edges:]
+        df = pd.DataFrame([m.__dict__ for m in records])
+        for i, area_id in enumerate([e.area_id for e in env.edge_areas]):
+            g = df[df["area_id"] == area_id]
+            if g.empty:
+                continue
+            for j, k in enumerate(obs_keys):
+                if k not in g.columns:
+                    continue
+                vals = g[k].values
+                if k == "I_net":
+                    obs[i, j] = float(np.sum(vals))
+                elif k == "cpu_to_ids_ratio":
+                    obs[i, j] = float(vals[-1])
+                elif k == "ema_mom":
+                    vals_nz = vals[vals != 0.0]
+                    obs[i, j] = float(np.mean(vals_nz)) if len(vals_nz) > 0 else 0.0
+                else:
+                    obs[i, j] = float(np.mean(vals))
+
+    obs[:, -1] = float(np.clip(scaling_pending / SCALING_K, -1.0, 1.0))
+    return obs.reshape(-1).astype(np.float32)
+
+
+def _cpu_util(env, decision_interval: int) -> float:
+    n_edges = len(env.edge_areas)
+    if len(env.history) < decision_interval * n_edges:
+        return 0.0
+    records = env.history[-decision_interval * n_edges:]
+    df = pd.DataFrame([m.__dict__ for m in records])
+    utils = []
+    for edge in env.edge_areas:
+        g = df[df["area_id"] == edge.area_id]
+        if g.empty or "ids_cpu_utilization" not in g.columns:
+            continue
+        utils.append(float(np.clip(np.mean(g["ids_cpu_utilization"].values), 0.0, 1.0)))
+    return float(max(utils)) if utils else 0.0
+
+
+# ---------------------------------------------------------------------------
+# Episode runner — returns the same dict schema as old_policy.run_episode
+# ---------------------------------------------------------------------------
+
+def run_episode(
+    env,
+    cfg: dict,
+    policy: BaselinePolicy,
+    obs_keys: List[str],
+    decision_interval: int,
+    scale_step: float,
+    ids_cpu_min: float,
+    seed: int,
+    reward_alpha: float,
+    reward_beta: float,
+    reward_gamma: float,
+    reward_q_th: float,
+) -> Dict[str, np.ndarray]:
+    """
+    Run one episode with *policy* and return a dict of per-decision arrays
+    (same keys as old_policy.run_episode so the same plotting code works).
+    """
+    env.reset(seed)
+    policy.reset()
+
+    n_edges     = len(env.edge_areas)
+    ids_cpu_max = np.array([e.budget.cpu - 0.5 for e in env.edge_areas], dtype=np.float32)
+    ids_cpu     = np.array([e.ids_cpu for e in env.edge_areas], dtype=np.float32)
+    ids_cpu     = np.clip(ids_cpu, ids_cpu_min, ids_cpu_max)
+
+    scaling_time_steps: List[int] = list(
+        cfg["globals"].get("scaling_time_step", [300, 450, 498, 544])
+    )
+    scaling_pending = 0.0
+    overhead_rate   = 0.0
+    rng = np.random.default_rng(seed)
+
+    decisions = math.ceil(int(cfg["run"]["t_max"]) / decision_interval)
+
+    qoe_ts                = []
+    benign_col_dmg_ts     = []
+    cpu_util_ts           = []
+    local_num_req_ts      = []
+    attack_in_rate_ts     = []
+    attack_in_rate_std_ts = []
+    attack_drop_rate_ts   = []
+    ema_mom_ts            = []
+    cpu_to_ids_ratio_ts   = []
+    reward_lambda_res_ts  = []
+    reward_bcd_ts         = []
+    reward_qoe_penalty_ts = []
+
+    for _ in range(decisions):
+        if env.t >= env.t_max:
+            break
+
+        obs_flat = _build_obs_flat(env, decision_interval, obs_keys, scaling_pending)
+        cpu_util = _cpu_util(env, decision_interval)
+
+        ctx = ActContext(
+            env=env,
+            ids_cpu=ids_cpu.copy(),
+            ids_cpu_min=ids_cpu_min,
+            ids_cpu_max=ids_cpu_max,
+            cpu_util=cpu_util,
+            decision_interval=decision_interval,
+            rng=rng,
+            scaling_pending=scaling_pending,
+            obs_flat=obs_flat,
+        )
+
+        ids_cpu_abs, delta = policy.act(ctx)
+
+        prev_ids_cpu = ids_cpu.copy()
+        if ids_cpu_abs is not None:
+            ids_cpu = np.clip(ids_cpu_abs, ids_cpu_min, ids_cpu_max).astype(np.float32)
+        else:
+            ids_cpu = np.clip(
+                ids_cpu + delta.astype(np.float32) * scale_step,
+                ids_cpu_min,
+                ids_cpu_max,
+            ).astype(np.float32)
+
+        delta_eff       = float(ids_cpu[0] - prev_ids_cpu[0])
+        scaling_pending = float(np.clip(scaling_pending + delta_eff, -SCALING_K, SCALING_K))
+        overhead_rate   = _overhead_rate(scaling_pending, scaling_time_steps)
+
+        for _ in range(decision_interval):
+            if abs(scaling_pending) > 1e-9:
+                consumed        = float(np.sign(scaling_pending)) * min(abs(scaling_pending), overhead_rate)
+                scaling_pending -= consumed
+                step_overhead   = consumed
+            else:
+                step_overhead = 0.0
+            env.step(ids_cpu, step_overhead)
+            if env.t >= env.t_max:
+                break
+
+        # --- aggregate metrics over the just-completed decision window ---
+        window = env.history[-decision_interval * n_edges:]
+        df = pd.DataFrame([m.__dict__ for m in window])
+
+        def _col_mean(col):
+            return float(df[col].mean()) if col in df.columns else 0.0
+
+        qoe_mean = (
+            float(np.mean(df["qoe_mean"].values)) if "qoe_mean" in df.columns else 0.0
+        )
+        bcd_mean = (
+            float(np.mean(df["benign_col_dmg"].values)) if "benign_col_dmg" in df.columns else 0.0
+        )
+
+        qoe_ts.append(qoe_mean)
+        benign_col_dmg_ts.append(bcd_mean)
+        cpu_util_ts.append(cpu_util)
+        local_num_req_ts.append(_col_mean("local_num_req"))
+        attack_in_rate_ts.append(_col_mean("attack_in_rate"))
+        attack_in_rate_std_ts.append(
+            float(df["attack_in_rate"].std()) if "attack_in_rate" in df.columns else 0.0
+        )
+        attack_drop_rate_ts.append(_col_mean("attack_drop_rate"))
+        ema_mom_ts.append(_col_mean("ema_mom"))
+        ratios = ids_cpu / np.array([e.budget.cpu for e in env.edge_areas], dtype=np.float32)
+        cpu_to_ids_ratio_ts.append(float(ratios.mean()))
+
+        # Reward components (same formula as TorchRLEnvWrapper._build_reward)
+        if "attack_in_rate" in df.columns and "attack_drop_rate" in df.columns:
+            atk_in   = df["attack_in_rate"].values.astype(np.float32)
+            atk_drop = df["attack_drop_rate"].values.astype(np.float32)
+            atk_pass = np.maximum(0.0, atk_in - atk_drop)
+            lres     = np.divide(atk_pass, atk_in, out=np.zeros_like(atk_pass), where=atk_in > 1e-6)
+            qoes     = df["qoe_mean"].values.astype(np.float32) if "qoe_mean" in df.columns else np.zeros(len(atk_in))
+            sf       = np.maximum(0.0, reward_q_th - qoes) / max(reward_q_th, 1e-6)
+            bcd_vals = df["benign_col_dmg"].values.astype(np.float32) if "benign_col_dmg" in df.columns else np.zeros(len(atk_in))
+
+            reward_lambda_res_ts.append(float(reward_beta  * np.mean(lres)))
+            reward_bcd_ts.append(       float(reward_gamma * np.mean(bcd_vals)))
+            reward_qoe_penalty_ts.append(float(reward_alpha * np.mean(sf)))
+        else:
+            reward_lambda_res_ts.append(0.0)
+            reward_bcd_ts.append(0.0)
+            reward_qoe_penalty_ts.append(0.0)
+
+    return {
+        "qoe":                  np.asarray(qoe_ts,                dtype=np.float32),
+        "benign_col_dmg":       np.asarray(benign_col_dmg_ts,     dtype=np.float32),
+        "cpu_util":             np.asarray(cpu_util_ts,           dtype=np.float32),
+        "local_num_req":        np.asarray(local_num_req_ts,      dtype=np.float32),
+        "attack_in_rate":       np.asarray(attack_in_rate_ts,     dtype=np.float32),
+        "attack_in_rate_std":   np.asarray(attack_in_rate_std_ts, dtype=np.float32),
+        "attack_drop_rate":     np.asarray(attack_drop_rate_ts,   dtype=np.float32),
+        "ema_mom":              np.asarray(ema_mom_ts,            dtype=np.float32),
+        "cpu_to_ids_ratio":     np.asarray(cpu_to_ids_ratio_ts,   dtype=np.float32),
+        "reward_lambda_res":    np.asarray(reward_lambda_res_ts,  dtype=np.float32),
+        "reward_benign_col_dmg": np.asarray(reward_bcd_ts,        dtype=np.float32),
+        "reward_qoe_penalty":   np.asarray(reward_qoe_penalty_ts, dtype=np.float32),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--cfg",               type=str,   default="./configs/simulation_0.yaml")
-    ap.add_argument("--episodes",          type=int,   default=30)
-    ap.add_argument("--decision_interval", type=int,   default=300)
+    ap = argparse.ArgumentParser(description="Evaluate baseline policies and plot results")
+    ap.add_argument("--cfg",               default="./configs/simulation_0.yaml")
+    ap.add_argument("--outdir",            default="eval_out")
+    ap.add_argument("--episodes",          type=int,   default=10)
+    ap.add_argument("--decision_interval", type=int,   default=None,
+                    help="Overrides globals.decision_interval from cfg if set")
     ap.add_argument("--scale_step",        type=float, default=0.5)
     ap.add_argument("--ids_cpu_min",       type=float, default=0.5)
-    ap.add_argument("--tbsa_table",        type=str,   default="tbsa_table.npz")
-    ap.add_argument("--wandb_project",     type=str,   default="edgeids")
-    ap.add_argument("--wandb_entity",      type=str,   default="asture123-national-taiwan-university")
-    ap.add_argument("--wandb_run_name",    type=str,   default="baselines_eval")
+    ap.add_argument("--methods",           nargs="+",  default=None,
+                    help="Methods to evaluate. Defaults: random constant_0.5 constant_4.0 reactive")
+    ap.add_argument("--tbsa_table",        default="tbsa_table.npz",
+                    help="TBSA lookup-table path (needed when 'tbsa' is in --methods)")
+    ap.add_argument("--ckpt",              default="checkpoints/tdsc/ckpt_iter_000150.pt",
+                    help="Checkpoint path (needed when 'lstm_rl' is in --methods)")
+    ap.add_argument("--device",            default="cpu")
     args = ap.parse_args()
 
-    with open(args.cfg, "r") as f:
+    with open(args.cfg) as f:
         cfg = yaml.safe_load(f)
 
-    base_seed = int(cfg["run"]["seed"])
+    base_seed         = int(cfg["run"]["seed"])
+    decision_interval = args.decision_interval or int(cfg["globals"]["decision_interval"])
 
-    obs_keys = [
-        "local_num_req",
-        "attack_in_rate",
-        "ema_mom",
-        "cpu_to_ids_ratio",
-        "ids_cpu_utilization",
-    ]
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    # Resolve methods list
+    methods: List[str] = args.methods if args.methods else list(DEFAULT_METHODS)
+
+    # Read obs_keys and reward weights from a throw-away wrapper instance
+    _wrapper      = TorchRLEnvWrapper(cfg_path=args.cfg, decision_interval=decision_interval, device="cpu")
+    obs_keys      = _wrapper.obs_keys
+    reward_alpha  = _wrapper.reward_alpha
+    reward_beta   = _wrapper.reward_beta
+    reward_gamma  = _wrapper.reward_gamma
+    reward_q_th   = _wrapper.reward_q_th
+    del _wrapper
 
     env = build_env_base(args.cfg)
 
-    # Build baseline policy objects
+    # Build one policy per method
     tbsa_table_path = Path(args.tbsa_table)
-    tbsa_exists = tbsa_table_path.exists()
-    if not tbsa_exists:
-        print(f"[warn] TBSA table not found at {tbsa_table_path}; skipping 'tbsa' method.")
-
-    methods = [m for m in BASELINE_METHODS if m != "tbsa" or tbsa_exists]
     policies: Dict[str, BaselinePolicy] = {}
     for name in methods:
         tbsa_path = str(tbsa_table_path) if name == "tbsa" else None
-        policies[name] = make_baseline_policy(name, tbsa_table_path=tbsa_path)
+        ckpt      = args.ckpt             if name == "lstm_rl" else None
+        ok_keys   = obs_keys              if name == "lstm_rl" else None
+        try:
+            policies[name] = make_baseline_policy(
+                name,
+                tbsa_table_path=tbsa_path,
+                ckpt_path=ckpt,
+                obs_keys=ok_keys,
+                device=args.device,
+            )
+        except (ValueError, FileNotFoundError) as exc:
+            print(f"[warn] Skipping '{name}': {exc}")
 
-    run = wandb.init(
-        entity=args.wandb_entity,
-        project=args.wandb_project,
-        name=args.wandb_run_name,
-        config={
-            "cfg_path":          args.cfg,
-            "episodes":          args.episodes,
-            "decision_interval": args.decision_interval,
-            "scale_step":        args.scale_step,
-            "ids_cpu_min":       args.ids_cpu_min,
-            "methods":           methods,
-            "env/t_max":         cfg["run"]["t_max"],
-            "env/seed":          cfg["run"]["seed"],
-        },
-    )
+    methods = [m for m in methods if m in policies]
+    if not methods:
+        raise SystemExit("No valid methods to evaluate.")
 
-    wandb.define_metric("episode")
-    wandb.define_metric("ep/*", step_metric="episode")
-    wandb.define_metric("decision_step")
-    wandb.define_metric("ts/*",  step_metric="decision_step")
-
-    # Per-episode accumulators for aggregate stats
-    ep_stats: Dict[str, Dict[str, List[float]]] = {m: {} for m in methods}
-
-    # Decision-step time series table (one row per method × episode × decision-step)
-    ts_table = wandb.Table(columns=[
-        "method", "episode", "decision_step",
-        "qoe", "benign_col_dmg",
-        "attack_in_rate", "attack_drop_rate", "lambda_res_frac",
-        "cpu_to_ids_ratio", "reward_total",
-    ])
+    # Accumulate per-decision results across episodes
+    results: Dict[str, Dict[str, np.ndarray]] = {m: {} for m in methods}
 
     for ep in tqdm(range(args.episodes), desc="episodes"):
         ep_seed = base_seed + ep * 1000
-
         for mname in methods:
-            result = run_episode(
+            ep_result = run_episode(
                 env=env,
                 cfg=cfg,
                 policy=policies[mname],
-                decision_interval=args.decision_interval,
                 obs_keys=obs_keys,
+                decision_interval=decision_interval,
                 scale_step=args.scale_step,
                 ids_cpu_min=args.ids_cpu_min,
                 seed=ep_seed,
+                reward_alpha=reward_alpha,
+                reward_beta=reward_beta,
+                reward_gamma=reward_gamma,
+                reward_q_th=reward_q_th,
             )
-
-            qoe       = result["qoe"]
-            bcd       = result["benign_col_dmg"]
-            atk_in    = result["attack_in_rate"]
-            atk_drop  = result["attack_drop_rate"]
-            r_lres    = result["reward_lambda_res"]
-            r_bcd     = result["reward_benign_col_dmg"]
-            r_qoe     = result["reward_qoe_penalty"]
-            cpu_ratio = result["cpu_to_ids_ratio"]
-
-            # QoE violation rate (fraction below 0.2 SLO)
-            q_th = float(cfg.get("globals", {}).get("reward", {}).get("q_th", 0.20))
-            vio_rate  = float(np.mean((qoe < q_th).astype(np.float32))) if qoe.size else 0.0
-            avg_qoe   = float(np.nanmean(qoe))   if qoe.size   else 0.0
-            avg_bcd   = float(np.nanmean(bcd))   if bcd.size   else 0.0
-            avg_lres  = float(np.nanmean(r_lres)) if r_lres.size else 0.0
-
-            # Total reward per decision step (sum of components, already weighted)
-            reward_ts = -(r_lres + r_bcd + r_qoe)
-
-            # Lambda-res fraction (unweighted) per step
-            with np.errstate(divide="ignore", invalid="ignore"):
-                lres_frac = np.where(atk_in > 1e-6,
-                                     np.maximum(0.0, atk_in - atk_drop) / atk_in,
-                                     0.0)
-
-            # --- per-episode scalar logging ---
-            global_step = ep * len(methods) + methods.index(mname)
-            wandb.log({
-                "episode": ep,
-                f"ep/{mname}/qoe_mean":    avg_qoe,
-                f"ep/{mname}/vio_rate":    vio_rate,
-                f"ep/{mname}/bcd_mean":    avg_bcd,
-                f"ep/{mname}/lambda_res":  avg_lres,
-                f"ep/{mname}/reward_mean": float(np.nanmean(reward_ts)),
-            }, step=global_step)
-
-            # --- decision-step time-series table rows ---
-            for t in range(len(qoe)):
-                r_total = float(-(r_lres[t] + r_bcd[t] + r_qoe[t])) if t < len(r_lres) else 0.0
-                ts_table.add_data(
-                    mname, ep, t,
-                    float(qoe[t]),
-                    float(bcd[t]) if t < len(bcd) else 0.0,
-                    float(atk_in[t]) if t < len(atk_in) else 0.0,
-                    float(atk_drop[t]) if t < len(atk_drop) else 0.0,
-                    float(lres_frac[t]) if t < len(lres_frac) else 0.0,
-                    float(cpu_ratio[t]) if t < len(cpu_ratio) else 0.0,
-                    r_total,
+            for k, v in ep_result.items():
+                results[mname][k] = np.concatenate(
+                    [results[mname].get(k, np.array([], dtype=np.float32)), v]
                 )
 
-            # Accumulate for summary
-            for k, v in [
-                ("qoe_mean",    avg_qoe),
-                ("vio_rate",    vio_rate),
-                ("bcd_mean",    avg_bcd),
-                ("lambda_res",  avg_lres),
-                ("reward_mean", float(np.nanmean(reward_ts))),
-            ]:
-                ep_stats[mname].setdefault(k, []).append(v)
+    # Plot — reuse the plotting functions from old_policy.py
+    ts_path      = outdir / "qoe_ts.png"
+    summary_path = outdir / "summary.png"
+    plot_ts_continuous(results, ts_path,      slo_qoe_min=reward_q_th, beta=3)
+    plot_qoe_vio_bars( results, summary_path, qoe_slo_min=reward_q_th, beta=3)
 
-    # --- Upload decision-step time series table ---
-    wandb.log({"timeseries/decision_steps": ts_table})
-
-    # --- Summary comparison table ---
-    summary_cols = ["method", "qoe_mean", "vio_rate", "bcd_mean", "lambda_res", "reward_mean"]
-    summary_table = wandb.Table(columns=summary_cols)
-
-    bar_data = {k: [] for k in ["method", "qoe_mean", "vio_rate", "bcd_mean", "lambda_res", "reward_mean"]}
-
-    for mname in methods:
-        stats = ep_stats[mname]
-        row_vals = {
-            "method":      mname,
-            "qoe_mean":    float(np.mean(stats.get("qoe_mean",   [0.0]))),
-            "vio_rate":    float(np.mean(stats.get("vio_rate",   [0.0]))),
-            "bcd_mean":    float(np.mean(stats.get("bcd_mean",   [0.0]))),
-            "lambda_res":  float(np.mean(stats.get("lambda_res", [0.0]))),
-            "reward_mean": float(np.mean(stats.get("reward_mean",[0.0]))),
-        }
-        summary_table.add_data(*[row_vals[c] for c in summary_cols])
-        for k in bar_data:
-            bar_data[k].append(row_vals[k])
-
-        # Also log as flat summary scalars
-        wandb.summary[f"{mname}/qoe_mean"]    = row_vals["qoe_mean"]
-        wandb.summary[f"{mname}/vio_rate"]    = row_vals["vio_rate"]
-        wandb.summary[f"{mname}/bcd_mean"]    = row_vals["bcd_mean"]
-        wandb.summary[f"{mname}/lambda_res"]  = row_vals["lambda_res"]
-        wandb.summary[f"{mname}/reward_mean"] = row_vals["reward_mean"]
-
-    wandb.log({"summary/comparison_table": summary_table})
-
-    # Bar charts for key metrics
-    for metric in ["qoe_mean", "vio_rate", "bcd_mean", "lambda_res"]:
-        data = [[m, v] for m, v in zip(bar_data["method"], bar_data[metric])]
-        table = wandb.Table(data=data, columns=["method", metric])
-        wandb.log({
-            f"summary/bar_{metric}": wandb.plot.bar(table, "method", metric, title=metric)
-        })
-
-    run.finish()
-    print(f"\nDone. Results uploaded to wandb run: {run.url}")
+    print(f"Plots saved to {outdir}/")
 
 
 if __name__ == "__main__":

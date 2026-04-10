@@ -257,7 +257,9 @@ class EdgeArea:
                 atk.reset(seed=atk_seed)
             idx = int(self.rng.integers(0, len(self._all_attackers)))
             self.attackers = [self._all_attackers[idx]]
-
+        # 4) Reset IDS
+        self.ids_cpu = 4.0
+        
     def get_state(self) -> dict:
         return {
             "ids_cpu": self.ids_cpu,
@@ -397,7 +399,7 @@ class EdgeArea:
             size_bits = 0.1 * (w * h * 3) * 8
             return size_bits / (1024.0 * 1024.0)
 
-        hs = sorted(set(int(h) for h in upload_hs))
+        hs = sorted(int(h) for h in upload_hs)
         per_req = {h: float(uplink_mbps_for_h(h)) for h in hs}
 
         if passed_req_pre_uplink <= 0 or uplink_available <= 0 or not hs:
@@ -482,8 +484,6 @@ class EdgeArea:
         mean_latency_ms : float
         qoe : float
         """
-        import math
-
         if N <= 0:
             return {}, True, 0, 0.0, 0.0, 1.0
 
@@ -624,10 +624,10 @@ class EdgeArea:
 
         # Detector quality proxy = best achievable accuracy across resolutions
         dets: List[str] = list(dp.keys())
-        det_proxy: Dict[str, float] = {}
-        for d in dets:
-            vals = [float(v) for (dd, _h), v in det_res_map.items() if dd == d]
-            det_proxy[d] = max(vals) if vals else 0.0
+        # pipeline.det_quality[d] already holds max(map) across all resolutions for d
+        det_proxy: Dict[str, float] = {
+            d: float(self.pipeline.det_quality.get(d, 0.0)) for d in dets
+        }
 
         res_list = sorted(up.keys())  # low -> high
         det_list = sorted(dets, key=lambda d: (det_proxy.get(d, 0.0), d))  # low -> high
@@ -666,7 +666,7 @@ class EdgeArea:
         if total <= 0:
             return 0.0, {}
 
-        qmax = max(1e-12, max(float(v) for v in det_res_map.values()))
+        qmax = self.pipeline._qmax_acc
         qoe_sum = 0.0
         for (d, h), n in assign.items():
             q = float(det_res_map[(d, int(h))]) / qmax
@@ -778,11 +778,7 @@ class EdgeArea:
         gamma = float(self.constraints.get("Gamma", 0.0))
 
         # derive detector list
-        dets = []
-        for a in self.pipeline.all_actions():
-            det = a[0] if isinstance(a, tuple) else a
-            dets.append(det)
-        dets = sorted(set(dets))
+        dets = sorted(self.pipeline.det_cycles.keys())
 
         # cost per request for each detector
         det_costs = {det: float(self.pipeline.detection_cycles(det)) for det in dets}

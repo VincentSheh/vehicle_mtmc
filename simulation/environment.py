@@ -449,6 +449,7 @@ class TorchRLEnvWrapper(EnvBase):
         self,
         cfg_path: str,
         decision_interval: int = 300,
+        n_actions: int = N_ACTION,
         seed: int = 0,
         device: str | torch.device = "cpu",
     ):
@@ -460,6 +461,7 @@ class TorchRLEnvWrapper(EnvBase):
         self.episode_id = 0
         self.base_seed = seed
         self.decision_interval = int(decision_interval)
+        self.n_actions = int(n_actions)
         # self._step_count = 0
 
         self.obs_keys = [
@@ -576,7 +578,7 @@ class TorchRLEnvWrapper(EnvBase):
 
         self.action_spec = CompositeSpec(
             action=DiscreteTensorSpec(
-                n=N_ACTION,   # {-1, 0, +1}
+                n=self.n_actions,   # e.g., 9 for {-4, ..., 0, ..., +4} * scale_step
                 # shape=(self.n_edges,),
                 device=self.device,
             )
@@ -677,9 +679,9 @@ class TorchRLEnvWrapper(EnvBase):
         return 0.0        
 
     def _step(self, tensordict: TensorDict) -> TensorDict:
-        action = tensordict["action"]                       # scalar 0/1/2
-        # propose change
-        delta_cmd = (action.to(self.device).float() - int(N_ACTION / 2)) * self.scale_step
+        action = tensordict["action"]                       # scalar 0 to n_actions-1
+        # propose change: center at (n_actions - 1) / 2
+        delta_cmd = (action.to(self.device).float() - ((self.n_actions - 1) / 2.0)) * self.scale_step
         # delta_cmd = self._reactive_delta() * self.scale_step  # -1, 0, +1
 
         prev_ids = self.ids_cpu[0].clone()
@@ -691,14 +693,31 @@ class TorchRLEnvWrapper(EnvBase):
         )
 
         delta_eff = float((self.ids_cpu[0] - prev_ids).item())
-        ids_cpu = self.ids_cpu.clone()
 
-        # Accumulate scaling work; same direction stacks, opposite subtracts.
-        # Clamped to [-K, K] so the lookup table stays valid.
-        self.scaling_pending = float(np.clip(
-            self.scaling_pending + delta_eff, -self.scaling_K, self.scaling_K
-        ))
+        # --- Scaling semantics ---
+        # Scale UP   (+delta): IDS stays at the OLD CPU for the full scaling
+        #                       duration; only switches to the target once pending
+        #                       drains to zero.
+        # Scale DOWN (-delta): IDS immediately runs at the new lower CPU;
+        #                       any previously accumulated scale-up pending is
+        #                       reduced by the down-step magnitude.
+        if delta_eff > 0.0:
+            self.scaling_pending = min(
+                self.scaling_pending + delta_eff, self.scaling_K
+            )
+        else:
+            # Scale-down cancels pending scale-up work; floor at 0.
+            self.scaling_pending = max(0.0, self.scaling_pending + delta_eff)
+
         self.overhead_rate = self._compute_overhead_rate(self.scaling_pending)
+
+        # ids_cpu_eff is what the IDS actually receives each tick:
+        #   - while pending > 0  → target minus pending  (= old value before any of
+        #                           the accumulated scale-up has taken effect)
+        #   - once pending == 0  → target (scale-up complete, or scale-down immediate)
+        ids_cpu_eff = self.ids_cpu.clone()
+        if self.scaling_pending > 1e-9:
+            ids_cpu_eff[0] = self.ids_cpu[0] - self.scaling_pending
 
         total_reward = 0.0
         total_lambda_res = 0.0
@@ -709,17 +728,15 @@ class TorchRLEnvWrapper(EnvBase):
 
         # 2) Simulate decision_interval internal timesteps
         for i in range(self.decision_interval):
-            # Drain scaling overhead one tick at a time, independent of window length
-            if abs(self.scaling_pending) > 1e-9:
-                consumed = float(np.sign(self.scaling_pending)) * min(
-                    abs(self.scaling_pending), self.overhead_rate
-                )
+            # Drain the scale-up pending one tick at a time.
+            if self.scaling_pending > 1e-9:
+                consumed = min(self.scaling_pending, self.overhead_rate)
                 self.scaling_pending -= consumed
-                step_overhead = consumed
-            else:
-                step_overhead = 0.0
+                if self.scaling_pending < 1e-9:
+                    self.scaling_pending = 0.0
+                    ids_cpu_eff[0] = self.ids_cpu[0]   # scale-up now complete
 
-            self.env.step(ids_cpu, step_overhead)
+            self.env.step(ids_cpu_eff, 0.0)
             r = self._build_reward()
             total_reward           += float(r["reward"].item())
             total_lambda_res       += r["lambda_res"]
@@ -829,8 +846,8 @@ class TorchRLEnvWrapper(EnvBase):
         q_th  = self.reward_q_th
 
         attack_pass = np.maximum(0.0, attack_in - attack_drop)
-        lambda_res  = np.where(attack_in > 1e-6, attack_pass / attack_in, 0.0).astype(np.float32)
-
+        lambda_res  = np.divide(attack_pass, attack_in, out=np.zeros_like(attack_pass), where=attack_in > 1e-6).astype(np.float32)
+        
         qoe_shortfall = np.maximum(0.0, q_th - qoe) / max(q_th, 1e-6)
 
         # raw (unweighted) components — used for tracking and print

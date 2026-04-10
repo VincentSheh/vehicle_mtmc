@@ -111,6 +111,7 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
 
     base_env = TorchRLEnvWrapper(
         cfg_path=env_cfg_path,
+        n_actions=train_cfg["model"]["n_actions"],
         seed=env_cfg["run"]["seed"],
         device=device,
         decision_interval=decision_interval,
@@ -156,6 +157,7 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
         def _make():
             return TorchRLEnvWrapper(
                 cfg_path=env_cfg_path,
+                n_actions=train_cfg["model"]["n_actions"],
                 seed=seed_offset,
                 device=device,
                 decision_interval=decision_interval,
@@ -335,17 +337,16 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
             print("batch keys:", batch.keys(True, True))        
 
         # ---- per-decision-step obs logging ----
-        # Each T step in the batch = one action taken by the agent.
-        # Log obs values individually so wandb renders a curve at decision-interval resolution.
+        # Each row after reshape = one decision interval (one action taken by the agent).
+        # reshape(-1, obs_dim) handles any leading batch/env dims (B=1 case: B*T == T).
         obs_keys_full = base_env.obs_keys + ["scaling_pending"]
-        _obs_flat = batch["observation"].float()          # [B, T, obs_dim]
-        _obs_flat = _obs_flat.mean(0).cpu()               # [T, obs_dim]  (mean over envs)
+        _obs_flat = batch["observation"].float().reshape(-1, base_env.obs_dim).cpu()  # [T, obs_dim]
         _T = _obs_flat.shape[0]
         for _t in range(_T):
-            _step_log = {}
+            _step_log = {"decision_step": global_decision_step + _t}
             for _j, _name in enumerate(obs_keys_full):
                 _step_log[f"obs/{_name}"] = float(_obs_flat[_t, _j].item())
-            wandb.log(_step_log, step=global_decision_step + _t)
+            wandb.log(_step_log)
         global_decision_step += _T
 
         # ---- build PPO traj ----
@@ -521,7 +522,6 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
                     "loss/critic":  float(last_out["loss_critic"].detach().item()),
                     "loss/entropy": float(last_out.get("loss_entropy", torch.tensor(0.0, device=device)).detach().item()),
                 },
-                step=global_decision_step - 1,  # align with last decision step of this batch
             )
 
         collector.update_policy_weights_()

@@ -20,13 +20,12 @@ from environment import build_env_base
 from train_mlp import ActorNet as MLPActorNet
 
 # LSTM training code
-from train_lstm import SplitObsModule, MergeModule
+from train_lstm import FeatureNet as LSTMFeatureNet
 
 from tensordict import TensorDict
 from tensordict.nn import TensorDictModule, TensorDictSequential
 from torchrl.modules import LSTMModule
 from tbsa_offline import TBSAPolicy
-from method_policy import BaselinePolicy, ActContext, make_baseline_policy
 
 # =========================================================
 # Policy wrappers
@@ -87,71 +86,49 @@ class MLPPolicy(BaseRLPolicy):
 
 
 class LSTMPolicy(BaseRLPolicy):
-    def __init__(self, ckpt_path: str, obs_size: int = 0, device: str = "cpu", greedy: bool = True):  # obs_size unused; dims read from checkpoint
+    def __init__(self, ckpt_path: str, obs_size: int, device: str = "cpu", greedy: bool = True):
         self.device = torch.device(device)
         self.greedy = greedy
 
         state = torch.load(ckpt_path, map_location=self.device)
         self.obsnorm = state.get("obsnorm", None)
 
-        model_cfg  = state["train_cfg"]["model"]
-        feature_dim = model_cfg["hidden_dim"]
-        n_actions   = model_cfg["n_actions"]
-        n_temporal  = model_cfg["n_temporal"]
-        n_static    = model_cfg["n_static"]
-        temporal_idx = model_cfg["temporal_idx"]
-        static_idx   = model_cfg["static_idx"]
+        feature_dim = state["train_cfg"]["model"]["hidden_dim"]
+        n_actions = state["train_cfg"]["model"]["n_actions"]
 
         self.h_size = feature_dim
         self.n_layers = 1
 
-        # ---- mirror architecture from train_lstm.py ----
-        split_module = TensorDictModule(
-            SplitObsModule(temporal_idx, static_idx).to(self.device),
+        feature_module = TensorDictModule(
+            LSTMFeatureNet(obs_size, feature_dim).to(self.device),
             in_keys=["observation_flat"],
-            out_keys=["temporal_obs", "static_obs"],
+            out_keys=["features"],
         )
 
         self.lstm = LSTMModule(
-            input_size=n_temporal,
+            input_size=feature_dim,
             hidden_size=feature_dim,
-            in_key="temporal_obs",
-            out_key="lstm_out",
+            in_key="features",
+            out_key="features",
             device=self.device,
         )
 
-        merge_module = TensorDictModule(
-            MergeModule().to(self.device),
-            in_keys=["lstm_out", "static_obs"],
-            out_keys=["features_merged"],
-        )
-
         actor_head = TensorDictModule(
-            nn.Linear(feature_dim + n_static, n_actions).to(self.device),
-            in_keys=["features_merged"],
+            nn.Linear(feature_dim, n_actions).to(self.device),
+            in_keys=["features"],
             out_keys=["logits"],
         )
 
-        self.actor = TensorDictSequential(
-            split_module, self.lstm, merge_module, actor_head
-        ).to(self.device)
+        self.actor = TensorDictSequential(feature_module, self.lstm, actor_head).to(self.device)
 
-        # Key remapping: checkpoint saves collector_policy whose module wraps
-        # TDSequential(shared_core, actor_head) with shared_core=TDSeq(split,lstm,merge).
-        # Flatten that nesting to match self.actor = TDSeq(split,lstm,merge,head).
         policy_sd = state["policy"]
+
         mapped_sd = {}
         for k, v in policy_sd.items():
-            if k.startswith("module.0.module.0.module."):
-                new_k = "module.0.module." + k[len("module.0.module.0.module."):]
-            elif k.startswith("module.0.module.1."):
-                new_k = "module.1." + k[len("module.0.module.1."):]
-            elif k.startswith("module.0.module.2."):
-                new_k = "module.2." + k[len("module.0.module.2."):]
-            elif k.startswith("module.1."):
-                new_k = "module.3." + k[len("module.1."):]
-            else:
-                new_k = k
+            new_k = k
+            new_k = new_k.replace("module.0.module.0.module.0.", "module.0.")
+            new_k = new_k.replace("module.0.module.0.module.1.", "module.1.")
+            new_k = new_k.replace("module.0.module.1.", "module.2.")
             mapped_sd[new_k] = v
 
         self.actor.load_state_dict(mapped_sd, strict=False)
@@ -337,15 +314,13 @@ def apply_delta(ids_cpu: np.ndarray, delta: np.ndarray, scale_step: float, ids_c
 def run_episode(
     env,
     cfg: dict,
-    policy,                        # BaselinePolicy | RLPolicy
+    method: str,
     decision_interval: int,
     obs_keys: List[str],
     scale_step: float,
     ids_cpu_min: float,
     seed: int,
-    # Legacy keyword args kept for backwards-compat with main() callers
-    method: Optional[str] = None,
-    rl_policy: Optional[RLPolicy] = None,
+    rl_policy: Optional[RLPolicy],
     tbsa_policy: Optional[TBSAPolicy] = None,
 ) -> Dict[str, np.ndarray]:
     env.reset(seed)
@@ -364,8 +339,8 @@ def run_episode(
 
     decisions = math.ceil(t_max / decision_interval)
 
-    if hasattr(policy, "reset"):
-        policy.reset()
+    if method == "rl" and rl_policy is not None:
+        rl_policy.reset()
 
     # Scaling overhead state (mirrors TorchRLEnvWrapper)
     scaling_time_steps: List[int] = list(cfg["globals"].get("scaling_time_step", [300, 450, 498, 544]))
@@ -395,26 +370,55 @@ def run_episode(
                                              scaling_pending=scaling_pending, scaling_K=scaling_K)
         cpu_util = decision_cpu_util(env, decision_interval)
 
-        if isinstance(policy, BaselinePolicy):
-            ctx = ActContext(
-                env=env,
-                ids_cpu=ids_cpu,
-                ids_cpu_min=ids_cpu_min,
-                ids_cpu_max=ids_cpu_max,
-                cpu_util=cpu_util,
-                decision_interval=decision_interval,
-                rng=rng,
-            )
-            ids_cpu_abs, delta = policy.act(ctx)
-            if ids_cpu_abs is not None:
-                ids_cpu = ids_cpu_abs
+        if method.startswith("constant_"):
+            constant_cpu = float(method.split("_", 1)[1])
+            ids_cpu = np.clip(np.full(n_edges, constant_cpu, dtype=np.float32), ids_cpu_min, ids_cpu_max)
+            delta = np.zeros(n_edges, dtype=np.int64)
+
+        elif method == "random":
+            delta = rng.integers(-1, 2, size=n_edges, dtype=np.int64)
+
+        elif method == "reactive":
+            if cpu_util >= 0.80:
+                delta = np.ones(n_edges, dtype=np.int64)
+            elif cpu_util <= 0.20:
+                delta = -np.ones(n_edges, dtype=np.int64)
+            else:
                 delta = np.zeros(n_edges, dtype=np.int64)
-        else:
-            # RLPolicy
+
+        elif method == "rl":
+            if rl_policy is None:
+                raise ValueError("rl_policy is None but method == 'rl'")
+
             obs_flat = obs.reshape(-1).astype(np.float32)
-            if policy.obsnorm is not None:
-                obs_flat = policy.normalize_obs_flat(obs_flat)
-            delta = policy.act_from_obs_flat(obs_flat)
+            if rl_policy.obsnorm is not None:
+                obs_flat = rl_policy.normalize_obs_flat(obs_flat)
+
+            delta = rl_policy.act_from_obs_flat(obs_flat)
+
+        elif method == "tbsa":
+            if tbsa_policy is None:
+                raise ValueError("tbsa_policy is None but method == 'tbsa'")
+
+            # Read attack rate and request rate from the last tick only
+            if env.history:
+                last_records = env.history[-n_edges:]
+                last_attack = float(np.mean([r.attack_drop_rate for r in last_records]))
+                last_req = float(np.mean([r.local_num_req for r in last_records]))
+            else:
+                last_attack = 0.0
+                last_req = 0.0
+
+            target_cpu = tbsa_policy.select_ids_cpu(last_attack, last_req)
+            ids_cpu = np.clip(
+                np.full(n_edges, target_cpu, dtype=np.float32),
+                ids_cpu_min,
+                ids_cpu_max,
+            )
+            delta = np.zeros(n_edges, dtype=np.int64)  # ids_cpu already set
+
+        else:
+            raise ValueError(method)
 
         prev_ids_cpu = ids_cpu.copy()
         ids_cpu = apply_delta(ids_cpu, delta, scale_step, ids_cpu_min, ids_cpu_max)
@@ -456,7 +460,7 @@ def run_episode(
             _atk_in = df["attack_in_rate"].values.astype(np.float32)
             _atk_drop = df["attack_drop_rate"].values.astype(np.float32)
             _atk_pass = np.maximum(0.0, _atk_in - _atk_drop)
-            _lres = np.where(_atk_in > 1e-6, _atk_pass / _atk_in, 0.0)
+            _lres = np.divide(_atk_pass, _atk_in, out=np.zeros_like(_atk_pass), where=_atk_in > 1e-6)
             _qoes = df["qoe_mean"].values.astype(np.float32)
             _shortfall = np.maximum(0.0, _q_th - _qoes) / max(_q_th, 1e-6)
             _bcd = df["benign_col_dmg"].values.astype(np.float32)
@@ -712,7 +716,7 @@ def main():
         "cpu_to_ids_ratio",
         "ids_cpu_utilization",
     ]
-    obs_dim = len(obs_keys)  # +1 for scaling_pending feature
+    obs_dim = len(obs_keys) +1  # +1 for scaling_pending feature
 
     env = build_env_base(args.cfg)
     n_edges = len(env.edge_areas)
@@ -729,9 +733,10 @@ def main():
         )
 
     # Load TBSA table if it exists
+    tbsa_policy: Optional[TBSAPolicy] = None
     tbsa_table_path = Path(args.tbsa_table)
-    tbsa_exists = tbsa_table_path.exists()
-    if tbsa_exists:
+    if tbsa_table_path.exists():
+        tbsa_policy = TBSAPolicy(str(tbsa_table_path))
         print(f"Loaded TBSA table from {tbsa_table_path}")
     else:
         print(
@@ -739,47 +744,51 @@ def main():
             "Run tbsa_offline.py first to include the 'tbsa' method."
         )
 
-    # Build policy registry: name -> policy object
-    policy_registry: Dict[str, object] = {}
-    baseline_names = ["reactive", "tbsa"] if tbsa_exists else ["reactive"]
-    for bname in baseline_names:
-        tbsa_path_str = str(tbsa_table_path) if bname == "tbsa" else None
-        policy_registry[bname] = make_baseline_policy(bname, tbsa_table_path=tbsa_path_str)
-    for name, rp in rl_policies.items():
-        policy_registry[name] = rp
-
-    methods = list(policy_registry.keys())
-
     # methods = ["random", "constant_0.5", "constant_1.5", "reactive", "tbsa"] + list(rl_policies.keys())
+    methods = ["constant_0.0", "constant_0.5", "constant_1.5"] + list(rl_policies.keys())
 
-    empty_arrays = {
-        k: np.array([], dtype=np.float32) for k in [
-            "qoe", "benign_col_dmg", "cpu_util", "local_num_req",
-            "attack_in_rate", "attack_in_rate_std", "attack_drop_rate",
-            "ema_mom", "cpu_to_ids_ratio",
-            "reward_lambda_res", "reward_benign_col_dmg", "reward_qoe_penalty",
-        ]
-    }
-    results: Dict[str, Dict[str, np.ndarray]] = {m: {k: v.copy() for k, v in empty_arrays.items()} for m in methods}
+    # methods = ["reactive"] + list(rl_policies.keys())
+
+    results: Dict[str, Dict[str, np.ndarray]] = {m: {} for m in methods}
+    for m in methods:
+        results[m] = {
+            "qoe": np.array([], dtype=np.float32),
+            "benign_col_dmg": np.array([], dtype=np.float32),
+            "cpu_util": np.array([], dtype=np.float32),
+            "local_num_req": np.array([], dtype=np.float32),
+            "attack_in_rate": np.array([], dtype=np.float32),
+            "attack_in_rate_std": np.array([], dtype=np.float32),
+            "attack_drop_rate": np.array([], dtype=np.float32),
+            "ema_mom": np.array([], dtype=np.float32),
+            "cpu_to_ids_ratio": np.array([], dtype=np.float32),
+            "reward_lambda_res": np.array([], dtype=np.float32),
+            "reward_benign_col_dmg": np.array([], dtype=np.float32),
+            "reward_qoe_penalty": np.array([], dtype=np.float32),
+        }
 
     for ep in tqdm(range(args.episodes)):
         ep_seed = base_seed + ep * 1000
         for m in methods:
+            this_policy = rl_policies.get(m, None)
+
             q = run_episode(
                 env=env,
                 cfg=cfg,
-                policy=policy_registry[m],
+                method="rl" if this_policy is not None else m,
                 decision_interval=args.decision_interval,
                 obs_keys=obs_keys,
                 scale_step=args.scale_step,
                 ids_cpu_min=args.ids_cpu_min,
                 seed=ep_seed,
+                rl_policy=this_policy,
+                tbsa_policy=tbsa_policy,
             )
             for k, v in q.items():
                 results[m][k] = np.concatenate([results[m][k], v])
 
     plot_ts_continuous(results, outdir / "qoe_ts.png", slo_qoe_min=0.2, beta=3)
     plot_qoe_vio_bars(results, outdir / "summary.png", qoe_slo_min=0.2, beta=3)
+    print("Plots saved in ", outdir)
 
 
 if __name__ == "__main__":

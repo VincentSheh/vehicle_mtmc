@@ -78,7 +78,7 @@ class IDS:
         avg_fpr = default_fpr
 
         # effective drop probability for a benign user request
-        p_drop = float(np.clip(coverage * avg_fpr, 0.0, 1.0))
+        p_drop = min(1.0, max(0.0, coverage * avg_fpr))
 
         # user_drop as a probabilistic (binomial) realization, not a deterministic expectation
         n_user = int(round(float(user_rate)))
@@ -166,6 +166,11 @@ class VideoPipeline:
 
         if not self.det_cycles:
             raise ValueError("VideoPipeline initialized with no detection configs")
+
+        # precomputed normalizer for QoE across all (det, h) entries
+        self._qmax_acc: float = max(
+            (1e-12, *[float(v) for v in self.res_to_acc.values()])
+        )
 
 
     def detection_cycles(self, detector: str) -> float:
