@@ -484,9 +484,9 @@ class TorchRLEnvWrapper(EnvBase):
 
         # Reward weights — read from config so they're tracked and reproducible
         _reward_cfg = _cfg["globals"].get("reward", {})
-        self.reward_alpha = 1.0 / float(_reward_cfg.get("alpha_inv", 0.10))
-        self.reward_beta  = 1.0 / float(_reward_cfg.get("beta_inv",  0.20))
-        self.reward_gamma = 1.0 / float(_reward_cfg.get("gamma_inv", 0.12))
+        self.reward_alpha = float(_reward_cfg.get("alpha_inv", 0.10))
+        self.reward_beta  = float(_reward_cfg.get("beta_inv",  0.20))
+        self.reward_gamma = float(_reward_cfg.get("gamma_inv", 0.12))
         self.reward_q_th  = float(_reward_cfg.get("q_th", 0.20))
         self.scaling_quanta: List[float] = [0.5, 1.0, 1.5, 2.0]
         self.scaling_K: float = 2.0          # max accumulated pending (CPU units)

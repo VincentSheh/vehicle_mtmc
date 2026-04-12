@@ -221,20 +221,30 @@ def run_episode(
                 ids_cpu_max,
             ).astype(np.float32)
 
-        delta_eff       = float(ids_cpu[0] - prev_ids_cpu[0])
-        scaling_pending = float(np.clip(scaling_pending + delta_eff, -SCALING_K, SCALING_K))
-        overhead_rate   = _overhead_rate(scaling_pending, scaling_time_steps)
+        delta_eff = float(ids_cpu[0] - prev_ids_cpu[0])
+        if delta_eff > 0.0:
+            scaling_pending = min(scaling_pending + delta_eff, SCALING_K)
+        else:
+            scaling_pending = max(0.0, scaling_pending + delta_eff)
+        overhead_rate = _overhead_rate(scaling_pending, scaling_time_steps)
+
+        # ids_cpu_eff is what the IDS actually receives:
+        #   scale-up pending → old value until pending drains to zero
+        #   scale-down / hold → new value immediately
+        ids_cpu_eff = ids_cpu.copy()
+        if scaling_pending > 1e-9:
+            ids_cpu_eff[0] = ids_cpu[0] - scaling_pending
 
         # Simulate decision_interval ticks
         for _ in range(decision_interval):
-            if abs(scaling_pending) > 1e-9:
-                consumed        = float(np.sign(scaling_pending)) * min(abs(scaling_pending), overhead_rate)
+            if scaling_pending > 1e-9:
+                consumed         = min(scaling_pending, overhead_rate)
                 scaling_pending -= consumed
-                step_overhead   = consumed
-            else:
-                step_overhead = 0.0
+                if scaling_pending < 1e-9:
+                    scaling_pending  = 0.0
+                    ids_cpu_eff[0]   = ids_cpu[0]   # scale-up complete
 
-            env.step(ids_cpu, step_overhead)
+            env.step(ids_cpu_eff, 0.0)
 
             r = _reward_components(env, n_edges, reward_alpha, reward_beta, reward_gamma, reward_q_th)
             total_reward      += r["reward"]

@@ -745,7 +745,8 @@ def main():
         )
 
     # methods = ["random", "constant_0.5", "constant_1.5", "reactive", "tbsa"] + list(rl_policies.keys())
-    methods = ["constant_0.0", "constant_0.5", "constant_1.5"] + list(rl_policies.keys())
+    # methods = ["constant_0.0", "constant_0.5", "constant_1.5"] + list(rl_policies.keys())
+    methods = ["constant_1.5", "reactive", "tbsa"] + list(rl_policies.keys())
 
     # methods = ["reactive"] + list(rl_policies.keys())
 

@@ -180,18 +180,25 @@ def run_episode(
                 ids_cpu_max,
             ).astype(np.float32)
 
-        delta_eff       = float(ids_cpu[0] - prev_ids_cpu[0])
-        scaling_pending = float(np.clip(scaling_pending + delta_eff, -SCALING_K, SCALING_K))
-        overhead_rate   = _overhead_rate(scaling_pending, scaling_time_steps)
+        delta_eff = float(ids_cpu[0] - prev_ids_cpu[0])
+        if delta_eff > 0.0:
+            scaling_pending = min(scaling_pending + delta_eff, SCALING_K)
+        else:
+            scaling_pending = max(0.0, scaling_pending + delta_eff)
+        overhead_rate = _overhead_rate(scaling_pending, scaling_time_steps)
+
+        ids_cpu_eff = ids_cpu.copy()
+        if scaling_pending > 1e-9:
+            ids_cpu_eff[0] = ids_cpu[0] - scaling_pending
 
         for _ in range(decision_interval):
-            if abs(scaling_pending) > 1e-9:
-                consumed        = float(np.sign(scaling_pending)) * min(abs(scaling_pending), overhead_rate)
+            if scaling_pending > 1e-9:
+                consumed         = min(scaling_pending, overhead_rate)
                 scaling_pending -= consumed
-                step_overhead   = consumed
-            else:
-                step_overhead = 0.0
-            env.step(ids_cpu, step_overhead)
+                if scaling_pending < 1e-9:
+                    scaling_pending = 0.0
+                    ids_cpu_eff[0]  = ids_cpu[0]
+            env.step(ids_cpu_eff, 0.0)
             if env.t >= env.t_max:
                 break
 
@@ -273,7 +280,7 @@ def main():
                     help="Methods to evaluate. Defaults: random constant_0.5 constant_4.0 reactive")
     ap.add_argument("--tbsa_table",        default="tbsa_table.npz",
                     help="TBSA lookup-table path (needed when 'tbsa' is in --methods)")
-    ap.add_argument("--ckpt",              default="checkpoints/tdsc/ckpt_iter_000150.pt",
+    ap.add_argument("--ckpt",              default="checkpoints/tdsc_so_rew/ckpt_iter_000150.pt",
                     help="Checkpoint path (needed when 'lstm_rl' is in --methods)")
     ap.add_argument("--device",            default="cpu")
     args = ap.parse_args()
