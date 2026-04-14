@@ -506,6 +506,9 @@ class TorchRLEnvWrapper(EnvBase):
             device=self.device,
             dtype=torch.float32,
         )
+        # Last fully-completed IDS CPU allocation (unit-step model: eff stays here
+        # until pending drains to zero, then jumps to ids_cpu).
+        self.ids_cpu_settled = self.ids_cpu.clone()
 
         self._set_seed(seed)
         self._make_specs()
@@ -630,6 +633,7 @@ class TorchRLEnvWrapper(EnvBase):
         # Clear scaling state
         self.scaling_pending = 0.0
         self.overhead_rate = 0.0
+        self.ids_cpu_settled = self.ids_cpu.clone()
 
 
         obs = self._build_observation().to(self.device)
@@ -694,30 +698,40 @@ class TorchRLEnvWrapper(EnvBase):
 
         delta_eff = float((self.ids_cpu[0] - prev_ids).item())
 
-        # --- Scaling semantics ---
-        # Scale UP   (+delta): IDS stays at the OLD CPU for the full scaling
-        #                       duration; only switches to the target once pending
-        #                       drains to zero.
-        # Scale DOWN (-delta): IDS immediately runs at the new lower CPU;
-        #                       any previously accumulated scale-up pending is
-        #                       reduced by the down-step magnitude.
-        if delta_eff > 0.0:
-            self.scaling_pending = min(
-                self.scaling_pending + delta_eff, self.scaling_K
-            )
-        else:
-            # Scale-down cancels pending scale-up work; floor at 0.
-            self.scaling_pending = max(0.0, self.scaling_pending + delta_eff)
+        # --- Scaling semantics (unit-step, asymmetric) ---
+        # Descaling is immediate; scaling-up is a transition:
+        #
+        #   IDS scale-up  (delta > 0):
+        #     - IDS holds at ids_cpu_settled until pending drains (unit step)
+        #     - VA immediately drops to budget - target
+        #
+        #   IDS scale-down (delta < 0):
+        #     - IDS immediately drops to target
+        #     - VA holds at budget - ids_cpu_settled until pending drains (unit step)
+        #
+        # In both cases step_overhead = -abs(target - settled), a constant that
+        # makes _run_step_once produce the correct va_cpu_eff throughout transition.
+        self.scaling_pending = float(np.clip(
+            self.scaling_pending + delta_eff, -self.scaling_K, self.scaling_K
+        ))
 
-        self.overhead_rate = self._compute_overhead_rate(self.scaling_pending)
+        # If target returned to settled there is no transition to perform.
+        delta_to_settled = float(self.ids_cpu[0].item()) - float(self.ids_cpu_settled[0].item())
+        if abs(delta_to_settled) < 1e-9:
+            self.scaling_pending = 0.0
 
-        # ids_cpu_eff is what the IDS actually receives each tick:
-        #   - while pending > 0  → target minus pending  (= old value before any of
-        #                           the accumulated scale-up has taken effect)
-        #   - once pending == 0  → target (scale-up complete, or scale-down immediate)
+        self.overhead_rate = self._compute_overhead_rate(delta_to_settled)
+
+        # ids_cpu_eff: IDS holds during scale-up; drops immediately on scale-down.
         ids_cpu_eff = self.ids_cpu.clone()
-        if self.scaling_pending > 1e-9:
-            ids_cpu_eff[0] = self.ids_cpu[0] - self.scaling_pending
+        if self.scaling_pending > 1e-9:          # scale-up: IDS holds at settled
+            ids_cpu_eff[0] = float(self.ids_cpu_settled[0].item())
+        # else (scale-down or settled): ids_cpu_eff already = target
+
+        # Constant overhead bridges the gap so that:
+        #   scale-up:   va_cpu_eff = budget - target   (VA drops immediately)
+        #   scale-down: va_cpu_eff = budget - settled  (VA holds until done)
+        step_overhead = -abs(delta_to_settled) if abs(self.scaling_pending) > 1e-9 else 0.0
 
         total_reward = 0.0
         total_lambda_res = 0.0
@@ -727,16 +741,19 @@ class TorchRLEnvWrapper(EnvBase):
         steps = 0
 
         # 2) Simulate decision_interval internal timesteps
-        for i in range(self.decision_interval):
-            # Drain the scale-up pending one tick at a time.
-            if self.scaling_pending > 1e-9:
-                consumed = min(self.scaling_pending, self.overhead_rate)
-                self.scaling_pending -= consumed
-                if self.scaling_pending < 1e-9:
+        for _ in range(self.decision_interval):
+            # Drain pending toward zero one tick at a time.
+            if abs(self.scaling_pending) > 1e-9:
+                sign = 1.0 if self.scaling_pending > 0.0 else -1.0
+                consumed = min(abs(self.scaling_pending), self.overhead_rate)
+                self.scaling_pending -= sign * consumed
+                if abs(self.scaling_pending) < 1e-9:
                     self.scaling_pending = 0.0
-                    ids_cpu_eff[0] = self.ids_cpu[0]   # scale-up now complete
+                    self.ids_cpu_settled[0] = self.ids_cpu[0]   # commit
+                    ids_cpu_eff[0] = float(self.ids_cpu[0].item())  # unit-step jump
+                    step_overhead = 0.0                             # overhead clears
 
-            self.env.step(ids_cpu_eff, 0.0)
+            self.env.step(ids_cpu_eff, step_overhead)
             r = self._build_reward()
             total_reward           += float(r["reward"].item())
             total_lambda_res       += r["lambda_res"]

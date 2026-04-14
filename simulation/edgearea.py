@@ -258,7 +258,7 @@ class EdgeArea:
             idx = int(self.rng.integers(0, len(self._all_attackers)))
             self.attackers = [self._all_attackers[idx]]
         # 4) Reset IDS
-        self.ids_cpu = 4.0
+        self.ids_cpu = 1.0
         
     def get_state(self) -> dict:
         return {
@@ -756,8 +756,8 @@ class EdgeArea:
                 "od_plan": {},
                 "served_req": 0,
                 "dropped_compute": int(total_req_in),
-                "va_cpu_utilization": min(1,(attack_cycles_per_ms + self.ids_cpu * self.cpu_cycle_per_ms) / avail_cycles_per_ms),
-                "attack_cpu_frac": min(1.0, attack_cycles_per_ms / avail_cycles_per_ms),
+                "va_cpu_utilization": 1.0 if avail_cycles_per_ms < 1e-12 else min(1.0, (attack_cycles_per_ms + self.ids_cpu * self.cpu_cycle_per_ms) / avail_cycles_per_ms),
+                "attack_cpu_frac": 1.0 if avail_cycles_per_ms < 1e-12 else min(1.0, attack_cycles_per_ms / avail_cycles_per_ms),
                 "uplink_util": 1,
                 "mean_latency_ms": float("inf"),
                 "qoe": 0.0,

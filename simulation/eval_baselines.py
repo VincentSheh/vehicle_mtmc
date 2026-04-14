@@ -130,8 +130,9 @@ def run_episode(
     scaling_time_steps: List[int] = list(
         cfg["globals"].get("scaling_time_step", [300, 450, 498, 544])
     )
-    scaling_pending = 0.0
-    overhead_rate   = 0.0
+    scaling_pending  = 0.0
+    overhead_rate    = 0.0
+    ids_cpu_settled  = ids_cpu.copy()   # last completed IDS CPU (unit-step model)
     rng = np.random.default_rng(seed)
 
     decisions = math.ceil(int(cfg["run"]["t_max"]) / decision_interval)
@@ -181,24 +182,37 @@ def run_episode(
             ).astype(np.float32)
 
         delta_eff = float(ids_cpu[0] - prev_ids_cpu[0])
-        if delta_eff > 0.0:
-            scaling_pending = min(scaling_pending + delta_eff, SCALING_K)
-        else:
-            scaling_pending = max(0.0, scaling_pending + delta_eff)
-        overhead_rate = _overhead_rate(scaling_pending, scaling_time_steps)
+        # Asymmetric unit-step: descaling is immediate, scaling-up is a transition.
+        #   IDS scale-up:   IDS holds at settled, VA immediately at budget-target.
+        #   IDS scale-down: IDS immediately at target, VA holds at budget-settled.
+        scaling_pending = float(np.clip(scaling_pending + delta_eff, -SCALING_K, SCALING_K))
+
+        # No transition needed if target returned to settled.
+        delta_to_settled = float(ids_cpu[0]) - float(ids_cpu_settled[0])
+        if abs(delta_to_settled) < 1e-9:
+            scaling_pending = 0.0
+
+        overhead_rate = _overhead_rate(delta_to_settled, scaling_time_steps)
 
         ids_cpu_eff = ids_cpu.copy()
-        if scaling_pending > 1e-9:
-            ids_cpu_eff[0] = ids_cpu[0] - scaling_pending
+        if scaling_pending > 1e-9:               # scale-up: IDS holds at settled
+            ids_cpu_eff[0] = float(ids_cpu_settled[0])
+        # else (scale-down or settled): ids_cpu_eff already = target
+
+        # Constant overhead: bridges gap so va_cpu_eff is correct throughout.
+        step_overhead = -abs(delta_to_settled) if abs(scaling_pending) > 1e-9 else 0.0
 
         for _ in range(decision_interval):
-            if scaling_pending > 1e-9:
-                consumed         = min(scaling_pending, overhead_rate)
-                scaling_pending -= consumed
-                if scaling_pending < 1e-9:
-                    scaling_pending = 0.0
-                    ids_cpu_eff[0]  = ids_cpu[0]
-            env.step(ids_cpu_eff, 0.0)
+            if abs(scaling_pending) > 1e-9:
+                sign             = 1.0 if scaling_pending > 0.0 else -1.0
+                consumed         = min(abs(scaling_pending), overhead_rate)
+                scaling_pending -= sign * consumed
+                if abs(scaling_pending) < 1e-9:
+                    scaling_pending    = 0.0
+                    ids_cpu_settled[0] = ids_cpu[0]   # commit
+                    ids_cpu_eff[0]     = ids_cpu[0]   # unit-step jump
+                    step_overhead      = 0.0           # overhead clears
+            env.step(ids_cpu_eff, step_overhead)
             if env.t >= env.t_max:
                 break
 
@@ -280,7 +294,8 @@ def main():
                     help="Methods to evaluate. Defaults: random constant_0.5 constant_4.0 reactive")
     ap.add_argument("--tbsa_table",        default="tbsa_table.npz",
                     help="TBSA lookup-table path (needed when 'tbsa' is in --methods)")
-    ap.add_argument("--ckpt",              default="checkpoints/tdsc_so_rew/ckpt_iter_000150.pt",
+    ap.add_argument("--ckpt",              default="checkpoints/tdsc_so/ckpt_iter_000300.pt",
+    # ap.add_argument("--ckpt",              default="checkpoints/tdsc_so/ckpt_best.pt",
                     help="Checkpoint path (needed when 'lstm_rl' is in --methods)")
     ap.add_argument("--device",            default="cpu")
     args = ap.parse_args()

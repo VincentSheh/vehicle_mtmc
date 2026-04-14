@@ -14,8 +14,10 @@ mot/deep_sort_orig/
 __py*
 .venv
 .jedi
-simulation/wandb/
-simulation/eval_out/
-simulation/logs/
+simulation/wandb/*
+simulation/eval_out/*
+simulation/logs/*
+simulation/output/*
+simulation/visualization/output/*
 *.csv
 *.png

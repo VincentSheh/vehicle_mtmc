@@ -18,7 +18,7 @@ logger:
   backend: wandb
   entity: asture123-national-taiwan-university
   project_name: edgeids
-  exp_name: tdsc_so_rew
+  exp_name: tdsc_so_rew_32_ids15
   plots:
     enabled: true
     out_dir: logs/wandb_plots
@@ -48,7 +48,7 @@ loss:
   entropy_coeff: 2.0e-3    # matches entropy_coef=1e-3
   loss_critic_type: smooth_l1
   normalize_advantage: false  # you normalize manually
-  seq_len: 16
+  seq_len: 32
 
 # =========================
 # Model

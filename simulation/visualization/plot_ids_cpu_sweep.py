@@ -33,7 +33,7 @@ def _fix_attack_lambda(env, cfg_path: str):
             ]
 
 
-def _fix_users(env, mu0 = 10):
+def _fix_users(env, mu0 = 40):
     """Scale mu_min/mu_max/sigma from the config's per-step intent to per-sec
     so that generate_req_trace (which multiplies by dt=slot_ms/1000) produces
     the originally intended per-step request rates."""
@@ -211,8 +211,6 @@ def run_sweep(cfg_path: str, plot: bool = False, out_dir: str = "./output/env_sw
     # ------------------------------------------------------------------
     # Time-series plots (from last ids_cpu sweep point)
     # ------------------------------------------------------------------
-    ts_dir = os.path.join(out_dir, "timeseries")
-    os.makedirs(ts_dir, exist_ok=True)
 
     print(f"\nSweep results saved to {out_dir}/")
     return result_df
