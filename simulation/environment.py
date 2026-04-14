@@ -280,6 +280,7 @@ class Environment:
                 viol_rate = float(viol.mean()) if len(viol) > 0 else 0.0
                 V_edge = np.exp(-edge.slo_beta * viol_rate)
 
+                # qoe_slo.append(float(qoes.mean()) * 1)
                 qoe_slo.append(float(qoes.mean()) * V_edge)
 
             self.final_qoe = np.mean(qoe_slo) if len(qoe_slo) > 0 else 0.0        

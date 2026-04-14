@@ -245,15 +245,40 @@ class LSTMRLPolicy(BaselinePolicy):
         self.net.eval()
 
         # ---- observation normalisation -----------------------------------
+        # TransformedEnv(Compose(InitTracker, lstm_primer, ObservationNorm))
+        # saves state as: transforms.2.loc / transforms.2.scale / transforms.2.standard_normal
+        _OBSNORM_LOC_KEY   = "transforms.2.loc"
+        _OBSNORM_SCALE_KEY = "transforms.2.scale"
+        _OBSNORM_STD_KEY   = "transforms.2.standard_normal"
+
         obsnorm = state.get("obsnorm", None)
         self.obs_loc   = None
         self.obs_scale = None
-        if obsnorm is not None:
+        if obsnorm is None:
+            print("[LSTMRLPolicy] WARNING: checkpoint has no 'obsnorm' — running WITHOUT normalisation")
+        elif _OBSNORM_LOC_KEY in obsnorm and _OBSNORM_SCALE_KEY in obsnorm:
+            _sn = obsnorm.get(_OBSNORM_STD_KEY, True)
+            std_normal = bool(_sn.item() if hasattr(_sn, "item") else _sn)
+            if not std_normal:
+                raise ValueError(
+                    "LSTMRLPolicy only supports standard_normal=True ObservationNorm; "
+                    "checkpoint was saved with standard_normal=False"
+                )
+            self.obs_loc   = obsnorm[_OBSNORM_LOC_KEY].detach().to(self.device).reshape(-1)
+            self.obs_scale = obsnorm[_OBSNORM_SCALE_KEY].detach().to(self.device).reshape(-1)
+            print(f"[LSTMRLPolicy] ObsNorm loaded: loc={self.obs_loc.tolist()}, scale={self.obs_scale.tolist()}")
+        else:
+            # Fallback: search by suffix (warns so silent failure is impossible)
             loc_key   = next((k for k in obsnorm if k.endswith("loc")),   None)
             scale_key = next((k for k in obsnorm if k.endswith("scale")), None)
             if loc_key and scale_key:
+                print(f"[LSTMRLPolicy] WARNING: expected keys {_OBSNORM_LOC_KEY!r}/{_OBSNORM_SCALE_KEY!r} "
+                      f"not found; falling back to suffix match: {loc_key!r}/{scale_key!r}")
                 self.obs_loc   = obsnorm[loc_key].detach().to(self.device).reshape(-1)
                 self.obs_scale = obsnorm[scale_key].detach().to(self.device).reshape(-1)
+            else:
+                print(f"[LSTMRLPolicy] WARNING: no loc/scale keys found in obsnorm "
+                      f"(keys: {list(obsnorm.keys())}) — running WITHOUT normalisation")
 
         self._h: Optional[object] = None
         self._c: Optional[object] = None

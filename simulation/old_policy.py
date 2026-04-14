@@ -350,6 +350,7 @@ def run_episode(
     overhead_rate: float = 0.0
 
     qoe_ts = []
+    qoe_vio_rate_ts = []
     benign_col_dmg_ts = []
     cpu_util_ts = []
     local_num_req_ts = []
@@ -443,7 +444,12 @@ def run_episode(
         block = env.history[-decision_interval * n_edges :]
         df = pd.DataFrame([m.__dict__ for m in block])
 
+        qoes_step = df["qoe_mean"].values.astype(np.float32)
+        v_rate = float(np.mean(qoes_step < 0.2)) # Hardcoded 0.2 for legacy script
+   
+
         qoe_ts.append(qoe)
+        qoe_vio_rate_ts.append(v_rate)
         benign_col_dmg_ts.append(benign_col_dmg)
         cpu_util_ts.append(cpu_util)
         local_num_req_ts.append(float(df["local_num_req"].mean()) if "local_num_req" in df.columns else 0.0)
@@ -464,16 +470,16 @@ def run_episode(
             _qoes = df["qoe_mean"].values.astype(np.float32)
             _shortfall = np.maximum(0.0, _q_th - _qoes) / max(_q_th, 1e-6)
             _bcd = df["benign_col_dmg"].values.astype(np.float32)
-            reward_lambda_res_ts.append(float(_beta * np.mean(_lres)))
-            reward_benign_col_dmg_ts.append(float(_gamma * np.mean(_bcd)))
-            reward_qoe_penalty_ts.append(float(_alpha * np.mean(_shortfall)))
+            reward_lambda_res_ts.append(float(np.mean(_lres)))
+            reward_benign_col_dmg_ts.append(float(np.mean(_bcd)))
+            reward_qoe_penalty_ts.append(float(np.mean(_shortfall)))
         else:
             reward_lambda_res_ts.append(0.0)
             reward_benign_col_dmg_ts.append(0.0)
             reward_qoe_penalty_ts.append(0.0)
-
     return {
         "qoe": np.asarray(qoe_ts, dtype=np.float32),
+        "qoe_vio_rate": np.asarray(qoe_vio_rate_ts, dtype=np.float32),
         "benign_col_dmg": np.asarray(benign_col_dmg_ts, dtype=np.float32),
         "cpu_util": np.asarray(cpu_util_ts, dtype=np.float32),
         "local_num_req": np.asarray(local_num_req_ts, dtype=np.float32),
@@ -496,14 +502,13 @@ def plot_ts_continuous(results: Dict[str, Dict[str, np.ndarray]], outpath: Path,
         ("benign_col_dmg", "Benign Collateral Damage"),
         ("local_num_req", "Local #Req"),
         ("attack_in_rate", "Attack in rate"),
-        ("attack_in_rate_std", "Attack in rate std"),
         ("attack_drop_rate", "Attack drop rate"),
         ("cpu_util", "CPU Utilization"),
         ("cpu_to_ids_ratio", "CPU→IDS Ratio"),
         ("ema_mom", "EMA Momentum"),
-        ("reward_lambda_res", "Reward: λ_res (attack residual)"),
-        ("reward_benign_col_dmg", "Reward: benign collateral dmg"),
-        ("reward_qoe_penalty", "Reward: QoE shortfall penalty"),
+        ("reward_lambda_res", "Raw Factor: λ_res (leakage)"),
+        ("reward_benign_col_dmg", "Raw Factor: Benign Collateral Dmg"),
+        ("reward_qoe_penalty", "Raw Factor: QoE Shortfall"),
     ]
 
     for ax, (k, ylabel) in zip(axes, panels):
@@ -560,7 +565,11 @@ def plot_qoe_vio_bars(results: Dict[str, Dict[str, np.ndarray]],
         if q.size == 0:
             continue
 
-        vr = float(np.mean((q < qoe_slo_min).astype(np.float32)))
+        qoe_vio_rate = series.get("qoe_vio_rate", None)
+        if qoe_vio_rate is not None and qoe_vio_rate.size > 0:
+            vr = float(np.mean(qoe_vio_rate))
+        else:
+            vr = float(np.mean((q < qoe_slo_min).astype(np.float32)))
         v = float(np.exp(-beta * vr))
 
         methods.append(method)
@@ -574,22 +583,16 @@ def plot_qoe_vio_bars(results: Dict[str, Dict[str, np.ndarray]],
             b = b[np.isfinite(b)]
             avg_benign_col_dmg.append(float(np.mean(b)) if b.size > 0 else np.nan)
 
-        if attack_drop_rate_ts is None or attack_in_rate_ts is None:
-            avg_attack_drop_pct.append(np.nan)
+        # 1 - lambda_res: matches the atk_drop_pct column in the eval summary
+        # table. lambda_res is averaged only over active attack ticks so this
+        # is the true per-tick drop fraction during attacks.
+        lres_ts = series.get("reward_lambda_res", None)
+        if lres_ts is not None and np.asarray(lres_ts).size > 0:
+            lres = np.asarray(lres_ts, dtype=np.float32).reshape(-1)
+            lres = lres[np.isfinite(lres)]
+            avg_attack_drop_pct.append(float(1.0 - np.mean(lres)) if lres.size > 0 else np.nan)
         else:
-            drop = np.asarray(attack_drop_rate_ts, dtype=np.float32).reshape(-1)
-            atk_in = np.asarray(attack_in_rate_ts, dtype=np.float32).reshape(-1)
-
-            m = min(len(drop), len(atk_in))
-            drop = drop[:m]
-            atk_in = atk_in[:m]
-
-            valid = np.isfinite(drop) & np.isfinite(atk_in) & (atk_in > 0)
-            if np.any(valid):
-                drop_pct = drop[valid] / atk_in[valid]
-                avg_attack_drop_pct.append(float(np.mean(drop_pct)))
-            else:
-                avg_attack_drop_pct.append(np.nan)
+            avg_attack_drop_pct.append(np.nan)
 
     x = np.arange(len(methods), dtype=np.int32)
     width = 0.7

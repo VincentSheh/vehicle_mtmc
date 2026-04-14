@@ -15,7 +15,7 @@ from __future__ import annotations
 import argparse
 import math
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -30,7 +30,7 @@ SCALING_K      = 2.0
 SCALING_QUANTA = [0.5, 1.0, 1.5, 2.0]
 
 DEFAULT_METHODS = ["random", "constant_0.5", "constant_1.5", "tbsa", "reactive"]
-DEFAULT_METHODS = ["tbsa", "reactive", "lstm_rl"]
+DEFAULT_METHODS = ["reactive", "lstm_rl"]
 
 
 # ---------------------------------------------------------------------------
@@ -114,17 +114,23 @@ def run_episode(
     reward_beta: float,
     reward_gamma: float,
     reward_q_th: float,
-) -> Dict[str, np.ndarray]:
+    initial_ids_cpu: Optional[np.ndarray] = None,
+) -> Tuple[Dict[str, np.ndarray], np.ndarray]:
     """
     Run one episode with *policy* and return a dict of per-decision arrays
-    (same keys as old_policy.run_episode so the same plotting code works).
+    and the final ids_cpu state for carry-over.
     """
     env.reset(seed)
     policy.reset()
 
     n_edges     = len(env.edge_areas)
     ids_cpu_max = np.array([e.budget.cpu - 0.5 for e in env.edge_areas], dtype=np.float32)
-    ids_cpu     = np.array([e.ids_cpu for e in env.edge_areas], dtype=np.float32)
+    
+    if initial_ids_cpu is not None:
+        ids_cpu = initial_ids_cpu.copy()
+    else:
+        ids_cpu = np.array([e.ids_cpu for e in env.edge_areas], dtype=np.float32)
+    
     ids_cpu     = np.clip(ids_cpu, ids_cpu_min, ids_cpu_max)
 
     scaling_time_steps: List[int] = list(
@@ -132,7 +138,7 @@ def run_episode(
     )
     scaling_pending  = 0.0
     overhead_rate    = 0.0
-    ids_cpu_settled  = ids_cpu.copy()   # last completed IDS CPU (unit-step model)
+    ids_cpu_settled  = ids_cpu.copy()   # matches TorchRLEnvWrapper._reset logic
     rng = np.random.default_rng(seed)
 
     decisions = math.ceil(int(cfg["run"]["t_max"]) / decision_interval)
@@ -146,9 +152,11 @@ def run_episode(
     attack_drop_rate_ts   = []
     ema_mom_ts            = []
     cpu_to_ids_ratio_ts   = []
+    qoe_vio_rate_ts       = []
     reward_lambda_res_ts  = []
     reward_bcd_ts         = []
     reward_qoe_penalty_ts = []
+    reward_ts             = []
 
     for _ in range(decisions):
         if env.t >= env.t_max:
@@ -223,14 +231,18 @@ def run_episode(
         def _col_mean(col):
             return float(df[col].mean()) if col in df.columns else 0.0
 
-        qoe_mean = (
-            float(np.mean(df["qoe_mean"].values)) if "qoe_mean" in df.columns else 0.0
-        )
+        qoe_vals = df["qoe_mean"].values.astype(np.float32) if "qoe_mean" in df.columns else np.array([])
+        qoe_mean = float(np.mean(qoe_vals)) if qoe_vals.size > 0 else 0.0
+        
+        # PER-STEP VIOLATION RATE (Matches TorchRLEnvWrapper)
+        v_rate = float(np.mean(qoe_vals < reward_q_th)) if qoe_vals.size > 0 else 0.0
+        
         bcd_mean = (
             float(np.mean(df["benign_col_dmg"].values)) if "benign_col_dmg" in df.columns else 0.0
         )
 
         qoe_ts.append(qoe_mean)
+        qoe_vio_rate_ts.append(v_rate)
         benign_col_dmg_ts.append(bcd_mean)
         cpu_util_ts.append(cpu_util)
         local_num_req_ts.append(_col_mean("local_num_req"))
@@ -253,16 +265,27 @@ def run_episode(
             sf       = np.maximum(0.0, reward_q_th - qoes) / max(reward_q_th, 1e-6)
             bcd_vals = df["benign_col_dmg"].values.astype(np.float32) if "benign_col_dmg" in df.columns else np.zeros(len(atk_in))
 
-            reward_lambda_res_ts.append(float(reward_beta  * np.mean(lres)))
-            reward_bcd_ts.append(       float(reward_gamma * np.mean(bcd_vals)))
-            reward_qoe_penalty_ts.append(float(reward_alpha * np.mean(sf)))
+            # Only average lres over ticks where attacks are actually present.
+            # Including zero-attack ticks (lres=0) inflates the apparent drop
+            # rate by counting quiet periods as "100% defended".
+            active = atk_in > 1e-6
+            r_lres = float(np.mean(lres[active])) if np.any(active) else 0.0
+            r_bcd  = float(np.mean(bcd_vals))
+            r_sf   = float(np.mean(sf))
+            reward_lambda_res_ts.append(r_lres)
+            reward_bcd_ts.append(r_bcd)
+            reward_qoe_penalty_ts.append(r_sf)
+            # Weighted reward scalar — same formula as TorchRLEnvWrapper._build_reward
+            reward_ts.append(-(reward_alpha * r_sf + reward_beta * r_lres + reward_gamma * r_bcd))
         else:
             reward_lambda_res_ts.append(0.0)
             reward_bcd_ts.append(0.0)
             reward_qoe_penalty_ts.append(0.0)
+            reward_ts.append(0.0)
 
-    return {
+    res = {
         "qoe":                  np.asarray(qoe_ts,                dtype=np.float32),
+        "qoe_vio_rate":         np.asarray(qoe_vio_rate_ts,       dtype=np.float32),
         "benign_col_dmg":       np.asarray(benign_col_dmg_ts,     dtype=np.float32),
         "cpu_util":             np.asarray(cpu_util_ts,           dtype=np.float32),
         "local_num_req":        np.asarray(local_num_req_ts,      dtype=np.float32),
@@ -274,7 +297,9 @@ def run_episode(
         "reward_lambda_res":    np.asarray(reward_lambda_res_ts,  dtype=np.float32),
         "reward_benign_col_dmg": np.asarray(reward_bcd_ts,        dtype=np.float32),
         "reward_qoe_penalty":   np.asarray(reward_qoe_penalty_ts, dtype=np.float32),
+        "reward":               np.asarray(reward_ts,             dtype=np.float32),
     }
+    return res, ids_cpu.copy()
 
 
 # ---------------------------------------------------------------------------
@@ -294,7 +319,8 @@ def main():
                     help="Methods to evaluate. Defaults: random constant_0.5 constant_4.0 reactive")
     ap.add_argument("--tbsa_table",        default="tbsa_table.npz",
                     help="TBSA lookup-table path (needed when 'tbsa' is in --methods)")
-    ap.add_argument("--ckpt",              default="checkpoints/tdsc_so/ckpt_iter_000300.pt",
+    ap.add_argument("--ckpt",              default="checkpoints/tdsc_so_rew_32/ckpt_iter_000300.pt",
+    # ap.add_argument("--ckpt",              default="checkpoints/tdsc/ckpt_iter_000500.pt",
     # ap.add_argument("--ckpt",              default="checkpoints/tdsc_so/ckpt_best.pt",
                     help="Checkpoint path (needed when 'lstm_rl' is in --methods)")
     ap.add_argument("--device",            default="cpu")
@@ -303,7 +329,10 @@ def main():
     with open(args.cfg) as f:
         cfg = yaml.safe_load(f)
 
-    base_seed         = int(cfg["run"]["seed"])
+    # Sync global random state with training for AttackTypeLibrary (identical to train_lstm.py)
+    base_seed = int(cfg["run"]["seed"])
+    np.random.seed(base_seed)
+
     decision_interval = args.decision_interval or int(cfg["globals"]["decision_interval"])
 
     outdir = Path(args.outdir)
@@ -347,11 +376,13 @@ def main():
 
     # Accumulate per-decision results across episodes
     results: Dict[str, Dict[str, np.ndarray]] = {m: {} for m in methods}
+    # Track carry-over state per method (matches training SyncDataCollector behavior)
+    last_ids_cpu: Dict[str, Optional[np.ndarray]] = {m: None for m in methods}
 
     for ep in tqdm(range(args.episodes), desc="episodes"):
-        ep_seed = base_seed + ep * 1000
+        ep_seed = 1000 + ep * 1000
         for mname in methods:
-            ep_result = run_episode(
+            ep_result, final_ids = run_episode(
                 env=env,
                 cfg=cfg,
                 policy=policies[mname],
@@ -364,7 +395,9 @@ def main():
                 reward_beta=reward_beta,
                 reward_gamma=reward_gamma,
                 reward_q_th=reward_q_th,
+                initial_ids_cpu=last_ids_cpu[mname],
             )
+            last_ids_cpu[mname] = final_ids
             for k, v in ep_result.items():
                 results[mname][k] = np.concatenate(
                     [results[mname].get(k, np.array([], dtype=np.float32)), v]
@@ -377,6 +410,22 @@ def main():
     plot_qoe_vio_bars( results, summary_path, qoe_slo_min=reward_q_th, beta=3)
 
     print(f"Plots saved to {outdir}/")
+
+    # Summary table — comparable to wandb training metrics
+    header = f"{'Method':<20} {'qoe_vio_rate':>12} {'reward/mean':>12} {'qoe_penalty':>12} {'atk_drop_pct':>12} {'lambda_res':>12}"
+    print("\n" + header)
+    print("-" * len(header))
+    for mname in methods:
+        r = results[mname]
+        lres = float(np.mean(r['reward_lambda_res']))
+        print(
+            f"{mname:<20} "
+            f"{float(np.mean(r['qoe_vio_rate'])):>12.1%} "
+            f"{float(np.mean(r['reward'])):>12.4f} "
+            f"{float(np.mean(r['reward_qoe_penalty'])):>12.4f} "
+            f"{1.0 - lres:>12.1%} "   # attack drop % — matches summary.png bar
+            f"{lres:>12.4f}"           # raw pass-through fraction (during attacks)
+        )
 
 
 if __name__ == "__main__":
