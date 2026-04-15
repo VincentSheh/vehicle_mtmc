@@ -26,7 +26,6 @@ from environment import build_env_base, TorchRLEnvWrapper
 from method_policy import ActContext, BaselinePolicy, make_baseline_policy
 from old_policy import plot_ts_continuous, plot_qoe_vio_bars
 
-SCALING_K      = 2.0
 SCALING_QUANTA = [0.5, 1.0, 1.5, 2.0]
 
 DEFAULT_METHODS = ["random", "constant_0.5", "constant_1.5", "tbsa", "reactive"]
@@ -37,24 +36,22 @@ DEFAULT_METHODS = ["reactive", "lstm_rl"]
 # Helpers (mirror TorchRLEnvWrapper internals)
 # ---------------------------------------------------------------------------
 
-def _overhead_rate(pending: float, scaling_time_steps: List[int]) -> float:
-    abs_p = abs(pending)
-    if abs_p < 1e-9:
-        return 0.0
+def _lookup_scaling_duration(magnitude: float, scaling_time_steps: List[int]) -> int:
     for i, q in enumerate(SCALING_QUANTA):
-        if abs_p <= q + 1e-9:
-            return abs_p / scaling_time_steps[i]
-    return abs_p / scaling_time_steps[-1]
+        if magnitude <= q + 1e-9:
+            return scaling_time_steps[i]
+    return scaling_time_steps[-1]
 
 
 def _build_obs_flat(
     env,
     decision_interval: int,
     obs_keys: List[str],
-    scaling_pending: float,
+    transition_ticks_norm: float,
+    delta_in_flight_norm: float,
 ) -> np.ndarray:
     n_edges = len(env.edge_areas)
-    obs_dim = len(obs_keys) + 1
+    obs_dim = len(obs_keys) + 2   # +2: transition_ticks_norm, delta_in_flight_norm
     obs = np.zeros((n_edges, obs_dim), dtype=np.float32)
 
     if env.history:
@@ -78,7 +75,8 @@ def _build_obs_flat(
                 else:
                     obs[i, j] = float(np.mean(vals))
 
-    obs[:, -1] = float(np.clip(scaling_pending / SCALING_K, -1.0, 1.0))
+    obs[:, -2] = float(np.clip(transition_ticks_norm, 0.0, 1.0))
+    obs[:, -1] = float(np.clip(delta_in_flight_norm, -1.0, 1.0))
     return obs.reshape(-1).astype(np.float32)
 
 
@@ -108,6 +106,7 @@ def run_episode(
     obs_keys: List[str],
     decision_interval: int,
     scale_step: float,
+    n_actions: int,
     ids_cpu_min: float,
     seed: int,
     reward_alpha: float,
@@ -136,9 +135,12 @@ def run_episode(
     scaling_time_steps: List[int] = list(
         cfg["globals"].get("scaling_time_step", [300, 450, 498, 544])
     )
-    scaling_pending  = 0.0
-    overhead_rate    = 0.0
-    ids_cpu_settled  = ids_cpu.copy()   # matches TorchRLEnvWrapper._reset logic
+    ids_cpu_settled            = ids_cpu.copy()
+    ids_cpu_target             = ids_cpu.copy()
+    transition_ticks_remaining = 0
+    transition_ticks_total     = 1
+    max_scaling_duration       = float(scaling_time_steps[-1])
+    max_delta                  = scale_step * (n_actions - 1) / 2.0   # largest single command
     rng = np.random.default_rng(seed)
 
     decisions = math.ceil(int(cfg["run"]["t_max"]) / decision_interval)
@@ -157,23 +159,26 @@ def run_episode(
     reward_bcd_ts         = []
     reward_qoe_penalty_ts = []
     reward_ts             = []
-
     for _ in range(decisions):
         if env.t >= env.t_max:
             break
 
-        obs_flat = _build_obs_flat(env, decision_interval, obs_keys, scaling_pending)
+        ticks_norm      = float(transition_ticks_remaining) / max(max_scaling_duration, 1.0)
+        delta_in_flight = float(ids_cpu_target[0]) - float(ids_cpu_settled[0])
+        d_flight_norm   = float(np.clip(delta_in_flight / max(max_delta, 1e-6), -1.0, 1.0))
+        obs_flat = _build_obs_flat(env, decision_interval, obs_keys, ticks_norm, d_flight_norm)
         cpu_util = _cpu_util(env, decision_interval)
 
         ctx = ActContext(
             env=env,
-            ids_cpu=ids_cpu.copy(),
+            ids_cpu=ids_cpu.copy(),   # netting: policies base delta on current queue
             ids_cpu_min=ids_cpu_min,
             ids_cpu_max=ids_cpu_max,
             cpu_util=cpu_util,
             decision_interval=decision_interval,
             rng=rng,
-            scaling_pending=scaling_pending,
+            transition_ticks_norm=ticks_norm,
+            delta_in_flight_norm=d_flight_norm,
             obs_flat=obs_flat,
         )
 
@@ -181,8 +186,11 @@ def run_episode(
 
         prev_ids_cpu = ids_cpu.copy()
         if ids_cpu_abs is not None:
+            # Abs-value policies (constant, tbsa, lstm_rl) return an absolute position;
+            # treat it as the new queue value directly.
             ids_cpu = np.clip(ids_cpu_abs, ids_cpu_min, ids_cpu_max).astype(np.float32)
         else:
+            # Delta policies: net delta onto current queue, not onto settled.
             ids_cpu = np.clip(
                 ids_cpu + delta.astype(np.float32) * scale_step,
                 ids_cpu_min,
@@ -190,36 +198,48 @@ def run_episode(
             ).astype(np.float32)
 
         delta_eff = float(ids_cpu[0] - prev_ids_cpu[0])
-        # Asymmetric unit-step: descaling is immediate, scaling-up is a transition.
-        #   IDS scale-up:   IDS holds at settled, VA immediately at budget-target.
-        #   IDS scale-down: IDS immediately at target, VA holds at budget-settled.
-        scaling_pending = float(np.clip(scaling_pending + delta_eff, -SCALING_K, SCALING_K))
 
-        # No transition needed if target returned to settled.
-        delta_to_settled = float(ids_cpu[0]) - float(ids_cpu_settled[0])
-        if abs(delta_to_settled) < 1e-9:
-            scaling_pending = 0.0
+        # Settled: apply delta immediately (start transition).
+        # In transition: net delta onto queue; ids_cpu_target unchanged until current
+        # transition completes, then the accumulated queue fires as the next command.
+        if transition_ticks_remaining <= 0:
+            if abs(delta_eff) > 1e-9:
+                ids_cpu_target[0] = ids_cpu[0]
+                gap = abs(float(ids_cpu_target[0]) - float(ids_cpu_settled[0]))
+                transition_ticks_total     = _lookup_scaling_duration(gap, scaling_time_steps)
+                transition_ticks_remaining = transition_ticks_total
+        # else: in transition — ids_cpu updated as queue; ids_cpu_target unchanged
 
-        overhead_rate = _overhead_rate(delta_to_settled, scaling_time_steps)
-
-        ids_cpu_eff = ids_cpu.copy()
-        if scaling_pending > 1e-9:               # scale-up: IDS holds at settled
-            ids_cpu_eff[0] = float(ids_cpu_settled[0])
-        # else (scale-down or settled): ids_cpu_eff already = target
-
-        # Constant overhead: bridges gap so va_cpu_eff is correct throughout.
-        step_overhead = -abs(delta_to_settled) if abs(scaling_pending) > 1e-9 else 0.0
+        # Asymmetric effective allocation for the transition in progress
+        delta_to_settled = float(ids_cpu_target[0]) - float(ids_cpu_settled[0])
+        ids_cpu_eff = ids_cpu_settled.copy()
+        if transition_ticks_remaining > 0:
+            if delta_to_settled > 1e-9:   # scale-up: IDS holds at settled
+                ids_cpu_eff[0] = ids_cpu_settled[0]
+            else:                          # scale-down: IDS drops immediately
+                ids_cpu_eff[0] = ids_cpu_target[0]
+        step_overhead = -abs(delta_to_settled) if transition_ticks_remaining > 0 else 0.0
 
         for _ in range(decision_interval):
-            if abs(scaling_pending) > 1e-9:
-                sign             = 1.0 if scaling_pending > 0.0 else -1.0
-                consumed         = min(abs(scaling_pending), overhead_rate)
-                scaling_pending -= sign * consumed
-                if abs(scaling_pending) < 1e-9:
-                    scaling_pending    = 0.0
-                    ids_cpu_settled[0] = ids_cpu[0]   # commit
-                    ids_cpu_eff[0]     = ids_cpu[0]   # unit-step jump
-                    step_overhead      = 0.0           # overhead clears
+            if transition_ticks_remaining > 0:
+                transition_ticks_remaining -= 1
+                if transition_ticks_remaining == 0:
+                    ids_cpu_settled[0] = ids_cpu_target[0]
+                    queued_delta = float(ids_cpu[0]) - float(ids_cpu_settled[0])
+                    if abs(queued_delta) > 1e-9:
+                        ids_cpu_target[0] = ids_cpu[0]
+                        gap = abs(queued_delta)
+                        transition_ticks_total     = _lookup_scaling_duration(gap, scaling_time_steps)
+                        transition_ticks_remaining = transition_ticks_total
+                        new_d = float(ids_cpu_target[0]) - float(ids_cpu_settled[0])
+                        step_overhead = -abs(new_d)
+                        if new_d > 1e-9:
+                            ids_cpu_eff[0] = ids_cpu_settled[0]
+                        else:
+                            ids_cpu_eff[0] = ids_cpu_target[0]
+                    else:
+                        ids_cpu_eff[0] = ids_cpu_settled[0]
+                        step_overhead = 0.0
             env.step(ids_cpu_eff, step_overhead)
             if env.t >= env.t_max:
                 break
@@ -252,7 +272,7 @@ def run_episode(
         )
         attack_drop_rate_ts.append(_col_mean("attack_drop_rate"))
         ema_mom_ts.append(_col_mean("ema_mom"))
-        ratios = ids_cpu / np.array([e.budget.cpu for e in env.edge_areas], dtype=np.float32)
+        ratios = ids_cpu_settled / np.array([e.budget.cpu for e in env.edge_areas], dtype=np.float32)
         cpu_to_ids_ratio_ts.append(float(ratios.mean()))
 
         # Reward components (same formula as TorchRLEnvWrapper._build_reward)
@@ -265,18 +285,15 @@ def run_episode(
             sf       = np.maximum(0.0, reward_q_th - qoes) / max(reward_q_th, 1e-6)
             bcd_vals = df["benign_col_dmg"].values.astype(np.float32) if "benign_col_dmg" in df.columns else np.zeros(len(atk_in))
 
-            # Only average lres over ticks where attacks are actually present.
-            # Including zero-attack ticks (lres=0) inflates the apparent drop
-            # rate by counting quiet periods as "100% defended".
-            active = atk_in > 1e-6
-            r_lres = float(np.mean(lres[active])) if np.any(active) else 0.0
+            # Mean over ALL ticks (quiet ticks contribute 0) — matches training's
+            # per-tick accumulation where each quiet tick yields r_lambda_res=0.
+            r_lres_scalar = float(np.mean(lres))
             r_bcd  = float(np.mean(bcd_vals))
             r_sf   = float(np.mean(sf))
-            reward_lambda_res_ts.append(r_lres)
+            reward_lambda_res_ts.append(r_lres_scalar)
             reward_bcd_ts.append(r_bcd)
             reward_qoe_penalty_ts.append(r_sf)
-            # Weighted reward scalar — same formula as TorchRLEnvWrapper._build_reward
-            reward_ts.append(-(reward_alpha * r_sf + reward_beta * r_lres + reward_gamma * r_bcd))
+            reward_ts.append(-(reward_alpha * r_sf + reward_beta * r_lres_scalar + reward_gamma * r_bcd))
         else:
             reward_lambda_res_ts.append(0.0)
             reward_bcd_ts.append(0.0)
@@ -319,9 +336,9 @@ def main():
                     help="Methods to evaluate. Defaults: random constant_0.5 constant_4.0 reactive")
     ap.add_argument("--tbsa_table",        default="tbsa_table.npz",
                     help="TBSA lookup-table path (needed when 'tbsa' is in --methods)")
-    ap.add_argument("--ckpt",              default="checkpoints/tdsc_so_rew_32/ckpt_iter_000300.pt",
+    ap.add_argument("--ckpt",              default="checkpoints/tdsc_so_u_rew_32/ckpt_iter_000450.pt",
     # ap.add_argument("--ckpt",              default="checkpoints/tdsc/ckpt_iter_000500.pt",
-    # ap.add_argument("--ckpt",              default="checkpoints/tdsc_so/ckpt_best.pt",
+    # ap.add_argument("--ckpt",              default="checkpoints/tdsc_so_u_rew_32/ckpt_best.pt",
                     help="Checkpoint path (needed when 'lstm_rl' is in --methods)")
     ap.add_argument("--device",            default="cpu")
     args = ap.parse_args()
@@ -348,6 +365,7 @@ def main():
     reward_beta   = _wrapper.reward_beta
     reward_gamma  = _wrapper.reward_gamma
     reward_q_th   = _wrapper.reward_q_th
+    n_actions     = _wrapper.n_actions
     del _wrapper
 
     env = build_env_base(args.cfg)
@@ -380,7 +398,7 @@ def main():
     last_ids_cpu: Dict[str, Optional[np.ndarray]] = {m: None for m in methods}
 
     for ep in tqdm(range(args.episodes), desc="episodes"):
-        ep_seed = 1000 + ep * 1000
+        ep_seed = base_seed + (ep + 1) * 1000   # matches training: base_seed + episode_id*1000
         for mname in methods:
             ep_result, final_ids = run_episode(
                 env=env,
@@ -389,13 +407,15 @@ def main():
                 obs_keys=obs_keys,
                 decision_interval=decision_interval,
                 scale_step=args.scale_step,
+                n_actions=n_actions,
                 ids_cpu_min=args.ids_cpu_min,
                 seed=ep_seed,
                 reward_alpha=reward_alpha,
                 reward_beta=reward_beta,
                 reward_gamma=reward_gamma,
                 reward_q_th=reward_q_th,
-                initial_ids_cpu=last_ids_cpu[mname],
+                # initial_ids_cpu=last_ids_cpu[mname],
+                initial_ids_cpu=None,
             )
             last_ids_cpu[mname] = final_ids
             for k, v in ep_result.items():
@@ -424,7 +444,7 @@ def main():
             f"{float(np.mean(r['reward'])):>12.4f} "
             f"{float(np.mean(r['reward_qoe_penalty'])):>12.4f} "
             f"{1.0 - lres:>12.1%} "   # attack drop % — matches summary.png bar
-            f"{lres:>12.4f}"           # raw pass-through fraction (during attacks)
+            f"{lres:>12.4f}"           # raw pass-through fraction (all ticks, matches training)
         )
 
 

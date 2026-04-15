@@ -26,13 +26,14 @@ from tbsa_offline import TBSAPolicy
 class ActContext:
     """All information a policy may need to make a decision."""
     env: object                    # Environment instance (for history, edge_areas)
-    ids_cpu: np.ndarray            # current IDS CPU allocation (absolute CPU units), shape (n_edges,)
+    ids_cpu: np.ndarray            # last-committed (settled) IDS CPU, shape (n_edges,)
     ids_cpu_min: float
     ids_cpu_max: np.ndarray        # shape (n_edges,)
     cpu_util: float                # scalar decision-window CPU utilisation
     decision_interval: int
     rng: np.random.Generator       # seeded RNG for stochastic policies
-    scaling_pending: float = 0.0   # signed pending CPU overhead (for obs construction)
+    transition_ticks_norm: float = 0.0   # remaining ticks / max_duration ∈ [0, 1]
+    delta_in_flight_norm: float = 0.0    # (ids_cpu_target - ids_cpu_settled) / ids_cpu_max ∈ [-1, 1]
     obs_flat: Optional[np.ndarray] = None  # pre-built normalised obs for RL policies
 
 
@@ -335,10 +336,10 @@ class LSTMRLPolicy(BaselinePolicy):
             probs  = torch.softmax(logits, dim=-1)
             action = int(torch.multinomial(probs, 1).item())
 
-        # Map discrete action → absolute CPU (same formula as TorchRLEnvWrapper._step)
+        # Map discrete action → absolute CPU (netting: relative to current queue)
         delta_cmd = (action - (self.n_actions - 1) / 2.0) * self.scale_step
         ids_cpu_abs = np.clip(
-            ctx.ids_cpu + float(delta_cmd),
+            ctx.ids_cpu + float(delta_cmd),   # ctx.ids_cpu == current queue position
             ctx.ids_cpu_min,
             ctx.ids_cpu_max,
         ).astype(np.float32)

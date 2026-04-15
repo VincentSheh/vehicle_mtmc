@@ -490,11 +490,13 @@ class TorchRLEnvWrapper(EnvBase):
         self.reward_gamma = float(_reward_cfg.get("gamma_inv", 0.12))
         self.reward_q_th  = float(_reward_cfg.get("q_th", 0.20))
         self.scaling_quanta: List[float] = [0.5, 1.0, 1.5, 2.0]
-        self.scaling_K: float = 2.0          # max accumulated pending (CPU units)
-        self.scaling_pending: float = 0.0    # signed; positive=scaling up, negative=down
-        self.overhead_rate: float = 0.0      # CPU units consumed per tick
 
-        self.obs_dim = len(self.obs_keys) + 1   # +1 for scaling_pending feature
+        # Method 2 serialised-scaling state
+        self.ids_cpu_target: torch.Tensor      # current transition target (= settled when not transitioning)
+        self.transition_ticks_remaining: int = 0   # 0 = settled
+        self.transition_ticks_total:     int = 1   # avoid div-by-zero
+
+        self.obs_dim = len(self.obs_keys) + 2   # +2: ticks_remaining_norm, delta_in_flight_norm
         self.obs_size = self.n_edges * self.obs_dim
 
         self.action_dim = self.n_edges
@@ -507,9 +509,8 @@ class TorchRLEnvWrapper(EnvBase):
             device=self.device,
             dtype=torch.float32,
         )
-        # Last fully-completed IDS CPU allocation (unit-step model: eff stays here
-        # until pending drains to zero, then jumps to ids_cpu).
         self.ids_cpu_settled = self.ids_cpu.clone()
+        self.ids_cpu_target  = self.ids_cpu.clone()
 
         self._set_seed(seed)
         self._make_specs()
@@ -522,13 +523,6 @@ class TorchRLEnvWrapper(EnvBase):
             if magnitude <= q + 1e-9:
                 return self.scaling_time_steps[i]
         return self.scaling_time_steps[-1]
-
-    def _compute_overhead_rate(self, pending: float) -> float:
-        """CPU units consumed per tick given current signed pending."""
-        abs_p = abs(pending)
-        if abs_p < 1e-9:
-            return 0.0
-        return abs_p / self._lookup_scaling_duration(abs_p)
 
     # ---------------- TorchRL required ----------------
 
@@ -632,9 +626,10 @@ class TorchRLEnvWrapper(EnvBase):
         self.env.reset(episode_seed)
 
         # Clear scaling state
-        self.scaling_pending = 0.0
-        self.overhead_rate = 0.0
-        self.ids_cpu_settled = self.ids_cpu.clone()
+        self.ids_cpu_settled             = self.ids_cpu.clone()
+        self.ids_cpu_target              = self.ids_cpu.clone()
+        self.transition_ticks_remaining  = 0
+        self.transition_ticks_total      = 1
 
 
         obs = self._build_observation().to(self.device)
@@ -691,48 +686,43 @@ class TorchRLEnvWrapper(EnvBase):
 
         prev_ids = self.ids_cpu[0].clone()
         edge = self.env.edge_areas[0]
+        ids_cpu_max_val = float(edge.budget.cpu - 0.5)
+
+        # ids_cpu tracks the desired ("queued") target.
+        # Netting queue: delta is applied on top of the current queue, not settled.
+        # Commands issued during a transition accumulate; they do not reset to settled.
         self.ids_cpu[0] = torch.clamp(
             self.ids_cpu[0] + delta_cmd,
             min=self.ids_cpu_min,
-            max=edge.budget.cpu - 0.5,
+            max=ids_cpu_max_val,
         )
-
         delta_eff = float((self.ids_cpu[0] - prev_ids).item())
 
-        # --- Scaling semantics (unit-step, asymmetric) ---
-        # Descaling is immediate; scaling-up is a transition:
-        #
-        #   IDS scale-up  (delta > 0):
-        #     - IDS holds at ids_cpu_settled until pending drains (unit step)
-        #     - VA immediately drops to budget - target
-        #
-        #   IDS scale-down (delta < 0):
-        #     - IDS immediately drops to target
-        #     - VA holds at budget - ids_cpu_settled until pending drains (unit step)
-        #
-        # In both cases step_overhead = -abs(target - settled), a constant that
-        # makes _run_step_once produce the correct va_cpu_eff throughout transition.
-        self.scaling_pending = float(np.clip(
-            self.scaling_pending + delta_eff, -self.scaling_K, self.scaling_K
-        ))
+        # Settled: apply delta immediately (start transition).
+        # In transition: net delta onto queue; ids_cpu_target unchanged until current
+        # transition completes, then the accumulated queue fires as the next command.
+        if self.transition_ticks_remaining <= 0:
+            if abs(delta_eff) > 1e-9:
+                self.ids_cpu_target[0] = self.ids_cpu[0]
+                gap = abs(float(self.ids_cpu_target[0].item()) - float(self.ids_cpu_settled[0].item()))
+                self.transition_ticks_total     = self._lookup_scaling_duration(gap)
+                self.transition_ticks_remaining = self.transition_ticks_total
+        # else: in transition — ids_cpu already updated as queue; ids_cpu_target unchanged
 
-        # If target returned to settled there is no transition to perform.
-        delta_to_settled = float(self.ids_cpu[0].item()) - float(self.ids_cpu_settled[0].item())
-        if abs(delta_to_settled) < 1e-9:
-            self.scaling_pending = 0.0
+        # --- Asymmetric effective allocation for the transition in progress ---
+        # scale-up:   IDS holds at settled, VA drops immediately to budget-target
+        # scale-down: IDS drops immediately to target, VA holds at budget-settled
+        target  = float(self.ids_cpu_target[0].item())
+        settled = float(self.ids_cpu_settled[0].item())
+        delta_to_settled = target - settled
 
-        self.overhead_rate = self._compute_overhead_rate(delta_to_settled)
-
-        # ids_cpu_eff: IDS holds during scale-up; drops immediately on scale-down.
-        ids_cpu_eff = self.ids_cpu.clone()
-        if self.scaling_pending > 1e-9:          # scale-up: IDS holds at settled
-            ids_cpu_eff[0] = float(self.ids_cpu_settled[0].item())
-        # else (scale-down or settled): ids_cpu_eff already = target
-
-        # Constant overhead bridges the gap so that:
-        #   scale-up:   va_cpu_eff = budget - target   (VA drops immediately)
-        #   scale-down: va_cpu_eff = budget - settled  (VA holds until done)
-        step_overhead = -abs(delta_to_settled) if abs(self.scaling_pending) > 1e-9 else 0.0
+        ids_cpu_eff = self.ids_cpu_settled.clone()
+        if self.transition_ticks_remaining > 0:
+            if delta_to_settled > 1e-9:   # scale-up: IDS holds at settled
+                ids_cpu_eff[0] = settled
+            else:                          # scale-down: IDS drops immediately
+                ids_cpu_eff[0] = target
+        step_overhead = -abs(delta_to_settled) if self.transition_ticks_remaining > 0 else 0.0
 
         total_reward = 0.0
         total_lambda_res = 0.0
@@ -743,16 +733,27 @@ class TorchRLEnvWrapper(EnvBase):
 
         # 2) Simulate decision_interval internal timesteps
         for _ in range(self.decision_interval):
-            # Drain pending toward zero one tick at a time.
-            if abs(self.scaling_pending) > 1e-9:
-                sign = 1.0 if self.scaling_pending > 0.0 else -1.0
-                consumed = min(abs(self.scaling_pending), self.overhead_rate)
-                self.scaling_pending -= sign * consumed
-                if abs(self.scaling_pending) < 1e-9:
-                    self.scaling_pending = 0.0
-                    self.ids_cpu_settled[0] = self.ids_cpu[0]   # commit
-                    ids_cpu_eff[0] = float(self.ids_cpu[0].item())  # unit-step jump
-                    step_overhead = 0.0                             # overhead clears
+            if self.transition_ticks_remaining > 0:
+                self.transition_ticks_remaining -= 1
+                if self.transition_ticks_remaining == 0:
+                    # Commit: settle at ids_cpu_target
+                    self.ids_cpu_settled[0] = self.ids_cpu_target[0]
+                    # Fire queued command if ids_cpu diverged from new settled
+                    queued_delta = float(self.ids_cpu[0].item()) - float(self.ids_cpu_settled[0].item())
+                    if abs(queued_delta) > 1e-9:
+                        self.ids_cpu_target[0] = self.ids_cpu[0]
+                        gap = abs(queued_delta)
+                        self.transition_ticks_total     = self._lookup_scaling_duration(gap)
+                        self.transition_ticks_remaining = self.transition_ticks_total
+                        new_d = float(self.ids_cpu_target[0].item()) - float(self.ids_cpu_settled[0].item())
+                        step_overhead = -abs(new_d)
+                        if new_d > 1e-9:   # scale-up: IDS holds
+                            ids_cpu_eff[0] = float(self.ids_cpu_settled[0].item())
+                        else:              # scale-down: IDS drops
+                            ids_cpu_eff[0] = float(self.ids_cpu_target[0].item())
+                    else:
+                        ids_cpu_eff[0] = float(self.ids_cpu_settled[0].item())
+                        step_overhead = 0.0
 
             self.env.step(ids_cpu_eff, step_overhead)
             r = self._build_reward()
@@ -839,8 +840,18 @@ class TorchRLEnvWrapper(EnvBase):
                 else:
                     obs[i, j] = float(np.mean(vals))
 
-        # Last feature: normalized signed scaling_pending in [-1, 1]
-        obs[:, -1] = float(np.clip(self.scaling_pending / self.scaling_K, -1.0, 1.0))
+        # Feature -2: remaining transition ticks normalised by max possible duration ∈ [0, 1]
+        # Using max_duration (not T_total) gives a consistent drain rate across all transition
+        # sizes, and encodes duration in the initial value (0.55 = T=300, 1.0 = T=544).
+        max_dur = float(self.scaling_time_steps[-1])
+        obs[:, -2] = float(self.transition_ticks_remaining) / max(max_dur, 1.0)
+
+        # Feature -1: delta in flight — (ids_cpu_target - ids_cpu_settled) / max_possible_delta ∈ [-1, 1]
+        # Normalise by the largest single command so the feature fills [-1, +1].
+        # max_delta = scale_step * (n_actions - 1) / 2  e.g. 0.5 * 4 = 2.0 for n_actions=9
+        max_delta = self.scale_step * (self.n_actions - 1) / 2.0
+        delta_in_flight = float(self.ids_cpu_target[0].item()) - float(self.ids_cpu_settled[0].item())
+        obs[:, -1] = float(np.clip(delta_in_flight / max(max_delta, 1e-6), -1.0, 1.0))
 
         return obs
 
@@ -869,7 +880,10 @@ class TorchRLEnvWrapper(EnvBase):
         qoe_shortfall = np.maximum(0.0, q_th - qoe) / max(q_th, 1e-6)
 
         # raw (unweighted) components — used for tracking and print
-        r_lambda_res  = float(np.mean(lambda_res))      # fraction [0, 1]
+        # lambda_res only averaged over ticks where attacks are present so that
+        # quiet windows (lres=0) don't dilute the penalty and match eval semantics.
+        active = attack_in > 1e-6
+        r_lambda_res  = float(np.mean(lambda_res[active])) if np.any(active) else 0.0
         r_bcd         = float(np.mean(bcd))             # QoE units
         r_qoe_penalty = float(np.mean(qoe_shortfall))   # normalised shortfall [0, 1]
 
