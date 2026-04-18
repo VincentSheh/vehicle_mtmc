@@ -33,9 +33,9 @@ globals:
 
   reward:
     alpha_inv: 5.0   # QoE shortfall normalizer        (alpha = 1/alpha_inv = 10)      || 0.10
-    beta_inv:  2.5   # Attack residual normalizer       (beta  = 1/beta_inv  =  5)     || 0.20
-    gamma_inv: 15   # Benign collateral normalizer     (gamma = 1/gamma_inv ≈  8.33)  || 0.12
-    q_th:      0.20   # QoE shortfall threshold
+    beta_inv:  7.0   # Attack residual normalizer       (beta  = 1/beta_inv  =  5)     || 0.20
+    gamma_inv: 10.0   # Benign collateral normalizer     (gamma = 1/gamma_inv ≈  8.33)  || 0.12
+    q_th:      0.2   # QoE shortfall threshold
 
   video_pipeline:
     reid_latency: 20 #! Should consider batch processing

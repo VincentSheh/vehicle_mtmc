@@ -258,7 +258,7 @@ class EdgeArea:
             idx = int(self.rng.integers(0, len(self._all_attackers)))
             self.attackers = [self._all_attackers[idx]]
         # 4) Reset IDS
-        self.ids_cpu = 4.0
+        self.ids_cpu = 0.5
         
     def get_state(self) -> dict:
         return {

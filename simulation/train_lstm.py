@@ -339,7 +339,7 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
         # ---- per-decision-step obs logging ----
         # Each row after reshape = one decision interval (one action taken by the agent).
         # reshape(-1, obs_dim) handles any leading batch/env dims (B=1 case: B*T == T).
-        obs_keys_full = base_env.obs_keys + ["transition_ticks_norm", "delta_in_flight_norm"]
+        obs_keys_full = base_env.obs_keys + ["transition_ticks_norm", "delta_in_flight_norm", "queue_ahead_norm"]
         _obs_flat = batch["observation"].float().reshape(-1, base_env.obs_dim).cpu()  # [T, obs_dim]
         _T = _obs_flat.shape[0]
         for _t in range(_T):

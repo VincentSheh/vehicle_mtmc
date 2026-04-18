@@ -33,7 +33,8 @@ class ActContext:
     decision_interval: int
     rng: np.random.Generator       # seeded RNG for stochastic policies
     transition_ticks_norm: float = 0.0   # remaining ticks / max_duration ∈ [0, 1]
-    delta_in_flight_norm: float = 0.0    # (ids_cpu_target - ids_cpu_settled) / ids_cpu_max ∈ [-1, 1]
+    delta_in_flight_norm: float = 0.0    # (ids_cpu_target - ids_cpu_settled) / max_delta ∈ [-1, 1]
+    queue_ahead_norm: float = 0.0        # (ids_cpu - ids_cpu_target) / max_delta ∈ [-1, 1]
     obs_flat: Optional[np.ndarray] = None  # pre-built normalised obs for RL policies
 
 
@@ -326,8 +327,8 @@ class LSTMRLPolicy(BaselinePolicy):
         with torch.no_grad():
             td = self.net(td)
 
-        self._h = td.get("recurrent_state_h")
-        self._c = td.get("recurrent_state_c")
+        self._h = td.get(("next", "recurrent_state_h"))
+        self._c = td.get(("next", "recurrent_state_c"))
 
         logits = td.get("logits").squeeze(0)
         if self.greedy:
@@ -377,6 +378,6 @@ def make_baseline_policy(
             raise ValueError("ckpt_path must be provided for 'lstm_rl' policy")
         if obs_keys is None:
             raise ValueError("obs_keys must be provided for 'lstm_rl' policy")
-        return LSTMRLPolicy(ckpt_path=ckpt_path, obs_keys=obs_keys, device=device)
+        return LSTMRLPolicy(ckpt_path=ckpt_path, obs_keys=obs_keys, device=device, greedy=False)
     else:
         raise ValueError(f"Unknown baseline policy name: {name!r}")
