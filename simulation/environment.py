@@ -489,14 +489,14 @@ class TorchRLEnvWrapper(EnvBase):
         self.reward_beta  = float(_reward_cfg.get("beta_inv",  0.20))
         self.reward_gamma = float(_reward_cfg.get("gamma_inv", 0.12))
         self.reward_q_th  = float(_reward_cfg.get("q_th", 0.20))
-        self.scaling_quanta: List[float] = [0.5, 1.0, 1.5, 2.0]
+        self.scaling_quanta: List[float] = [0.5]
 
         # Method 2 serialised-scaling state
         self.ids_cpu_target: torch.Tensor      # current transition target (= settled when not transitioning)
         self.transition_ticks_remaining: int = 0   # 0 = settled
         self.transition_ticks_total:     int = 1   # avoid div-by-zero
 
-        self.obs_dim = len(self.obs_keys) + 2   # +2: ticks_remaining_norm, delta_in_flight_norm
+        self.obs_dim = len(self.obs_keys) #+ 3   # +3: ticks_remaining_norm, delta_in_flight_norm, queue_ahead_norm
         self.obs_size = self.n_edges * self.obs_dim
 
         self.action_dim = self.n_edges
@@ -691,10 +691,14 @@ class TorchRLEnvWrapper(EnvBase):
         # ids_cpu tracks the desired ("queued") target.
         # Netting queue: delta is applied on top of the current queue, not settled.
         # Commands issued during a transition accumulate; they do not reset to settled.
+        # Queue is clamped to settled ± max_quantum so the gap never exceeds the largest
+        # single scaling step the transition system supports.
+        _settled = float(self.ids_cpu_settled[0].item())
+        _max_q   = float(self.scaling_quanta[-1])   # 2.0
         self.ids_cpu[0] = torch.clamp(
             self.ids_cpu[0] + delta_cmd,
-            min=self.ids_cpu_min,
-            max=ids_cpu_max_val,
+            min=max(self.ids_cpu_min, _settled - _max_q),
+            max=min(ids_cpu_max_val,  _settled + _max_q),
         )
         delta_eff = float((self.ids_cpu[0] - prev_ids).item())
 
@@ -840,18 +844,25 @@ class TorchRLEnvWrapper(EnvBase):
                 else:
                     obs[i, j] = float(np.mean(vals))
 
-        # Feature -2: remaining transition ticks normalised by max possible duration ∈ [0, 1]
-        # Using max_duration (not T_total) gives a consistent drain rate across all transition
-        # sizes, and encodes duration in the initial value (0.55 = T=300, 1.0 = T=544).
-        max_dur = float(self.scaling_time_steps[-1])
-        obs[:, -2] = float(self.transition_ticks_remaining) / max(max_dur, 1.0)
+        # # Feature -3: remaining transition ticks normalised by max possible duration ∈ [0, 1]
+        # # Using max_duration (not T_total) gives a consistent drain rate across all transition
+        # # sizes, and encodes duration in the initial value (0.55 = T=300, 1.0 = T=544).
+        # max_dur = float(self.scaling_time_steps[-1])
+        # obs[:, -3] = float(self.transition_ticks_remaining) / max(max_dur, 1.0)
 
-        # Feature -1: delta in flight — (ids_cpu_target - ids_cpu_settled) / max_possible_delta ∈ [-1, 1]
-        # Normalise by the largest single command so the feature fills [-1, +1].
-        # max_delta = scale_step * (n_actions - 1) / 2  e.g. 0.5 * 4 = 2.0 for n_actions=9
-        max_delta = self.scale_step * (self.n_actions - 1) / 2.0
-        delta_in_flight = float(self.ids_cpu_target[0].item()) - float(self.ids_cpu_settled[0].item())
-        obs[:, -1] = float(np.clip(delta_in_flight / max(max_delta, 1e-6), -1.0, 1.0))
+        # # max_delta shared by the two delta features below
+        # max_delta = self.scale_step * (self.n_actions - 1) / 2.0
+
+        # # Feature -2: delta in flight — (ids_cpu_target - ids_cpu_settled) / max_delta ∈ [-1, 1]
+        # # Direction and magnitude of the transition currently executing.
+        # delta_in_flight = float(self.ids_cpu_target[0].item()) - float(self.ids_cpu_settled[0].item())
+        # obs[:, -2] = float(np.clip(delta_in_flight / max(max_delta, 1e-6), -1.0, 1.0))
+
+        # # Feature -1: queue ahead — (ids_cpu - ids_cpu_target) / max_delta ∈ [-1, 1]
+        # # Commands accumulated on the netting queue beyond the current in-flight transition.
+        # # Zero when settled or when no extra commands have been queued mid-transition.
+        # queue_ahead = float(self.ids_cpu[0].item()) - float(self.ids_cpu_target[0].item())
+        # obs[:, -1] = float(np.clip(queue_ahead / max(max_delta, 1e-6), -1.0, 1.0))
 
         return obs
 

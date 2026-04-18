@@ -26,7 +26,7 @@ from environment import build_env_base, TorchRLEnvWrapper
 from method_policy import ActContext, BaselinePolicy, make_baseline_policy
 from old_policy import plot_ts_continuous, plot_qoe_vio_bars
 
-SCALING_QUANTA = [0.5, 1.0, 1.5, 2.0]
+SCALING_QUANTA = [0.5]
 
 DEFAULT_METHODS = ["random", "constant_0.5", "constant_1.5", "tbsa", "reactive"]
 DEFAULT_METHODS = ["reactive", "lstm_rl"]
@@ -49,9 +49,10 @@ def _build_obs_flat(
     obs_keys: List[str],
     transition_ticks_norm: float,
     delta_in_flight_norm: float,
+    queue_ahead_norm: float,
 ) -> np.ndarray:
     n_edges = len(env.edge_areas)
-    obs_dim = len(obs_keys) + 2   # +2: transition_ticks_norm, delta_in_flight_norm
+    obs_dim = len(obs_keys) #+ 3   # +3: transition_ticks_norm, delta_in_flight_norm, queue_ahead_norm
     obs = np.zeros((n_edges, obs_dim), dtype=np.float32)
 
     if env.history:
@@ -75,8 +76,9 @@ def _build_obs_flat(
                 else:
                     obs[i, j] = float(np.mean(vals))
 
-    obs[:, -2] = float(np.clip(transition_ticks_norm, 0.0, 1.0))
-    obs[:, -1] = float(np.clip(delta_in_flight_norm, -1.0, 1.0))
+    # obs[:, -3] = float(np.clip(transition_ticks_norm, 0.0, 1.0))
+    # obs[:, -2] = float(np.clip(delta_in_flight_norm, -1.0, 1.0))
+    # obs[:, -1] = float(np.clip(queue_ahead_norm, -1.0, 1.0))
     return obs.reshape(-1).astype(np.float32)
 
 
@@ -166,7 +168,9 @@ def run_episode(
         ticks_norm      = float(transition_ticks_remaining) / max(max_scaling_duration, 1.0)
         delta_in_flight = float(ids_cpu_target[0]) - float(ids_cpu_settled[0])
         d_flight_norm   = float(np.clip(delta_in_flight / max(max_delta, 1e-6), -1.0, 1.0))
-        obs_flat = _build_obs_flat(env, decision_interval, obs_keys, ticks_norm, d_flight_norm)
+        queue_ahead     = float(ids_cpu[0]) - float(ids_cpu_target[0])
+        q_ahead_norm    = float(np.clip(queue_ahead / max(max_delta, 1e-6), -1.0, 1.0))
+        obs_flat = _build_obs_flat(env, decision_interval, obs_keys, ticks_norm, d_flight_norm, q_ahead_norm)
         cpu_util = _cpu_util(env, decision_interval)
 
         ctx = ActContext(
@@ -178,23 +182,25 @@ def run_episode(
             decision_interval=decision_interval,
             rng=rng,
             transition_ticks_norm=ticks_norm,
-            delta_in_flight_norm=d_flight_norm,
+            # delta_in_flight_norm=d_flight_norm,
+            # queue_ahead_norm=q_ahead_norm,
             obs_flat=obs_flat,
         )
 
         ids_cpu_abs, delta = policy.act(ctx)
 
         prev_ids_cpu = ids_cpu.copy()
+        _max_q = SCALING_QUANTA[-1]   # 2.0 — max quantum the transition system supports
         if ids_cpu_abs is not None:
             # Abs-value policies (constant, tbsa, lstm_rl) return an absolute position;
             # treat it as the new queue value directly.
             ids_cpu = np.clip(ids_cpu_abs, ids_cpu_min, ids_cpu_max).astype(np.float32)
         else:
-            # Delta policies: net delta onto current queue, not onto settled.
+            # Delta policies: net delta onto current queue, clamped to settled ± max_quantum.
             ids_cpu = np.clip(
                 ids_cpu + delta.astype(np.float32) * scale_step,
-                ids_cpu_min,
-                ids_cpu_max,
+                np.maximum(ids_cpu_min, ids_cpu_settled - _max_q),
+                np.minimum(ids_cpu_max, ids_cpu_settled + _max_q),
             ).astype(np.float32)
 
         delta_eff = float(ids_cpu[0] - prev_ids_cpu[0])
@@ -336,7 +342,7 @@ def main():
                     help="Methods to evaluate. Defaults: random constant_0.5 constant_4.0 reactive")
     ap.add_argument("--tbsa_table",        default="tbsa_table.npz",
                     help="TBSA lookup-table path (needed when 'tbsa' is in --methods)")
-    ap.add_argument("--ckpt",              default="checkpoints/tdsc_so_u_rew_32/ckpt_iter_000450.pt",
+    ap.add_argument("--ckpt",              default="checkpoints/tdsc_so_u_rew_32_d300_05/ckpt_iter_000700.pt",
     # ap.add_argument("--ckpt",              default="checkpoints/tdsc/ckpt_iter_000500.pt",
     # ap.add_argument("--ckpt",              default="checkpoints/tdsc_so_u_rew_32/ckpt_best.pt",
                     help="Checkpoint path (needed when 'lstm_rl' is in --methods)")
@@ -414,8 +420,8 @@ def main():
                 reward_beta=reward_beta,
                 reward_gamma=reward_gamma,
                 reward_q_th=reward_q_th,
-                # initial_ids_cpu=last_ids_cpu[mname],
-                initial_ids_cpu=None,
+                initial_ids_cpu=last_ids_cpu[mname],
+                # initial_ids_cpu=None,
             )
             last_ids_cpu[mname] = final_ids
             for k, v in ep_result.items():
