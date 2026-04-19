@@ -1,11 +1,68 @@
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from typing import Dict, Tuple, Union
+from typing import Dict, List, Tuple, Union
 import re
 from dataclasses import dataclass
 from typing import Optional, Union
 import math
+
+
+@dataclass(frozen=True)
+class AttackTypeSpec:
+    """Immutable characteristics for one attack type, sampled once per run."""
+    type_id: int
+    lambda_base: float
+    noise_std: float
+    pattern_type: str            # "sinus" | "pw" | "expo" | "static" | "yoyo"
+    t_min_pattern: float
+    t_max_pattern: float
+    latency_per_flow: float
+    bw_per_flow: float
+    non_defendable_bw_const: float
+
+
+class AttackTypeLibrary:
+    """
+    Holds N attack type specifications sampled once per run.
+    Each EdgeArea holds a reference and draws from it at episode start.
+    """
+
+    def __init__(self, n_types: int, sampler_cfg: dict, rng: np.random.Generator):
+        self.n_types = n_types
+        self.sampler_cfg = sampler_cfg
+        self._specs: List[AttackTypeSpec] = []
+        self._sample_all(rng)
+
+    def _sample_all(self, rng: np.random.Generator):
+        cfg = self.sampler_cfg
+        pattern_types = cfg.get("pattern_types", ["sinus", "pw", "expo", "static"])
+        specs = []
+        for i in range(self.n_types):
+            lb_range  = cfg["lambda_base"]
+            ns_range  = cfg["noise_std"]
+            tcm_range = cfg["t_cycle_min"]
+            tcd_range = cfg["t_cycle_delta"]
+            lat_range = cfg["latency_per_flow"]
+            bw_range  = cfg["bw_per_flow"]
+            t_min = float(rng.uniform(*tcm_range))
+            t_max = t_min + float(rng.uniform(*tcd_range))
+            specs.append(AttackTypeSpec(
+                type_id=i,
+                lambda_base=float(rng.uniform(*lb_range)),
+                noise_std=float(np.clip(rng.uniform(*ns_range), 0.0, 1.0)),
+                pattern_type=str(rng.choice(pattern_types)),
+                t_min_pattern=t_min,
+                t_max_pattern=t_max,
+                latency_per_flow=float(rng.uniform(*lat_range)),
+                bw_per_flow=float(rng.uniform(*bw_range)),
+                non_defendable_bw_const=float(cfg.get("non_defendable_bw_const", 0.0)),
+            ))
+        self._specs = specs
+
+    def get(self, type_id: int) -> AttackTypeSpec:
+        return self._specs[type_id]
+
 
 class Attacker:
     """
@@ -148,8 +205,13 @@ class Attacker:
     def reset(self, seed=None):
         if seed is not None:
             self.rng = np.random.default_rng(seed)
-        self._init_start()        
+        self._init_start()
 
+    def get_state(self) -> dict:
+        return {"scaling": self.scaling}
+
+    def set_state(self, state: dict):
+        self.scaling = state["scaling"]
 
     def load_at(self, t: int):
         local_step = t - self.start
@@ -181,6 +243,160 @@ class Attacker:
             # "flows_per_sec_ema": float(self._flows_ema[sec_idx]) * self.scaling,
             # "flows_per_sec_ema_mom": float(self._flows_ema_mom[sec_idx]) * self.scaling,
         }
+
+
+class SyntheticAttacker:
+    """
+    Synthetic attacker using pattern-based attack generation (sinus/pw/expo/static/yoyo).
+    Characteristics come from an AttackTypeSpec sampled at run start.
+    """
+
+    def __init__(
+        self,
+        attacker_id: str,
+        spec: "AttackTypeSpec",
+        slot_ms: float,
+        t_max: int,
+        seed: int,
+        cpu_cycle_per_ms: float,
+        cpu_cores: int,
+    ):
+        self.attacker_id = attacker_id
+        self.attack_type = f"type_{spec.type_id}"
+        self.episode_active = True
+
+        self.latency_per_flow = spec.latency_per_flow
+        self.cycle_per_flow = spec.latency_per_flow * float(cpu_cycle_per_ms) * int(cpu_cores)
+        self.bw_per_flow = spec.bw_per_flow
+        self.non_defendable_bw_const = spec.non_defendable_bw_const
+
+        self.slot_ms = slot_ms
+        self.t_max = t_max
+        self.rep = 1
+        self.scaling = 1
+        self.z_t = 0
+        self.tau = 0
+        self.tau_threshold = 4000
+
+        self.pattern_type = spec.pattern_type
+        self.t_min_pattern = spec.t_min_pattern
+        self.t_max_pattern = spec.t_max_pattern
+        self.lambda_base = spec.lambda_base
+        self.noise_std = spec.noise_std
+
+        self.steps_per_sec = int(1000 // slot_ms)
+
+        self.base_seed = seed
+        self.rng = np.random.default_rng(seed)
+        self._init_start()
+
+    def _generate_patterned_trace(self):
+        self.active_len = self.t_max // 2
+        dt = self.slot_ms / 1000.0
+        t_full = np.arange(0, self.active_len * dt, dt)
+        g = np.zeros_like(t_full, dtype=float)
+
+        def sinus_local(t_local, T):
+            return 0.5 * (1.0 + np.sin(2.0 * np.pi * t_local / T))
+
+        def expo_local(t_local, T):
+            x = np.exp(-3.0 * t_local / T)
+            x = (x - np.exp(-3.0)) / (1.0 - np.exp(-3.0))
+            return np.clip(x, 0.0, 1.0)
+
+        def pulse_wave_local(t_local, T):
+            return (t_local < T / 2).astype(float)
+
+        def static_local(t_local, T):
+            return np.ones_like(t_local, dtype=float)
+
+        pattern_fn = {
+            "sinus": sinus_local,
+            "expo": expo_local,
+            "pw": pulse_wave_local,
+            "static": static_local,
+        }.get(self.pattern_type, sinus_local)
+
+        cursor = 0.0
+        total_time = self.active_len * dt
+        while cursor < total_time:
+            T_k = float(self.rng.uniform(self.t_min_pattern, self.t_max_pattern))
+            end = min(cursor + T_k, total_time)
+
+            mask = (t_full >= cursor) & (t_full < end)
+            t_local = t_full[mask] - cursor
+            T_eff = max(end - cursor, dt)
+
+            local_peak_scaling = float(self.rng.uniform(0.8, 1.2))
+            if self.pattern_type != "static":
+                g[mask] = pattern_fn(t_local, T_eff) * local_peak_scaling
+            else:
+                g[mask] = pattern_fn(t_local, T_eff)
+            cursor = end
+
+        noise = self.rng.normal(loc=1.0, scale=self.noise_std, size=len(g))
+        noise = np.clip(noise, 0.05, None)
+
+        lambda_t = self.lambda_base * g * noise
+        self._flows = self.rng.poisson(lam=lambda_t * dt).astype(np.float32)
+
+        hl = float(50.0)
+        alpha = 1.0 - math.exp(math.log(0.5) / hl) if hl > 0 else 1.0
+        self._flows_ema = pd.Series(self._flows).ewm(alpha=alpha, adjust=False).mean().to_numpy(dtype=np.float32)
+
+    def _init_start(self):
+        self.active_len = self.t_max // 2
+        self.start = int(self.rng.uniform(500, self.active_len))
+        self.scaling = float(self.rng.uniform(0.8, 1.4))
+        self.rep = 1
+        self.tau = 0
+        self._generate_patterned_trace()
+
+    def reset(self, seed=None):
+        if seed is not None:
+            self.rng = np.random.default_rng(seed)
+        self._init_start()
+
+    def get_state(self) -> dict:
+        return {"z_t": self.z_t}
+
+    def set_state(self, state: dict):
+        self.z_t = state["z_t"]
+
+    def load_at(self, t: int):
+        if not (self.start <= t < self.start + self.active_len):
+            return None
+
+        local_step = t - self.start
+
+        if self.pattern_type == "yoyo":
+            if self.z_t == 1:
+                self.tau = 0
+                intensity = float(self.lambda_base)
+            elif self.z_t == -1:
+                self.tau = 0
+                intensity = float(self.lambda_base)
+            else:
+                self.tau += 1
+                intensity = float(self.lambda_base) if self.tau > self.tau_threshold else 0.0
+
+            dt = self.slot_ms / 1000.0
+            noise = float(np.clip(self.rng.normal(loc=1.0, scale=self.noise_std), 0.05, None))
+            flows = self.rng.poisson(lam=intensity * noise * dt)
+
+            return {
+                "attacker_id": self.attacker_id,
+                "attack_type": self.attack_type,
+                "flows_per_step": float(flows) * self.scaling,
+            }
+
+        if local_step < len(self._flows):
+            return {
+                "attacker_id": self.attacker_id,
+                "attack_type": self.attack_type,
+                "flows_per_step": float(self._flows[local_step]) * self.scaling,
+            }
+        return None
 
 
 class User:

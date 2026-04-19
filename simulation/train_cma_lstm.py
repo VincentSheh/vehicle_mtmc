@@ -371,8 +371,20 @@ class WriteRecurrentOutToNext(Transform):
 
         nxt.set(("agents","recurrent_state_h"), td.get(("agents","recurrent_state_h_out")))
         nxt.set(("agents","recurrent_state_c"), td.get(("agents","recurrent_state_c_out")))
-        nxt.set("recurrent_state_h_v", td.get("recurrent_state_h_v_out"))
-        nxt.set("recurrent_state_c_v", td.get("recurrent_state_c_v_out"))
+        h_v_out = td.get("recurrent_state_h_v_out", default=None)
+        c_v_out = td.get("recurrent_state_c_v_out", default=None)
+        if h_v_out is not None:
+            # Critic was run: carry updated hidden state to next.
+            nxt.set("recurrent_state_h_v", h_v_out)
+            nxt.set("recurrent_state_c_v", c_v_out)
+        else:
+            # Critic not run during collection: carry current (zero) state forward so
+            # the key remains present in the td at every step.
+            h_v = td.get("recurrent_state_h_v", default=None)
+            c_v = td.get("recurrent_state_c_v", default=None)
+            if h_v is not None:
+                nxt.set("recurrent_state_h_v", h_v)
+                nxt.set("recurrent_state_c_v", c_v)
         return td
 
 class InitRecurrentState(Transform):
@@ -424,8 +436,11 @@ class CarryCriticState(Transform):
         )
 
     def _call(self, td):
-        td.set("recurrent_state_h_v", td.get(("next","recurrent_state_h_v")))
-        td.set("recurrent_state_c_v", td.get(("next","recurrent_state_c_v")))
+        h = td.get(("next", "recurrent_state_h_v"), default=None)
+        c = td.get(("next", "recurrent_state_c_v"), default=None)
+        if h is not None:
+            td.set("recurrent_state_h_v", h)
+            td.set("recurrent_state_c_v", c)
         return td
     
 class FlatToAgentsObs(Transform):
@@ -533,8 +548,10 @@ class AgentRecurrentCore(nn.Module):
         step_mode = (x.ndim == 2)
         if step_mode:
             x = x.unsqueeze(1)          # [B,1,E*D]
-        if is_init.ndim == 2:
-            is_init = is_init.unsqueeze(1)  # [B,1,1]
+        # Normalise is_init to [..., T, 1]: unsqueeze(-1) handles both
+        # [B,1] step-mode and [B,T] train-mode (unsqueeze(1) was wrong for the latter).
+        while is_init.ndim < 3:
+            is_init = is_init.unsqueeze(-1)
 
         B, T, FD = x.shape
         if FD != E * D:
@@ -620,8 +637,8 @@ class CriticRecurrentCore(nn.Module):
         step_mode = (x.ndim == 2)
         if step_mode:
             x = x.unsqueeze(1)             # [B,1,F]
-        if is_init.ndim == 2:
-            is_init = is_init.unsqueeze(1) # [B,1,1]
+        while is_init.ndim < 3:
+            is_init = is_init.unsqueeze(-1)
 
         B, T, F = x.shape
         H = self.hidden_dim
@@ -633,17 +650,13 @@ class CriticRecurrentCore(nn.Module):
         h = td.get("recurrent_state_h_v", default=None)
         c = td.get("recurrent_state_c_v", default=None)
 
-        # # build zero state if missing (this is what fixes your crash)
-        # if h is None or c is None:
-        #     # step_mode: x is [B,1,F], else [B,T,F]
-        #     h0 = torch.zeros((B, 1, H), device=vf.device)
-        #     c0 = torch.zeros((B, 1, H), device=vf.device)
-        # else:
-        # if sequence-shaped, take t=0 as initial
-        if h.ndim == 4:
-            h0 = h[:, 0]   # [B,1,H]
+        if h is None or c is None:
+            h0 = torch.zeros(B, 1, H, device=vf.device)
+            c0 = torch.zeros(B, 1, H, device=vf.device)
+        elif h.ndim == 4:   # [B,T,1,H] sequence-shaped: take t=0 as initial
+            h0 = h[:, 0]
             c0 = c[:, 0]
-        else:
+        else:               # [B,1,H] step-shaped
             h0 = h
             c0 = c
 
@@ -920,6 +933,7 @@ def train(
     gae_lambda = float(train_cfg["loss"]["gae_lambda"])
     base_lr = float(train_cfg["optim"]["lr"])
     base_clip_eps = float(train_cfg["loss"]["clip_epsilon"])
+    loss_critic_type = train_cfg["loss"].get("loss_critic_type", "mse")
 
     ckpt_dir = Path("checkpoints") / run.name
     ckpt_every = 50
@@ -952,9 +966,33 @@ def train(
             traj.get("next").set(("agents", "terminated"), traj.get("next").get(("agents","terminated")).to(torch.bool))
 
         # --- values + GAE ---
+        # Single forward pass gives V(s_0)..V(s_{T-1}) with consistent LSTM context.
+        # next_values[t] = vals[t+1] (same pass), so δ_t = r_t + γ*V(s_{t+1}) - V(s_t)
+        # is computed from a single coherent LSTM unroll — no context mismatch.
+        # The final bootstrap V(s_T) uses a fresh zero-state single-step critic call.
         with torch.no_grad():
             value_net(traj)
-            value_net(traj.get("next"))
+            vals = traj.get(("agents", "state_value"))  # [B,T,E]
+
+            B_sz = vals.shape[0]
+            Hc = hidden_dim * 2
+            dev = vals.device
+            boot_td = TensorDict(
+                {
+                    "observation_flat": traj.get("next").get("observation_flat")[:, -1],
+                    "is_init": torch.zeros(B_sz, 1, dtype=torch.bool, device=dev),
+                    "recurrent_state_h_v": torch.zeros(B_sz, 1, Hc, device=dev),
+                    "recurrent_state_c_v": torch.zeros(B_sz, 1, Hc, device=dev),
+                },
+                batch_size=[B_sz],
+                device=dev,
+            )
+            value_net(boot_td)
+            v_boot = boot_td.get(("agents", "state_value"))  # [B, E]
+
+            next_vals = torch.cat([vals[:, 1:], v_boot.unsqueeze(1)], dim=1)  # [B,T,E]
+            traj.set(("next", "agents", "state_value"), next_vals)
+
             compute_gae_inplace(traj, gamma=gamma, lmbda=gae_lambda, n_edges=n_edges)
 
         last_total_loss = last_policy_loss = last_critic_loss = last_entropy = None
@@ -986,7 +1024,7 @@ def train(
                     old_logp = old_logp.squeeze(-1)
 
                 adv = sub.get(("agents", "advantage"))
-                adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+                adv = (adv - adv.mean(dim=(0, 1), keepdim=True)) / (adv.std(dim=(0, 1), keepdim=True) + 1e-8)
 
                 logits = sub.get(("agents", "logits"))
                 dist = Categorical(logits=logits)
@@ -1000,7 +1038,10 @@ def train(
 
                 v_pred = sub.get(("agents", "state_value"))
                 v_targ = sub.get(("agents", "value_target"))
-                critic_loss = 0.5 * (v_targ - v_pred).pow(2).mean()
+                if loss_critic_type == "smooth_l1":
+                    critic_loss = nn.functional.smooth_l1_loss(v_pred, v_targ)
+                else:
+                    critic_loss = 0.5 * (v_targ - v_pred).pow(2).mean()
 
                 entropy_loss = -entropy.mean()
                 total_loss = policy_loss + critic_coeff * critic_loss + entropy_coeff * entropy_loss

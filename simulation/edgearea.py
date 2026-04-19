@@ -8,7 +8,7 @@ import math
 
 from service import IDS, VideoPipeline
 
-from request import User, Attacker
+from request import User, Attacker, AttackTypeLibrary, SyntheticAttacker
 
 @dataclass
 class ResourceBudget:
@@ -53,6 +53,9 @@ class EdgeArea:
         users: List[User],
         attackers: List[Attacker],
         pipeline: VideoPipeline,
+        attack_type_library: Optional[AttackTypeLibrary] = None,
+        t_max: int = 0,
+        dirichlet_alpha: float = 1.0,
     ):
         self.area_id = str(area_id)
         self.cpu_cycle_per_ms = float(cpu_cycle_per_ms)
@@ -72,6 +75,9 @@ class EdgeArea:
         self.attackers = list(attackers)
         
         self.pipeline = pipeline
+        self.attack_type_library = attack_type_library
+        self.t_max = int(t_max)
+        self.dirichlet_alpha = float(dirichlet_alpha)
 
         self.ids_cpu = self.budget.cpu - 0.5
         self.va_cpu = self.budget.cpu - self.ids_cpu
@@ -111,17 +117,54 @@ class EdgeArea:
             user.reset(seed=user_seed)
 
         # 3) Reset attackers (independent seeds)
-        for i, atk in enumerate(self.attackers):
+        if self.attack_type_library is not None:
+            n = self.attack_type_library.n_types
+            concentration = np.ones(n) * self.dirichlet_alpha
+            p_attack_type = self.rng.dirichlet(concentration)
+            chosen_type_id = int(self.rng.choice(n, p=p_attack_type))
+            spec = self.attack_type_library.get(chosen_type_id)
             atk_seed = int(self.rng.integers(0, 2**32))
-            atk.reset(seed=atk_seed)     
-        idx = int(self.rng.integers(0, len(self.attackers)))
-        self.cur_attacker = [self.attackers[idx]]
+            self.attackers = [SyntheticAttacker(
+                attacker_id=f"atk_type_{chosen_type_id}",
+                spec=spec,
+                slot_ms=self.slot_ms,
+                t_max=self.t_max,
+                seed=atk_seed,
+                cpu_cycle_per_ms=self.cpu_cycle_per_ms,
+                cpu_cores=int(self.budget.cpu),
+            )]
+            self.cur_attacker = self.attackers
+        else:
+            for atk in self.attackers:
+                atk_seed = int(self.rng.integers(0, 2**32))
+                atk.reset(seed=atk_seed)
+            idx = int(self.rng.integers(0, len(self.attackers)))
+            self.cur_attacker = [self.attackers[idx]]
 
     def reset_running_attack_stats(self):
         self._atk_ema_inited = False
         self._atk_ema = 0.0
-        self._atk_mom_ema = 0.0    
-        
+        self._atk_mom_ema = 0.0
+
+    def get_state(self) -> dict:
+        return {
+            "ids_cpu": self.ids_cpu,
+            "va_cpu": self.va_cpu,
+            "_atk_ema_inited": self._atk_ema_inited,
+            "_atk_ema": self._atk_ema,
+            "_atk_mom_ema": self._atk_mom_ema,
+            "attacker_states": [atk.get_state() for atk in self.attackers],
+        }
+
+    def set_state(self, state: dict):
+        self.ids_cpu = state["ids_cpu"]
+        self.va_cpu  = state["va_cpu"]
+        self._atk_ema_inited = state["_atk_ema_inited"]
+        self._atk_ema        = state["_atk_ema"]
+        self._atk_mom_ema    = state["_atk_mom_ema"]
+        for i, atk_state in enumerate(state["attacker_states"]):
+            self.attackers[i].set_state(atk_state)
+
     # --------------------------
     # Load aggregation
     # --------------------------
@@ -148,7 +191,7 @@ class EdgeArea:
                 continue
             
 
-            flows = float(r["flows_per_sec"])
+            flows = float(r.get("flows_per_sec", r.get("flows_per_step", 0.0)))
             total_flows += flows
             total_bw_in += flows * float(atk.bw_per_flow)
             total_cycles_per_s += flows * float(atk.cycle_per_flow)
@@ -656,9 +699,9 @@ class EdgeArea:
         attack_cycles_per_ms = float(attack_req_in) * float(atk_cycles_per_req)
 
         # -------------------------------------------------
-        # Attack EMA / momentum based on admitted attack load
+        # Attack EMA / momentum based on pre-IDS attack rate (matches singleedge)
         # -------------------------------------------------
-        atk_signal = float(attack_req_in)
+        atk_signal = float(atk_in_ref)
 
         if not getattr(self, "_atk_ema_inited", False):
             self._atk_ema_inited = True
@@ -688,6 +731,8 @@ class EdgeArea:
         avail_cycles_per_ms = self.cpu_cycle_per_ms * self.va_cpu
         avail_cycles_aft_atk_per_ms = max(0.0, avail_cycles_per_ms - attack_cycles_per_ms)
 
+        attack_cpu_frac = float(attack_cycles_per_ms / max(total_cycles_per_ms, 1e-9))
+
         if avail_cycles_aft_atk_per_ms <= 1e-12 or uplink_available <= 1e-12:
             benign_dropped_uplink = benign_req_in
             benign_dropped_compute = benign_req_in
@@ -706,6 +751,7 @@ class EdgeArea:
                 "uplink_util": 1.0,
                 "mean_latency_ms": float("inf"),
                 "qoe": 0.0,
+                "attack_cpu_frac": attack_cpu_frac,
                 "admitted_user_req_in": int(benign_req_in),
                 "admitted_atk_req_in": int(attack_req_in),
                 "total_req_in": float(total_req_in),
@@ -752,18 +798,19 @@ class EdgeArea:
         )
         qoe, od_and_res_plan = self.match_detectors_to_resolutions(upload_plan, od_plan)
 
-        va_cpu_utilization = used_cycles / max(avail_cycles_per_ms * self.slot_ms, 1e-9)
+        va_cpu_utilization = min(1.0, (used_cycles + attack_cycles_per_ms + self.ids_cpu * self.cpu_cycle_per_ms) / max(total_cycles_per_ms, 1e-9))
 
         served_compute = int(sum(od_plan.values()))
         assert served_compute + int(dropped_compute) == int(served_req_uplink)
 
         # -------------------------------------------------
-        # Final QoE: normalize by benign demand only
+        # Final QoE: quadratic drop penalty over total demand (matches singleedge)
         # -------------------------------------------------
-        if benign_req_in <= 0:
+        if total_req_in <= 0:
             qoe = 1.0
         else:
-            qoe = float(qoe) * (served_compute / float(benign_req_in))
+            drop_frac = 1.0 - served_compute / total_req_in
+            qoe = float(qoe) * (1.0 - drop_frac) ** 2
 
         return {
             "ids_out": ids_out,
@@ -778,6 +825,7 @@ class EdgeArea:
             "uplink_util": float(uplink_util),
             "mean_latency_ms": float(mean_latency_ms),
             "qoe": float(qoe),
+            "attack_cpu_frac": attack_cpu_frac,
             "admitted_user_req_in": int(benign_req_in),
             "admitted_atk_req_in": int(attack_req_in),
             "total_req_in": float(total_req_in),

@@ -55,7 +55,7 @@ loss:
 # =========================
 model:
   hidden_dim: 64           # ActorNet / CriticNet hidden size
-  n_actions: 9             # discrete {scale down, hold, scale up}
+  n_actions: 3             # discrete {scale down, hold, scale up}
 
 # =========================
 # Observation normalization
