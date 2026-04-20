@@ -13,15 +13,16 @@ globals:
   decision_interval: 300
   scaling_time_step: [300, 450, 498, 544] # for 0.5,1.0,1.5,2.0 scaling
 
-  ids:
+  ids: # With 0.0357, it can defend 28000 attacks with 8 IDS CPU
     latency_ms: 0.0357 #0.357
     cycles_ms: 0.0
   
   attack_sampler:
     n_types: 10
-    pattern_types: ["sinus", "pw", "expo" ] #, "yoyo"]
+    # pattern_types: ["sinus", "pw", "expo" ] #, "yoyo"]
     # pattern_types: ["pw"]
-    lambda_base:      [7000, 14000]   # flows/sec
+    pattern_types: ["yoyo"]
+    lambda_base:      [7000, 20000]   # flows/sec
     noise_std:        [0.05, 0.10]
     t_cycle_min:      [300, 500]     # seconds (lower bound on cycle duration)
     t_cycle_delta:    [300, 800]   # seconds added to t_min to get t_max
@@ -33,9 +34,9 @@ globals:
 
   reward:
     alpha_inv: 5.0   # QoE shortfall normalizer        (alpha = 1/alpha_inv = 10)      || 0.10
-    beta_inv:  7.0   # Attack residual normalizer       (beta  = 1/beta_inv  =  5)     || 0.20
-    gamma_inv: 10.0   # Benign collateral normalizer     (gamma = 1/gamma_inv ≈  8.33)  || 0.12
-    q_th:      0.2   # QoE shortfall threshold
+    beta_inv:  9.0   # Attack residual normalizer       (beta  = 1/beta_inv  =  5)     || 0.20
+    gamma_inv: 8.0   # Benign collateral normalizer     (gamma = 1/gamma_inv ≈  8.33)  || 0.12
+    q_th:      0.35   # QoE shortfall threshold
 
   video_pipeline:
     reid_latency: 20 #! Should consider batch processing
@@ -111,23 +112,3 @@ edge_areas:
           mu_max: 200.0 # Before Conversion to per step request = 40.0
           kappa: 0.25 
           sigma: 8 # Before Conversion to per step request = 0.9
-
-    attackers:
-      - attacker_type: "atk_01"
-      # - attacker_type: "atk_02"
-      # - attacker_type: "atk_03"
-      # - attacker_type: "atk_04"
-      # - attacker_type: "atk_05"
-
-  # - area_id: "E2"
-  #   cpu_cycle_per_ms: 3.8 #3.8GHz #3.8E6 / ms
-  #   budget: { cpu: 8.0, mem: 8.0, uplink: 12.5 }
-  #   constraints:
-  #     D_Max: 250.0
-  #     MOTA_min: 0.40    
-  #     Gamma: 0.0005 
-  #   ids_config:
-  #     accuracy_by_type:
-  #       default: [0.01, 0.05]
-  #   users: []
-  #   attackers: []

@@ -42,6 +42,8 @@ class ActContext:
 # Abstract base
 # ---------------------------------------------------------------------------
 class BaselinePolicy(abc.ABC):
+    min_cpu_override: Optional[float] = None
+
     @abc.abstractmethod
     def act(self, ctx: ActContext) -> tuple[Optional[np.ndarray], np.ndarray]:
         """
@@ -82,6 +84,17 @@ class RandomPolicy(BaselinePolicy):
 
 
 # ---------------------------------------------------------------------------
+# No IDS policy (IDS fully disabled, CPU = 0)
+# ---------------------------------------------------------------------------
+class NoIDSPolicy(BaselinePolicy):
+    min_cpu_override = 0.0
+
+    def act(self, ctx: ActContext) -> tuple[Optional[np.ndarray], np.ndarray]:
+        n = len(ctx.ids_cpu)
+        return np.zeros(n, dtype=np.float32), np.zeros(n, dtype=np.int64)
+
+
+# ---------------------------------------------------------------------------
 # Reactive threshold policy
 # ---------------------------------------------------------------------------
 class ReactivePolicy(BaselinePolicy):
@@ -97,6 +110,33 @@ class ReactivePolicy(BaselinePolicy):
             delta = -np.ones(n_edges, dtype=np.int64)
         else:
             delta = np.zeros(n_edges, dtype=np.int64)
+        return None, delta
+
+
+# ---------------------------------------------------------------------------
+# App workload autoscaling policy (wrong signal: VA utilization, not attack load)
+# ---------------------------------------------------------------------------
+class AppAutoscalePolicy(BaselinePolicy):
+    def __init__(self, high_threshold: float = 0.80, low_threshold: float = 0.20):
+        self.high_threshold = high_threshold
+        self.low_threshold  = low_threshold
+
+    def act(self, ctx: ActContext) -> tuple[Optional[np.ndarray], np.ndarray]:
+        import pandas as pd
+        n   = len(ctx.ids_cpu)
+        env = ctx.env
+        va_util = 0.0
+        if env.history:
+            records = env.history[-ctx.decision_interval * n:]
+            df = pd.DataFrame([m.__dict__ for m in records])
+            if "va_cpu_utilization" in df.columns:
+                va_util = float(np.mean(df["va_cpu_utilization"].values))
+        if va_util >= self.high_threshold:
+            delta = np.ones(n, dtype=np.int64)
+        elif va_util <= self.low_threshold:
+            delta = -np.ones(n, dtype=np.int64)
+        else:
+            delta = np.zeros(n, dtype=np.int64)
         return None, delta
 
 
@@ -364,13 +404,23 @@ def make_baseline_policy(
     if name.startswith("constant_"):
         cpu_val = float(name.split("_", 1)[1])
         return ConstantPolicy(cpu_val)
+    elif name == "no_ids":
+        return NoIDSPolicy()
+    elif name == "static_low":
+        return ConstantPolicy(0.5)
+    elif name == "static_balanced":
+        return ConstantPolicy(2.0)
+    elif name == "static_high":
+        return ConstantPolicy(4.0)
     elif name == "random":
         return RandomPolicy()
-    elif name == "reactive":
+    elif name in ("reactive", "autoscale_def"):
         return ReactivePolicy()
-    elif name == "tbsa":
+    elif name == "autoscale_app":
+        return AppAutoscalePolicy()
+    elif name in ("tbsa", "offline_optimal"):
         if tbsa_table_path is None:
-            raise ValueError("tbsa_table_path must be provided for 'tbsa' policy")
+            raise ValueError(f"tbsa_table_path must be provided for '{name}' policy")
         tbsa = TBSAPolicy(tbsa_table_path)
         return TBSAWrapperPolicy(tbsa)
     elif name == "lstm_rl":
@@ -378,6 +428,6 @@ def make_baseline_policy(
             raise ValueError("ckpt_path must be provided for 'lstm_rl' policy")
         if obs_keys is None:
             raise ValueError("obs_keys must be provided for 'lstm_rl' policy")
-        return LSTMRLPolicy(ckpt_path=ckpt_path, obs_keys=obs_keys, device=device, greedy=False)
+        return LSTMRLPolicy(ckpt_path=ckpt_path, obs_keys=obs_keys, device=device, greedy=True)
     else:
         raise ValueError(f"Unknown baseline policy name: {name!r}")

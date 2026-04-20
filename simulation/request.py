@@ -172,7 +172,7 @@ class Attacker:
         self._flows_ema = pd.Series(self._flows).ewm(alpha=alpha, adjust=False).mean().to_numpy(dtype=np.float32)
 
     def _init_start(self):
-        self.active_len = self.t_max // 2
+        self.active_len = self.t_max // 4
         max_start = self.t_max - self.active_len
         # Sample start and scaling BEFORE trace generation so these are
         # identical across pattern types for the same seed.
