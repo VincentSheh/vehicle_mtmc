@@ -713,20 +713,17 @@ class TorchRLEnvWrapper(EnvBase):
                 self.transition_ticks_remaining = self.transition_ticks_total
         # else: in transition — ids_cpu already updated as queue; ids_cpu_target unchanged
 
-        # --- Asymmetric effective allocation for the transition in progress ---
-        # scale-up:   IDS holds at settled, VA drops immediately to budget-target
-        # scale-down: IDS drops immediately to target, VA holds at budget-settled
+        # Effective allocation during a transition.
+        # Both directions: IDS holds at settled for the full duration.
+        # scale-up:   VA drops immediately (overhead = -(target-settled) < 0)
+        # scale-down: VA holds at settled, step_overhead = 0 (no VA penalty; freed
+        #             cores become available only when settled commits to target)
         target  = float(self.ids_cpu_target[0].item())
         settled = float(self.ids_cpu_settled[0].item())
         delta_to_settled = target - settled
 
-        ids_cpu_eff = self.ids_cpu_settled.clone()
-        if self.transition_ticks_remaining > 0:
-            if delta_to_settled > 1e-9:   # scale-up: IDS holds at settled
-                ids_cpu_eff[0] = settled
-            else:                          # scale-down: IDS drops immediately
-                ids_cpu_eff[0] = target
-        step_overhead = -abs(delta_to_settled) if self.transition_ticks_remaining > 0 else 0.0
+        ids_cpu_eff = self.ids_cpu_settled.clone()   # IDS holds at settled in all cases
+        step_overhead = -delta_to_settled if (self.transition_ticks_remaining > 0 and delta_to_settled > 1e-9) else 0.0
 
         total_reward = 0.0
         total_lambda_res = 0.0
@@ -750,11 +747,8 @@ class TorchRLEnvWrapper(EnvBase):
                         self.transition_ticks_total     = self._lookup_scaling_duration(gap)
                         self.transition_ticks_remaining = self.transition_ticks_total
                         new_d = float(self.ids_cpu_target[0].item()) - float(self.ids_cpu_settled[0].item())
-                        step_overhead = -abs(new_d)
-                        if new_d > 1e-9:   # scale-up: IDS holds
-                            ids_cpu_eff[0] = float(self.ids_cpu_settled[0].item())
-                        else:              # scale-down: IDS drops
-                            ids_cpu_eff[0] = float(self.ids_cpu_target[0].item())
+                        ids_cpu_eff[0] = float(self.ids_cpu_settled[0].item())   # hold at settled (both directions)
+                        step_overhead = -new_d if new_d > 1e-9 else 0.0
                     else:
                         ids_cpu_eff[0] = float(self.ids_cpu_settled[0].item())
                         step_overhead = 0.0
@@ -948,7 +942,7 @@ def test_environment_run(cfg_path: str, plot=False, decision_interval: int = 500
     env = build_env_base(cfg_path)
 
     dfs = []
-    for i in range(5):
+    for i in range(15):
         env.reset(seed=1000 + i)
 
         n_edges = len(env.edge_areas)
@@ -1043,4 +1037,4 @@ def test_environment_run(cfg_path: str, plot=False, decision_interval: int = 500
     print(f"Plots saved to {out_dir}/")    
         
 if __name__ == "__main__":
-    test_environment_run("./configs/simulation_0.yaml", plot=True, method="constant", constant_cpu=0.0)
+    test_environment_run("./configs/simulation_0.yaml", plot=True, method="constant", constant_cpu=2.0)
