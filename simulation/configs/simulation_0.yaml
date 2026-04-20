@@ -109,7 +109,7 @@ edge_areas:
         synthetic:
           rw_sigma_per_sqrt_sec: 1.2
           mu_min: 20.0 # Before Conversion to per step request = 5.0
-          mu_max: 250.0 # Before Conversion to per step request = 40.0
+          mu_max: 200.0 # Before Conversion to per step request = 40.0
           kappa: 0.25 
           sigma: 8 # Before Conversion to per step request = 0.9
 

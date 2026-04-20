@@ -24,11 +24,11 @@ from matplotlib import pyplot as plt
 
 from service import IDS, VideoPipeline
 
-from request import User, Attacker, AttackTypeLibrary
+from request import User, AttackTypeLibrary
 
 from edgearea import ResourceBudget, EdgeArea
 
-from offload import OffloadPlan, balance_with_caps_and_prop_filter
+from offload import OffloadPlan, balance_with_caps_and_prop_filter, sp2_inspection_offload
 
 
 N_ACTION = 9
@@ -103,6 +103,10 @@ class Environment:
         delay_ms: np.ndarray,
         t_max: int,
         seed: int = 0,
+        dirichlet_alpha: float = 1.0,
+        sp2_fnr_matrix: Optional[np.ndarray] = None,
+        sp2_fpr_matrix: Optional[np.ndarray] = None,
+        sp2_weights: Optional[Tuple[float, float, float, float]] = None,
     ):
         self.edge_areas = edge_areas
         self.delay_ms = np.asarray(delay_ms, dtype=np.float32)
@@ -130,7 +134,36 @@ class Environment:
 
         np.random.seed(seed)
         self.rng = np.random.default_rng(seed)
-        self.active_attack = None        
+        self.active_attack = None
+        self.dirichlet_alpha: float = float(dirichlet_alpha)
+
+        # SP2 Phase 1: Accuracy-Aware Inspection Offloading
+        self.sp2_fnr_matrix: Optional[np.ndarray] = (
+            np.asarray(sp2_fnr_matrix, dtype=np.float64) if sp2_fnr_matrix is not None else None
+        )
+        self.sp2_fpr_matrix: Optional[np.ndarray] = (
+            np.asarray(sp2_fpr_matrix, dtype=np.float64) if sp2_fpr_matrix is not None else None
+        )
+        self.sp2_weights: Tuple[float, float, float, float] = sp2_weights or (1.0, 1.0, 0.01, 1.0)
+        self._ids_util_prev: Dict[str, float] = {eid: 0.0 for eid in self.area_ids}
+
+        # Compute joint Dirichlet partition once — fixed for the entire run.
+        # For each type k: Dirichlet(alpha * ones(n_edges)) partitions that type's weight across edges.
+        # p_per_edge[k, e] = probability of attack type k at edge e.
+        lib = next((e.attack_type_library for e in self.edge_areas if e.attack_type_library is not None), None)
+        n_edges = len(self.edge_areas)
+        self.p_per_edge = None
+        if lib is not None and n_edges > 1:
+            n_types = lib.n_types
+            W = np.stack([self.rng.dirichlet(self.dirichlet_alpha * np.ones(n_edges)) for _ in range(n_types)], axis=0)
+            self.p_per_edge = W / W.sum(axis=0, keepdims=True)  # (n_types, n_edges)
+
+            header = f"  {'Type':<6}" + "".join(f"{eid:>10}" for eid in self.area_ids)
+            print("\n[Environment] Attack type Dirichlet partition P(type|edge):")
+            print(header)
+            for k in range(n_types):
+                row = f"  {k:<6}" + "".join(f"{self.p_per_edge[k, e]:>10.4f}" for e in range(n_edges))
+                print(row)
 
     def _area_ids(self) -> List[int]:
         return self.area_ids
@@ -144,9 +177,9 @@ class Environment:
         self.history.clear()
         self.final_qoe = 0
 
-        # reset edges
         for i, edge in enumerate(self.edge_areas):
-            edge.reset(seed=seed + i * 99)
+            p = self.p_per_edge[:, i] if self.p_per_edge is not None else None
+            edge.reset(seed=seed + i * 99, p_attack_type=p)
             # edge.ids_cpu = 4.0
 
         # ---- enforce: only ONE attacker active in this episode ----
@@ -243,19 +276,35 @@ class Environment:
 
             # A) IDS OFFLOAD + EXECUTE
             W_def_src = {eid: float(obs[eid]["total_workload_in"]) for eid in area_ids}
-            c_def_dst = {eid: float(edges[eid].ids_cpu) for eid in area_ids}
 
-            kappa_ids_min = min(float(edges[eid].ids.cycles_per_packet) for eid in area_ids)
-
-            plan_def = balance_with_caps_and_prop_filter(
-                area_ids=area_ids,
-                edges=edges,
-                kappa_min=kappa_ids_min,
-                W_src=W_def_src,
-                c_dst=c_def_dst,
-                prop_delay=self.prop_delay,
-                tau_loc=None,
-            )
+            if (
+                self.sp2_fnr_matrix is not None
+                and self.sp2_fpr_matrix is not None
+                and len(area_ids) > 1
+            ):
+                plan_def = sp2_inspection_offload(
+                    area_ids=area_ids,
+                    edges=edges,
+                    W_src=W_def_src,
+                    fnr_matrix=self.sp2_fnr_matrix,
+                    fpr_matrix=self.sp2_fpr_matrix,
+                    prop_delay=self.prop_delay,
+                    ids_util_prev=self._ids_util_prev,
+                    weights=self.sp2_weights,
+                    id_to_idx=self.id_to_idx,
+                )
+            else:
+                c_def_dst = {eid: float(edges[eid].ids_cpu) for eid in area_ids}
+                kappa_ids_min = min(float(edges[eid].ids.cycles_per_packet) for eid in area_ids)
+                plan_def = balance_with_caps_and_prop_filter(
+                    area_ids=area_ids,
+                    edges=edges,
+                    kappa_min=kappa_ids_min,
+                    W_src=W_def_src,
+                    c_dst=c_def_dst,
+                    prop_delay=self.prop_delay,
+                    tau_loc=None,
+                )
 
             exec_user_in = {e: 0 for e in area_ids}
             exec_atk_in  = {e: 0 for e in area_ids}
@@ -289,6 +338,7 @@ class Environment:
             for e_exec in area_ids:
                 admitted_user_exec[e_exec] = int(ids_out_exec[e_exec].get("user_pass_cnt", exec_user_in[e_exec]))
                 admitted_atk_exec[e_exec]  = int(ids_out_exec[e_exec].get("atk_pass_cnt", 0))
+                self._ids_util_prev[e_exec] = float(ids_out_exec[e_exec].get("ids_cpu_util", 0.0))
 
             W_va_src = {
                 eid: float(admitted_user_exec[eid] + admitted_atk_exec[eid])
@@ -360,8 +410,9 @@ class Environment:
         edges = self._edge_by_id()
 
         # snapshot → ideal run (no attacks) → restore → real run
+        ideal_ids_cpus = [0.0] * len(self.edge_areas)
         snapshot = self._snapshot_edges()
-        ideal_cache, _, _ = self._run_step_once(ids_cpus, overhead, disable_attack=True)
+        ideal_cache, _, _ = self._run_step_once(ideal_ids_cpus, overhead, disable_attack=True)
         self._restore_edges(snapshot)
         real_cache, _, va_atk_in_dst = self._run_step_once(ids_cpus, overhead, disable_attack=False)
 
@@ -439,8 +490,10 @@ def build_env_base(cfg_path: str):
             sampler_cfg=sampler_cfg,
             rng=lib_rng,
         )
+        dirichlet_alpha = float(sampler_cfg.get("dirichlet_alpha", 1.0))
     else:
         attack_type_library = None
+        dirichlet_alpha = 1.0
 
     # --------------------------------------------------
     # Build shared VideoPipeline
@@ -456,7 +509,7 @@ def build_env_base(cfg_path: str):
     # --------------------------------------------------
     edge_areas = []
 
-    for area_cfg in cfg["edge_areas"]:
+    for i, area_cfg in enumerate(cfg["edge_areas"]):
         ids = IDS(
             cycles_per_packet=globals_cfg.ids_cycles_per_packet,
             accuracy_by_type_fpr_fnr={
@@ -475,40 +528,13 @@ def build_env_base(cfg_path: str):
                     user_id=u["user_id"],
                     slot_ms=globals_cfg.slot_ms,
                     t_max=cfg["run"]["t_max"],
-                    seed=cfg["run"]["seed"],
+                    seed=cfg["run"]["seed"] + i,
                     synth_cfg=u["synthetic"],
                 )
             )
 
-        # When attack_type_library is set, attackers are created dynamically at episode reset
+        # Attackers are created dynamically at episode reset via attack_type_library
         attackers = []
-
-        if attack_type_library is None:
-            for atk_ref in area_cfg.get("attackers", []):
-                atk_type = atk_ref["attacker_type"]
-
-                if atk_type not in cfg["globals"].get("attack", {}):
-                    raise KeyError(f"Unknown attacker_type: {atk_type}")
-
-                atk_cfg = cfg["globals"]["attack"][atk_type]
-
-                attackers.append(
-                    Attacker(
-                        attacker_id=atk_type,
-                        attack_type=atk_cfg["type"],
-                        ts_df=pd.read_csv(atk_cfg["ts_path"]),
-                        latency_per_flow=atk_cfg["latency_per_flow"],
-                        bw_per_flow=atk_cfg["bw_per_flow"],
-                        base_scaling=atk_cfg["scaling"],
-                        mean_rep=atk_cfg["mean_rep"],
-                        non_defendable_bw_const=atk_cfg["non_defendable_bw_const"],
-                        slot_ms=globals_cfg.slot_ms,
-                        t_max=cfg["run"]["t_max"],
-                        seed=cfg["run"]["seed"],
-                        cpu_cycle_per_ms=globals_cfg.cpu_cycle_per_ms,
-                        cpu_cores=globals_cfg.cpu_cores,
-                    )
-                )
 
         edge = EdgeArea(
             area_id=area_cfg["area_id"],
@@ -530,12 +556,21 @@ def build_env_base(cfg_path: str):
         edge_areas.append(edge)
         
 
-    # Build delay matrix (simple symmetric test case)
+    # Build delay matrix from config, or default to 0 (same-node)
     n = len(edge_areas)
-    delay_ms = np.zeros((n, n), dtype=np.float32) #TODO!
-    for i in range(n):
-        for j in range(n):
-            delay_ms[i, j] = 2.0 if i != j else 0.0
+    if "delay_ms" in cfg["globals"]:
+        delay_ms = np.asarray(cfg["globals"]["delay_ms"], dtype=np.float32)
+        assert delay_ms.shape == (n, n), (
+            f"globals.delay_ms must be ({n},{n}), got {delay_ms.shape}"
+        )
+    else:
+        delay_ms = np.zeros((n, n), dtype=np.float32)
+
+    # SP2 Phase 1 matrices (optional; falls back to balance_with_caps_and_prop_filter if absent)
+    g = cfg["globals"]
+    sp2_fnr = np.asarray(g["sp2_fnr_matrix"], dtype=np.float64) if "sp2_fnr_matrix" in g else None
+    sp2_fpr = np.asarray(g["sp2_fpr_matrix"], dtype=np.float64) if "sp2_fpr_matrix" in g else None
+    sp2_weights = tuple(float(w) for w in g["sp2_weights"]) if "sp2_weights" in g else None
 
     # Build environment
     env = Environment(
@@ -543,6 +578,10 @@ def build_env_base(cfg_path: str):
         delay_ms=delay_ms,
         t_max=cfg["run"]["t_max"],
         seed=cfg["run"]["seed"],
+        dirichlet_alpha=dirichlet_alpha,
+        sp2_fnr_matrix=sp2_fnr,
+        sp2_fpr_matrix=sp2_fpr,
+        sp2_weights=sp2_weights,
     )
     env.reset(cfg["run"]["seed"])
     return env
@@ -946,7 +985,7 @@ def test_environment_run(cfg_path: str, plot=False, decision_interval: int = 500
     os.makedirs(out_dir, exist_ok=True)
 
     (
-        all_df.pivot(index="t", columns="area_id", values=["qoe_mean", "qoe_mean_ideal", "benign_col_dmg"])
+        all_df.pivot(index="t", columns="area_id", values=["qoe_mean", "qoe_mean_ideal"])#, "benign_col_dmg"])
         .plot(figsize=(10, 4), title="QoE over time")
         .get_figure()
         .savefig(f"{out_dir}/qoe_over_time.png", bbox_inches="tight")

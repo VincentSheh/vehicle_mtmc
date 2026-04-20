@@ -18,8 +18,9 @@ globals:
 
   attack_sampler:
     n_types: 10
-    pattern_types: ["pw"]
-    lambda_base:      [7000, 14000]   # flows/sec
+    dirichlet_alpha: 0.2  # symmetric Dirichlet concentration over edges per type; higher=uniform, lower=concentrated on one edge
+    pattern_types: ["sinus", "pw", "expo"]
+    lambda_base:      [7000, 7000]   # flows/sec
     noise_std:        [0.05, 0.10]
     t_cycle_min:      [300, 500]     # seconds (lower bound on cycle duration)
     t_cycle_delta:    [300, 800]     # seconds added to t_min to get t_max
@@ -32,6 +33,29 @@ globals:
     beta_inv:  2.5   # Attack residual normalizer       (beta  = 1/beta_inv  =  5)
     gamma_inv: 15    # Benign collateral normalizer     (gamma = 1/gamma_inv ≈ 8.33)
     q_th:      0.20  # QoE shortfall threshold
+
+  # SP2 Phase 1: Accuracy-Aware Inspection Offloading
+  # Matrices are |E|×|E|; row = source edge index, col = target edge index.
+  # Order matches edge_areas list: E1=row/col 0, E2=row/col 1.
+  sp2_fnr_matrix:
+    - [0.10, 0.15]   # traffic from E1 inspected at: [E1, E2]
+    - [0.15, 0.10]   # traffic from E2 inspected at: [E1, E2]
+
+  sp2_fpr_matrix:
+    - [0.05, 0.10]
+    - [0.10, 0.05]
+
+  # [omega_1, omega_2, omega_3, omega_4] = [FNR weight, FPR weight, prop_delay weight, util weight]
+  sp2_weights: [1.0, 1.0, 0.01, 1.0]
+
+  # Propagation delay matrix in ms: row=source edge index, col=target edge index.
+  # Order matches edge_areas list: E1=0, E2=1. Diagonal must be 0.
+  # - Campus LAN: 1–5 ms                                                                                                                                                                                                                   
+  # - City-scale (intersection to intersection): 5–20 ms                                                                                                                                                                                   
+  # - Metro area / across districts: 20–50 ms     
+  delay_ms:
+    - [0.0, 30.0]
+    - [30.0, 0.0]
 
   video_pipeline:
     reid_latency: 20 #! Should consider batch processing
@@ -104,7 +128,7 @@ edge_areas:
         synthetic:
           rw_sigma_per_sqrt_sec: 1.2
           mu_min: 20.0
-          mu_max: 250.0
+          mu_max: 200.0
           kappa: 0.25
           sigma: 8
 
@@ -133,7 +157,7 @@ edge_areas:
         synthetic:
           rw_sigma_per_sqrt_sec: 1.2
           mu_min: 20.0
-          mu_max: 250.0
+          mu_max: 200.0
           kappa: 0.25
           sigma: 8
 

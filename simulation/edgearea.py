@@ -8,7 +8,7 @@ import math
 
 from service import IDS, VideoPipeline
 
-from request import User, Attacker, AttackTypeLibrary, SyntheticAttacker
+from request import User, Attacker, AttackTypeLibrary
 
 @dataclass
 class ResourceBudget:
@@ -78,8 +78,18 @@ class EdgeArea:
         self.attack_type_library = attack_type_library
         self.t_max = int(t_max)
         self.dirichlet_alpha = float(dirichlet_alpha)
+        
+        if attack_type_library is not None:
+            print(f"\n[{area_id}] Attack type library (fixed for this run):")
+            print(f"  {'ID':<4} {'pattern':<8} {'λ_base':>8} {'noise_σ':>8} "
+                  f"{'t_min(s)':>9} {'t_max(s)':>9} {'lat_ms':>7} {'bw_Mbps':>8}")
+            for tid in range(attack_type_library.n_types):
+                s = attack_type_library.get(tid)
+                print(f"  {tid:<4} {s.pattern_type:<8} {s.lambda_base:>8.1f} {s.noise_std:>8.3f} "
+                      f"{s.t_min_pattern:>9.1f} {s.t_max_pattern:>9.1f} "
+                      f"{s.latency_per_flow:>7.3f} {s.bw_per_flow:>8.4f}")        
 
-        self.ids_cpu = self.budget.cpu - 0.5
+        self.ids_cpu = 0.5
         self.va_cpu = self.budget.cpu - self.ids_cpu
 
         self._last_action: Optional[Tuple[str, int]] = None
@@ -97,13 +107,15 @@ class EdgeArea:
         # momentum smoothing can be same or a bit faster, here same
         self._atk_mom_alpha = self._atk_alpha        
 
-    def reset(self, seed: int | None = None):
+    def reset(self, seed: int | None = None, p_attack_type: np.ndarray | None = None):
         """
         Reset EdgeArea stochastic state.
 
         - Re-seeds internal RNG
         - Re-seeds all users and attackers independently
         - Resets per-episode dynamic state
+        - p_attack_type: pre-computed probability vector over attack types (from joint
+          Dirichlet partition in Environment.reset). If None, samples independently.
         """
 
         # 1) Reset own RNG
@@ -111,20 +123,21 @@ class EdgeArea:
             self.rng = np.random.default_rng(seed)
 
 
-        # 2) Reset users (independent seeds)
+        # 2) Reset users
         for i, user in enumerate(self.users):
             user_seed = int(self.rng.integers(0, 2**32))
             user.reset(seed=user_seed)
 
-        # 3) Reset attackers (independent seeds)
+        # 3) Reset attackers
         if self.attack_type_library is not None:
             n = self.attack_type_library.n_types
-            concentration = np.ones(n) * self.dirichlet_alpha
-            p_attack_type = self.rng.dirichlet(concentration)
+            if p_attack_type is None:
+                concentration = np.ones(n) * self.dirichlet_alpha
+                p_attack_type = self.rng.dirichlet(concentration)
             chosen_type_id = int(self.rng.choice(n, p=p_attack_type))
             spec = self.attack_type_library.get(chosen_type_id)
             atk_seed = int(self.rng.integers(0, 2**32))
-            self.attackers = [SyntheticAttacker(
+            self.attackers = [Attacker(
                 attacker_id=f"atk_type_{chosen_type_id}",
                 spec=spec,
                 slot_ms=self.slot_ms,
@@ -191,7 +204,7 @@ class EdgeArea:
                 continue
             
 
-            flows = float(r.get("flows_per_sec", r.get("flows_per_step", 0.0)))
+            flows = float(r.get("flows_per_step", r.get("flows_per_sec", 0.0)))
             total_flows += flows
             total_bw_in += flows * float(atk.bw_per_flow)
             total_cycles_per_s += flows * float(atk.cycle_per_flow)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional
 import math
 import numpy as np
 
@@ -145,6 +145,87 @@ def balance_with_caps_and_prop_filter(
     for s in area_ids:
         for d, n in flow[s].items():
             assigned_dst[d] += int(n)
-    
+
+    return OffloadPlan(flow=flow, assigned_dst=assigned_dst)
+
+
+def sp2_inspection_offload(
+    area_ids: List[str],
+    edges: Dict[str, Any],
+    W_src: Dict[str, float],
+    fnr_matrix: np.ndarray,
+    fpr_matrix: np.ndarray,
+    prop_delay: Dict[Tuple[str, str], float],
+    ids_util_prev: Dict[str, float],
+    weights: Tuple[float, float, float, float],
+    id_to_idx: Dict[str, int],
+) -> OffloadPlan:
+    """
+    SP2 Phase 1: Accuracy-Aware Inspection Offloading.
+
+    Routes each source edge's inspection workload across feasible receivers
+    proportionally to their suitability score:
+      Score(e, e') = -w1*FNR[e,e'] - w2*FPR[e,e'] - w3*d_prop(e,e') - w4*rho(e')
+
+    Feasibility: e' is eligible only if it has residual IDS capacity.
+    Allocation: softmax over max(0, Score); if all scores <= 0, keep local.
+    """
+    omega1, omega2, omega3, omega4 = weights
+
+    # IDS capacity (packets/step) and current assigned load at each edge
+    mu_def = {
+        eid: edges[eid].ids.effective_speed_pkt_per_step(edges[eid].ids_cpu)
+        for eid in area_ids
+    }
+    Lambda_in = {eid: float(W_src[eid]) for eid in area_ids}
+
+    # Initialize all traffic kept local
+    flow_float: Dict[str, Dict[str, float]] = {e: {e: float(W_src[e])} for e in area_ids}
+
+    for src in area_ids:
+        si = id_to_idx[src]
+        w = float(W_src[src])
+        if w <= EPS:
+            continue
+
+        # Step 1: feasible receivers (residual IDS capacity > 0)
+        feasible = [ep for ep in area_ids if mu_def[ep] - Lambda_in[ep] > 0.0]
+        if not feasible:
+            continue
+
+        # Step 2: score each feasible receiver
+        raw_scores: Dict[str, float] = {}
+        for dst in feasible:
+            di = id_to_idx[dst]
+            fnr = float(fnr_matrix[si, di])
+            fpr = float(fpr_matrix[si, di])
+            d_prop = float(prop_delay.get((src, dst), 0.0))
+            rho = float(ids_util_prev.get(dst, 0.0))
+            raw_scores[dst] = -omega1 * fnr - omega2 * fpr - omega3 * d_prop - omega4 * rho
+
+        # Step 3: proportional allocation over positive scores only
+        pos_scores = {ep: max(0.0, s) for ep, s in raw_scores.items()}
+        total_pos = sum(pos_scores.values())
+
+        if total_pos <= EPS:
+            continue
+
+        # Overwrite local-only initialisation with scored fractions
+        flow_float[src] = {dst: (pos_scores[dst] / total_pos) * w for dst in feasible}
+
+    # Round to integers and conserve per-source total
+    flow = round_flow_to_int(flow_float)
+    for s in area_ids:
+        sent = sum(flow.get(s, {}).values())
+        want = int(round(W_src[s]))
+        diff = want - sent
+        if diff != 0:
+            flow.setdefault(s, {})[s] = flow[s].get(s, 0) + diff
+
+    assigned_dst: Dict[str, int] = {e: 0 for e in area_ids}
+    for s in area_ids:
+        for d, n_tasks in flow.get(s, {}).items():
+            assigned_dst[d] = assigned_dst.get(d, 0) + int(n_tasks)
+
     return OffloadPlan(flow=flow, assigned_dst=assigned_dst)
 
