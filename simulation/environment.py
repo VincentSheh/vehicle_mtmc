@@ -28,7 +28,13 @@ from request import User, Attacker, AttackTypeLibrary
 
 from edgearea import ResourceBudget, EdgeArea
 
-from offload import OffloadPlan, balance_with_caps_and_prop_filter
+from offload import (
+    OffloadPlan,
+    no_offload,
+    balance_workload,
+    score_based_offload,
+    balance_with_caps_and_prop_filter,
+)
 
 N_ACTION = 9
 
@@ -106,11 +112,11 @@ class Environment:
         delay_ms: np.ndarray,
         t_max: int,
         seed: int = 0,
-        offload: bool = True,
+        offload_mode: str = "balance",
     ):
         self.edge_areas = edge_areas
         self.delay_ms = np.asarray(delay_ms, dtype=np.float32)
-        self.offload = bool(offload)
+        self.offload_mode = str(offload_mode)  # "none" | "balance" | "delay_workload" | "full"
         self.t_max = int(t_max)
         self.t = 0
         self.history: List[StepMetrics] = []
@@ -133,6 +139,9 @@ class Environment:
 
         self.rng = np.random.default_rng(seed)
         self.active_attack = None
+        self.acc_by_region: Optional[np.ndarray] = None  # shape (n_edges, n_edges, 2): [src, exec, fpr/fnr]
+        self._max_prop_delay_ms: float = 1e9
+        self._offload_weights: Tuple[float, float, float, float] = (1.0, 1.0, 0.01, 1.0)
 
         np.random.seed(seed)
 
@@ -195,7 +204,8 @@ class Environment:
         )
 
         edges_by_id = {e.area_id: e for e in self.edge_areas}
-        tot_req = sum(int(real_cache[aid].get("local_num_request", 0)) for aid in self.area_ids)
+        # Weight QoE by original (pre-IDS) user count so FPR-dropped users pull weight
+        tot_req = sum(int(real_cache[aid].get("original_user_in", real_cache[aid].get("local_num_request", 0))) for aid in self.area_ids)
         total_cpu_to_ids_ratio = sum(
             edges_by_id[aid].ids_cpu / edges_by_id[aid].budget.cpu for aid in self.area_ids
         )
@@ -211,7 +221,7 @@ class Environment:
             cache = real_cache[aid]
             cache_ideal = ideal_cache[aid]
             ids_out = cache["ids_out"]
-            n = int(cache.get("local_num_request", 0))
+            n = int(cache.get("original_user_in", cache.get("local_num_request", 0)))
             qoe_weighted = float(cache["qoe"]) * (n / tot_req) if tot_req > 0 else float(cache["qoe"])
 
             self.history.append(
@@ -263,9 +273,50 @@ class Environment:
                 den += w
             self.final_qoe = (num / den) if den > 0.0 else 0.0
 
+    def _make_offload_plan(
+        self,
+        W_src: Dict[str, float],
+        c_dst: Dict[str, float],
+        stage: str = "ids",
+    ) -> OffloadPlan:
+        """Dispatch to the correct offload function based on self.offload_mode."""
+        mode = self.offload_mode
+        if mode == "none":
+            return no_offload(self.area_ids, W_src)
+
+        if mode == "balance":
+            return balance_workload(self.area_ids, W_src, c_dst)
+
+        # modes "delay_workload" and "full" use score_based_offload
+        max_d = float(getattr(self, "_max_prop_delay_ms", 1e9))
+        fnr_matrix = fpr_matrix = None
+        if mode == "full" and self.acc_by_region is not None and stage == "ids":
+            fpr_matrix = self.acc_by_region[:, :, 0]
+            fnr_matrix = self.acc_by_region[:, :, 1]
+
+        ids_util = {
+            aid: float(getattr(self._edges_by_id.get(aid, object()), "ids_cpu", 0.0))
+                 / max(float(getattr(self._edges_by_id.get(aid, object()), "budget", type("B", (), {"cpu": 1.0})()).cpu), 1e-9)
+            for aid in self.area_ids
+        } if mode == "full" else {}
+
+        return score_based_offload(
+            area_ids=self.area_ids,
+            W_src=W_src,
+            c_dst=c_dst,
+            prop_delay=self.prop_delay,
+            max_prop_delay_ms=max_d,
+            fnr_matrix=fnr_matrix,
+            fpr_matrix=fpr_matrix,
+            ids_util=ids_util,
+            weights=self._offload_weights,
+            id_to_idx=self.id_to_idx,
+        )
+
     def _run_step_multi_edge(self, ids_cpus, overhead=0.0, disable_attack=False):
         """Two-stage IDS→VA offload step. Preserves single-edge overhead logic."""
         edges = {e.area_id: e for e in self.edge_areas}
+        self._edges_by_id = edges  # cache for _make_offload_plan
 
         if isinstance(ids_cpus, torch.Tensor):
             ids_cpus = ids_cpus.detach().cpu().tolist()
@@ -298,37 +349,54 @@ class Environment:
         # Stage A: observe arrivals at each edge
         obs = {aid: edges[aid].observe_arrivals(self.t) for aid in self.area_ids}
 
-        # Stage B: IDS — offload or process locally
-        if self.offload:
-            W_ids = {aid: float(obs[aid]["total_workload_in"]) for aid in self.area_ids}
-            c_ids = {aid: float(edges[aid].ids_cpu) for aid in self.area_ids}
-            kappa_ids_min = min(float(edges[aid].ids.cycles_per_packet) for aid in self.area_ids)
-            plan_ids = balance_with_caps_and_prop_filter(
-                area_ids=self.area_ids,
-                edges=edges,
-                W_src=W_ids,
-                c_dst=c_ids,
-                kappa_min=kappa_ids_min,
-                prop_delay=self.prop_delay,
-                tau_loc=None,
-            )
-            exec_user_in: Dict[str, int] = {aid: 0 for aid in self.area_ids}
-            exec_atk_in:  Dict[str, int] = {aid: 0 for aid in self.area_ids}
-            for src in self.area_ids:
-                u = float(obs[src]["user_req_in"])
-                a = float(obs[src]["atk_req_in"])
-                tot = max(u + a, 1.0)
-                for dst, n_sent in plan_ids.flow.get(src, {}).items():
-                    n_sent = float(n_sent)
-                    exec_user_in[dst] += int(round(n_sent * u / tot))
-                    exec_atk_in[dst]  += int(round(n_sent * a / tot))
-        else:
-            plan_ids = OffloadPlan(
-                flow={aid: {aid: int(obs[aid]["total_workload_in"])} for aid in self.area_ids},
-                assigned_dst={aid: int(obs[aid]["total_workload_in"]) for aid in self.area_ids},
-            )
-            exec_user_in = {aid: obs[aid]["user_req_in"] for aid in self.area_ids}
-            exec_atk_in  = {aid: obs[aid]["atk_req_in"]  for aid in self.area_ids}
+        # Stage B: IDS offload plan
+        W_ids = {aid: float(obs[aid]["total_workload_in"]) for aid in self.area_ids}
+        c_ids = {aid: float(edges[aid].ids_cpu) for aid in self.area_ids}
+        plan_ids = self._make_offload_plan(W_ids, c_ids, stage="ids")
+
+        exec_user_in: Dict[str, int] = {aid: 0 for aid in self.area_ids}
+        exec_atk_in:  Dict[str, int] = {aid: 0 for aid in self.area_ids}
+        exec_local_user_in: Dict[str, int] = {aid: 0 for aid in self.area_ids}
+        ids_remote_d_num: Dict[str, float] = {aid: 0.0 for aid in self.area_ids}
+        ids_remote_n:     Dict[str, float] = {aid: 0.0 for aid in self.area_ids}
+        for src in self.area_ids:
+            u = float(obs[src]["user_req_in"])
+            a = float(obs[src]["atk_req_in"])
+            tot = max(u + a, 1.0)
+            for dst, n_sent in plan_ids.flow.get(src, {}).items():
+                n_sent_f = float(n_sent)
+                nu = int(round(n_sent_f * u / tot))
+                na = int(round(n_sent_f * a / tot))
+                exec_user_in[dst] += nu
+                exec_atk_in[dst]  += na
+                if src == dst:
+                    exec_local_user_in[dst] += nu
+                else:
+                    d = float(self.prop_delay.get((src, dst), 0.0))
+                    ids_remote_d_num[dst] += d * n_sent_f
+                    ids_remote_n[dst]     += n_sent_f
+        ids_d_remote_avg: Dict[str, float] = {
+            aid: ids_remote_d_num[aid] / ids_remote_n[aid] if ids_remote_n[aid] > 0 else 0.0
+            for aid in self.area_ids
+        }
+
+        # Compute per-executor FPR/FNR overrides from accuracy_by_region (weighted by flow volume)
+        exec_fpr_ov: Dict[str, Optional[float]] = {aid: None for aid in self.area_ids}
+        exec_tpr_ov: Dict[str, Optional[float]] = {aid: None for aid in self.area_ids}
+        if self.acc_by_region is not None:
+            for e_exec in self.area_ids:
+                exec_idx = self.id_to_idx[e_exec]
+                total_dst = float(plan_ids.assigned_dst.get(e_exec, 0))
+                if total_dst <= 1e-9:
+                    continue
+                fpr_w = fnr_w = 0.0
+                for e_src in self.area_ids:
+                    src_idx = self.id_to_idx[e_src]
+                    n = float(plan_ids.flow.get(e_src, {}).get(e_exec, 0))
+                    fpr_w += n * float(self.acc_by_region[src_idx, exec_idx, 0])
+                    fnr_w += n * float(self.acc_by_region[src_idx, exec_idx, 1])
+                exec_fpr_ov[e_exec] = fpr_w / total_dst
+                exec_tpr_ov[e_exec] = 1.0 - (fnr_w / total_dst)
 
         # Execute IDS at each executor
         ids_out_exec: Dict[str, dict] = {
@@ -338,6 +406,8 @@ class Environment:
                 atk_in=exec_atk_in[aid],
                 inspect_in=exec_user_in[aid] + exec_atk_in[aid],
                 attack_dict=obs[aid]["attack_dict"],
+                fpr_override=exec_fpr_ov[aid],
+                tpr_override=exec_tpr_ov[aid],
             )
             for aid in self.area_ids
         }
@@ -351,53 +421,68 @@ class Environment:
             aid: int(ids_out_exec[aid].get("atk_pass_cnt", 0))
             for aid in self.area_ids
         }
+        # Locally-originated admitted users: scale local fraction by IDS pass rate
+        admitted_local_user: Dict[str, int] = {
+            aid: int(round(
+                float(exec_local_user_in[aid])
+                * (float(admitted_user[aid]) / max(float(exec_user_in[aid]), 1.0))
+            ))
+            for aid in self.area_ids
+        }
 
-        # Stage C: VA — offload or process locally
+        # Stage C: VA offload plan (VA has no accuracy benefit; delay/load only)
         W_va = {aid: float(admitted_user[aid] + admitted_atk[aid]) for aid in self.area_ids}
-        if self.offload:
-            c_va = {aid: float(edges[aid].va_cpu) for aid in self.area_ids}
-            tau_loc = {aid: W_va[aid] / max(c_va[aid], 1e-9) for aid in self.area_ids}
-            kappa_va_min = min(
-                float(edges[aid].pipeline.detection_cycles("nanoDet-m")) for aid in self.area_ids
-            )
-            plan_va = balance_with_caps_and_prop_filter(
-                area_ids=self.area_ids,
-                edges=edges,
-                W_src=W_va,
-                c_dst=c_va,
-                kappa_min=kappa_va_min,
-                prop_delay=self.prop_delay,
-                tau_loc=tau_loc,
-            )
-            va_user_in: Dict[str, int] = {aid: 0 for aid in self.area_ids}
-            va_atk_in:  Dict[str, int] = {aid: 0 for aid in self.area_ids}
-            for src in self.area_ids:
-                u = float(admitted_user[src])
-                a = float(admitted_atk[src])
-                tot = max(u + a, 1.0)
-                for dst, n_sent in plan_va.flow.get(src, {}).items():
-                    n_sent = float(n_sent)
-                    va_user_in[dst] += int(round(n_sent * u / tot))
-                    va_atk_in[dst]  += int(round(n_sent * a / tot))
-        else:
-            plan_va = OffloadPlan(
-                flow={aid: {aid: int(W_va[aid])} for aid in self.area_ids},
-                assigned_dst={aid: int(W_va[aid]) for aid in self.area_ids},
-            )
-            va_user_in = {aid: admitted_user[aid] for aid in self.area_ids}
-            va_atk_in  = {aid: admitted_atk[aid]  for aid in self.area_ids}
+        c_va = {aid: float(edges[aid].va_cpu) for aid in self.area_ids}
+        plan_va = self._make_offload_plan(W_va, c_va, stage="va")
 
-        # Execute VA at each executor
+        va_user_in: Dict[str, int] = {aid: 0 for aid in self.area_ids}
+        va_atk_in:  Dict[str, int] = {aid: 0 for aid in self.area_ids}
+        va_local_user_in: Dict[str, int] = {aid: 0 for aid in self.area_ids}
+        va_original_user_in: Dict[str, int] = {aid: 0 for aid in self.area_ids}
+        va_remote_d_num: Dict[str, float] = {aid: 0.0 for aid in self.area_ids}
+        va_remote_n:     Dict[str, float] = {aid: 0.0 for aid in self.area_ids}
+        for src in self.area_ids:
+            u = float(admitted_user[src])
+            a = float(admitted_atk[src])
+            tot = max(u + a, 1.0)
+            u_share = u / tot
+            a_share = a / tot
+            local_frac    = float(admitted_local_user[src]) / max(u, 1.0)
+            ids_pass_rate = u / max(float(exec_user_in[src]), 1.0)
+            for dst, n_sent in plan_va.flow.get(src, {}).items():
+                n_sent_f = float(n_sent)
+                nu = int(round(n_sent_f * u_share))
+                va_user_in[dst] += nu
+                va_atk_in[dst]  += int(round(n_sent_f * a_share))
+                va_original_user_in[dst] += int(round(nu / max(ids_pass_rate, 1e-9)))
+                if src == dst:
+                    va_local_user_in[dst] += int(round(nu * local_frac))
+                else:
+                    d = float(self.prop_delay.get((src, dst), 0.0))
+                    va_remote_d_num[dst] += d * n_sent_f
+                    va_remote_n[dst]     += n_sent_f
+        va_d_remote_avg: Dict[str, float] = {
+            aid: va_remote_d_num[aid] / va_remote_n[aid] if va_remote_n[aid] > 0 else 0.0
+            for aid in self.area_ids
+        }
+
+        # Execute VA at each executor — combine IDS-stage and VA-stage propagation delays
         local_cache: Dict[str, dict] = {
             aid: edges[aid].process_va(
                 t=self.t,
                 admitted_user_req_in=va_user_in[aid],
                 admitted_atk_req_in=va_atk_in[aid],
+                n_local_user=va_local_user_in[aid],
+                original_user_in=va_original_user_in[aid],
+                d_remote_avg_ms=ids_d_remote_avg[aid] + va_d_remote_avg[aid],
                 attack_dict=obs[aid]["attack_dict"],
                 ids_out=ids_out_exec[aid],
             )
             for aid in self.area_ids
         }
+        # Annotate each cache entry with the original user count for weighting in step()
+        for aid in self.area_ids:
+            local_cache[aid]["original_user_in"] = va_original_user_in[aid]
 
         # Restore attack active flags
         if disable_attack:
@@ -415,6 +500,14 @@ class Environment:
                 
         
         
+def _resolve_offload_mode(g: dict) -> str:
+    """Read offload_mode from config; fall back to legacy offload: true/false."""
+    if "offload_mode" in g:
+        return str(g["offload_mode"])
+    legacy = g.get("offload", True)
+    return "balance" if legacy else "none"
+
+
 def build_env_from_cfg(cfg: dict):
     globals_cfg = load_globals(cfg)
 
@@ -446,13 +539,18 @@ def build_env_from_cfg(cfg: dict):
     # --------------------------------------------------
     edge_areas = []
 
+    # Global fallback IDS accuracy (used when area has no ids_config)
+    global_ids_accuracy = {"default": (0.0, 0.0)}
+
     for area_cfg in cfg["edge_areas"]:
+        ids_accuracy = (
+            {k: tuple(v) for k, v in area_cfg["ids_config"]["accuracy_by_type"].items()}
+            if "ids_config" in area_cfg
+            else global_ids_accuracy
+        )
         ids = IDS(
             cycles_per_packet=globals_cfg.ids_cycles_per_packet,
-            accuracy_by_type_fpr_fnr={
-                k: tuple(v)
-                for k, v in area_cfg["ids_config"]["accuracy_by_type"].items()
-            },
+            accuracy_by_type_fpr_fnr=ids_accuracy,
             cpu_cycle_per_ms=globals_cfg.cpu_cycle_per_ms,
             cpu_cores=globals_cfg.cpu_cores,
             slot_ms=globals_cfg.slot_ms,
@@ -493,23 +591,38 @@ def build_env_from_cfg(cfg: dict):
         edge_areas.append(edge)
 
 
-    # Build delay matrix (simple symmetric test case)
+    # Build delay matrix from config if present, else default to 2 ms inter-edge
     n = len(edge_areas)
-    delay_ms = np.zeros((n, n)) #! TODO
-    for i in range(n):
-        for j in range(n):
-            delay_ms[i, j] = 2.0 if i != j else 0.0  # 2 ms inter-edge delay
+    if "delay_ms" in cfg["globals"]:
+        delay_ms = np.array(cfg["globals"]["delay_ms"], dtype=np.float32)
+    else:
+        delay_ms = np.where(np.eye(n, dtype=bool), 0.0, 2.0).astype(np.float32)
 
     # Build environment
+    acc_by_region_raw = cfg["globals"].get("accuracy_by_region")
+    acc_by_region = np.array(acc_by_region_raw, dtype=np.float32) if acc_by_region_raw is not None else None
+
     env = Environment(
         edge_areas=edge_areas,
         delay_ms=delay_ms,
         t_max=cfg["run"]["t_max"],
         seed=cfg["run"]["seed"],
-        offload=bool(cfg["globals"].get("offload", True)),
+        offload_mode=_resolve_offload_mode(cfg["globals"]),
     )
+    env._max_prop_delay_ms = float(cfg["globals"].get("max_prop_delay_ms", 1e9))
+    w = cfg["globals"].get("offload_weights", {})
+    env._offload_weights = (
+        float(w.get("w1", 1.0)),
+        float(w.get("w2", 1.0)),
+        float(w.get("w3", 0.01)),
+        float(w.get("w4", 1.0)),
+    )
+    if acc_by_region is not None:
+        env.acc_by_region = acc_by_region
     env.reset(cfg["run"]["seed"])
     return env
+
+
 
 
 def build_env_base(cfg_path: str):

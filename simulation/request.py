@@ -127,7 +127,7 @@ class Attacker:
         self._init_start()
 
     def _generate_patterned_trace(self):
-        self.active_len = self.t_max // 4
+        self.active_len = self.t_max // 5
         dt = self.slot_ms / 1000.0
         t_full = np.arange(0, self.active_len * dt, dt)
         g = np.zeros_like(t_full, dtype=float)

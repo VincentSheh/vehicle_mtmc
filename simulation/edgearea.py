@@ -252,6 +252,8 @@ class EdgeArea:
         atk_in: int,
         inspect_in: int,
         attack_dict: Dict,
+        fpr_override: Optional[float] = None,
+        tpr_override: Optional[float] = None,
     ) -> Dict:
         """Stage 2 — executor-side IDS filtering on offloaded counts.
         Wraps classify_rates() and adds count-key aliases for process_va() compat.
@@ -263,6 +265,8 @@ class EdgeArea:
             attack_dict=scaled_dict,
             user_rate=float(max(user_in, 0)),
             ids_cpu=float(self.ids_cpu),
+            fpr_override=fpr_override,
+            tpr_override=tpr_override,
         )
         # count-key aliases used by process_va() fallback lookups
         out["atk_in_cnt"]    = out.get("attack_in_rate", 0.0)
@@ -279,6 +283,9 @@ class EdgeArea:
         admitted_atk_req_in: int,
         attack_dict: Dict,
         ids_out: Dict,
+        d_remote_avg_ms: float = 0.0,
+        n_local_user: Optional[int] = None,
+        original_user_in: Optional[int] = None,
     ) -> Dict:
         """Stage 3 — VA pipeline on post-IDS, post-offload counts.
         Preserves single-edge resource accounting and QoE normalisation.
@@ -348,24 +355,63 @@ class EdgeArea:
         det_costs = {det: float(self.pipeline.detection_cycles(det)) for det in dets}
         det_quality = {det: float(self.pipeline.det_quality[det]) for det in dets} if hasattr(self.pipeline, "det_quality") else None
 
-        od_plan, feasible_all, dropped_compute, used_cycles, mean_latency_ms, qoe = self.allocate_detectors(
-            det_costs=det_costs,
-            det_quality=det_quality,
-            N=int(served_req_uplink),
-            mu_cycles_per_ms=float(avail_cycles_aft_atk_per_ms),
-            gamma=float(gamma),
-        )
+        mu = float(avail_cycles_aft_atk_per_ms)
+        budget_total = float(self.slot_ms) * mu
+        n_local_user = int(n_local_user) if n_local_user is not None else int(admitted_user_req_in)
+        use_split = (n_local_user < benign_req_in and float(d_remote_avg_ms) > 0.0)
+
+        if use_split:
+            # Partition served requests into local (originated here) and remote (offloaded in)
+            local_ratio  = float(n_local_user) / max(float(benign_req_in), 1.0)
+            n_local_compute  = int(round(int(served_req_uplink) * local_ratio))
+            n_remote_compute = int(served_req_uplink) - n_local_compute
+
+            # Pre-partition budget proportionally so local tasks cannot starve remote tasks.
+            # Remote tasks also pay a time-window tax for propagation delay.
+            delay_fraction = float(d_remote_avg_ms) / max(float(self.slot_ms), 1e-9)
+            mu_local  = mu * local_ratio
+            mu_remote = mu * (1.0 - local_ratio) * max(0.0, 1.0 - delay_fraction)
+
+            od_local, _, dropped_local, used_local, mean_latency_ms, qoe = self.allocate_detectors(
+                det_costs=det_costs, det_quality=det_quality,
+                N=n_local_compute, mu_cycles_per_ms=mu_local, gamma=float(gamma),
+            )
+
+            od_remote, _, dropped_remote, used_remote, _, _ = self.allocate_detectors(
+                det_costs=det_costs, det_quality=det_quality,
+                N=n_remote_compute, mu_cycles_per_ms=mu_remote, gamma=float(gamma),
+            )
+
+            # Merge plans
+            od_plan = dict(od_local)
+            for det, cnt in od_remote.items():
+                od_plan[det] = od_plan.get(det, 0) + cnt
+            dropped_compute = dropped_local + dropped_remote
+            used_cycles = used_local + used_remote
+            feasible_all = (dropped_compute == 0)
+        else:
+            od_plan, feasible_all, dropped_compute, used_cycles, mean_latency_ms, qoe = self.allocate_detectors(
+                det_costs=det_costs,
+                det_quality=det_quality,
+                N=int(served_req_uplink),
+                mu_cycles_per_ms=mu,
+                gamma=float(gamma),
+            )
+
         qoe, _ = self.match_detectors_to_resolutions(upload_plan, od_plan)
 
         va_cpu_utilization = min(1.0, (used_cycles + attack_cycles_per_ms + self.ids_cpu * self.cpu_cycle_per_ms) / max(total_cycles_per_ms, 1e-9))
         served_compute = int(sum(od_plan.values()))
         assert served_compute + int(dropped_compute) == int(served_req_uplink)
 
-        # QoE normalisation: penalise drops relative to admitted benign demand (single-edge logic)
-        if benign_req_in <= 0:
+        # QoE normalisation: penalise all drops including FPR user drops
+        # original_user_in (pre-IDS) is the true denominator; falls back to admitted count
+        qoe_denom = int(original_user_in) if original_user_in is not None else benign_req_in
+        qoe_denom = max(qoe_denom, benign_req_in)  # never smaller than admitted count
+        if qoe_denom <= 0:
             qoe = 1.0
         else:
-            drop_frac = 1.0 - served_compute / float(benign_req_in)
+            drop_frac = 1.0 - served_compute / float(qoe_denom)
             qoe = qoe * (1.0 - drop_frac) ** 2
 
         return {

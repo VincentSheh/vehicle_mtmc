@@ -4,38 +4,70 @@ run:
 
 eval:
   episode: 30
-  
+
 
 globals:
   cpu_clock_cycle: 3.8 # Used to convert detection latency to cycle
   cpu_cores: 8
   fps: 5
   decision_interval: 300
-  scaling_time_step: [300, 450, 498, 544] # for 0.5,1.0,1.5,2.0 scaling
-  offload: false
+
   ids:
     latency_ms: 0.0357 #0.357
     cycles_ms: 0.0
-  
+
   attack_sampler:
     n_types: 10
-    pattern_types: ["sinus", "pw", "expo" ] #, "yoyo"]
-    # pattern_types: ["pw"]
-    lambda_base:      [7000, 14000]   # flows/sec
+    dirichlet_alpha: 0.2  # symmetric Dirichlet concentration over edges per type; higher=uniform, lower=concentrated on one edge
+    pattern_types: ["sinus", "pw", "expo"]
+    lambda_base:      [7000, 7000]   # flows/sec
     noise_std:        [0.05, 0.10]
     t_cycle_min:      [300, 500]     # seconds (lower bound on cycle duration)
-    t_cycle_delta:    [300, 800]   # seconds added to t_min to get t_max
-    latency_per_flow: [0.01,0.02]      # ms per flow  (latency_per_flow * 1000 * va_cpu / lambda_base)
-    bw_per_flow:      [0.0, 0.0]   # Mbps per flow
-    # bw_per_flow:      [0.15, 0.30]   # Mbps per flow
+    t_cycle_delta:    [300, 800]     # seconds added to t_min to get t_max
+    latency_per_flow: [0.01, 0.02]   # ms per flow
+    bw_per_flow:      [0.0, 0.0]     # Mbps per flow
     non_defendable_bw_const: 0.0
-  
 
   reward:
-    alpha_inv: 5.0   # QoE shortfall normalizer        (alpha = 1/alpha_inv = 10)      || 0.10
-    beta_inv:  2.5   # Attack residual normalizer       (beta  = 1/beta_inv  =  5)     || 0.20
-    gamma_inv: 15   # Benign collateral normalizer     (gamma = 1/gamma_inv ≈  8.33)  || 0.12
-    q_th:      0.20   # QoE shortfall threshold
+    alpha_inv: 5.0   # QoE shortfall normalizer        (alpha = 1/alpha_inv = 10)
+    beta_inv:  2.5   # Attack residual normalizer       (beta  = 1/beta_inv  =  5)
+    gamma_inv: 15    # Benign collateral normalizer     (gamma = 1/gamma_inv ≈ 8.33)
+    q_th:      0.20  # QoE shortfall threshold
+
+  offload_mode: "none"  # "none" | "balance" | "delay_workload" | "full"
+  max_prop_delay_ms: 50.0        # hard delay cutoff for modes delay_workload / full
+
+  # Score-based offload weights (modes delay_workload / full)
+  #   score(src,dst) = load_benefit - d_prop/d_max * w3
+  #                  + (FNR_local - FNR_remote) * w1   [full only]
+  #                  + (FPR_local - FPR_remote) * w2   [full only]
+  #                  + (util_src  - util_dst)   * w4   [full only]
+  offload_weights:
+    w1: 0.0   # FNR accuracy improvement
+    w2: 1.5   # FPR accuracy improvement
+    w3: 1.0  # propagation delay penalty
+    w4: 0.5   # IDS utilization balancing
+
+  # Accuracy-by-region matrix: [src_edge_idx][exec_edge_idx] = [FPR, FNR]
+  # Row = traffic source edge, Col = inspecting/executing edge.
+  # Diagonal = local inspection accuracy (own model on own traffic).
+  # Off-diagonal = cross-edge accuracy (typically higher error due to domain shift).
+  # Order matches edge_areas list: E1=0, E2=1.
+  accuracy_by_region:
+    - [[0.0, 0.00], [0.1, 0.00], [0.1, 0.00]]   # traffic from E1: inspected at [E1, E2, E3]
+    - [[0.1, 0.00], [0.0, 0.00], [0.1, 0.00]]   # traffic from E2: inspected at [E1, E2, E3]
+    - [[0.1, 0.00], [0.1, 0.00], [0.0, 0.00]]   # traffic from E3: inspected at [E1, E2, E3]
+
+
+  # Propagation delay matrix in ms: row=source edge index, col=target edge index.
+  # Order matches edge_areas list: E1=0, E2=1, E3=2. Diagonal must be 0.
+  # - Campus LAN: 1–5 ms
+  # - City-scale (intersection to intersection): 5–20 ms
+  # - Metro area / across districts: 20–50 ms
+  delay_ms:
+    - [0.0,  20.0, 35.0]
+    - [20.0,  0.0, 20.0]
+    - [35.0, 20.0,  0.0]
 
   video_pipeline:
     reid_latency: 20 #! Should consider batch processing
@@ -46,8 +78,8 @@ globals:
         latency_ms:
           detection: 4.05
         cycles:
-          detection: 0      
-        res_to_acc: 
+          detection: 0
+        res_to_acc:
         - base_resolution_h: 412
           map: 0.235
         - base_resolution_h: 320
@@ -60,22 +92,22 @@ globals:
         latency_ms:
           detection: 6.55
         cycles:
-          detection: 0      
-        res_to_acc: 
+          detection: 0
+        res_to_acc:
         - base_resolution_h: 412
           map: 0.304
         - base_resolution_h: 320
           map: 0.27
         - base_resolution_h: 224
-          map: 0.25          
+          map: 0.25
 
       - detector: nanoDet-plus-m-1.5x
         map: 0.341
         latency_ms:
           detection: 10.17
         cycles:
-          detection: 0      
-        res_to_acc: 
+          detection: 0
+        res_to_acc:
         - base_resolution_h: 412
           map: 0.341
         - base_resolution_h: 320
@@ -93,24 +125,19 @@ edge_areas:
     budget: { cpu: 8.0, mem: 8.0, uplink: 100 } #100Mbps
     constraints:
       D_Max: 250.0
-      MOTA_min: 0.1  
-      Gamma: 0.0005 
+      MOTA_min: 0.1
+      Gamma: 0.0005
 
     dirichlet_concentration: 1.0  # Dirichlet alpha for P(a|e); 1.0 = uniform over attack types
-
-    ids_config:
-      accuracy_by_type:
-        #! Explicitly set to 0 for training
-        default: [0.00, 0.00]   # single global [FPR, FNR] applied to all attack types
 
     users:
       - user_id: 0
         synthetic:
           rw_sigma_per_sqrt_sec: 1.2
-          mu_min: 20.0 # Before Conversion to per step request = 5.0
-          mu_max: 200.0 # Before Conversion to per step request = 40.0
-          kappa: 0.25 
-          sigma: 8 # Before Conversion to per step request = 0.9
+          mu_min: 20.0
+          mu_max: 250.0
+          kappa: 0.25
+          sigma: 8
 
 
   - area_id: "E2"
@@ -120,21 +147,38 @@ edge_areas:
     budget: { cpu: 8.0, mem: 8.0, uplink: 100 } #100Mbps
     constraints:
       D_Max: 250.0
-      MOTA_min: 0.1  
-      Gamma: 0.0005 
+      MOTA_min: 0.1
+      Gamma: 0.0005
 
     dirichlet_concentration: 1.0  # Dirichlet alpha for P(a|e); 1.0 = uniform over attack types
-
-    ids_config:
-      accuracy_by_type:
-        #! Explicitly set to 0 for training
-        default: [0.00, 0.00]   # single global [FPR, FNR] applied to all attack types
 
     users:
       - user_id: 0
         synthetic:
           rw_sigma_per_sqrt_sec: 1.2
-          mu_min: 20.0 # Before Conversion to per step request = 5.0
-          mu_max: 250.0 # Before Conversion to per step request = 40.0
-          kappa: 0.25 
-          sigma: 8 # Before Conversion to per step request = 0.9
+          mu_min: 20.0
+          mu_max: 250.0
+          kappa: 0.25
+          sigma: 8
+
+
+  - area_id: "E3"
+    cpu_cycle_per_ms: 3.8 #3.8GHz #3.8E6 / ms
+    slo_beta: 3.0
+    slo_threshold: 0.2
+    budget: { cpu: 8.0, mem: 8.0, uplink: 100 } #100Mbps
+    constraints:
+      D_Max: 250.0
+      MOTA_min: 0.1
+      Gamma: 0.0005
+
+    dirichlet_concentration: 1.0  # Dirichlet alpha for P(a|e); 1.0 = uniform over attack types
+
+    users:
+      - user_id: 0
+        synthetic:
+          rw_sigma_per_sqrt_sec: 1.2
+          mu_min: 20.0
+          mu_max: 250.0
+          kappa: 0.25
+          sigma: 8

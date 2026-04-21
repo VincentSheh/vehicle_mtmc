@@ -52,6 +52,8 @@ class IDS:
         attack_dict: Dict[str,Any],
         user_rate: float,
         ids_cpu: float,
+        fpr_override: float = None,
+        tpr_override: float = None,
     ) -> Dict[str, float]:
         total_attack = float(attack_dict["flows"])
         total_in = float(user_rate + total_attack)
@@ -65,17 +67,23 @@ class IDS:
         default_entry = self.acc_tpr_fpr.get("default", (0.9, 0.01))
         default_tpr, default_fpr = default_entry
 
+        # Apply region-based accuracy overrides when provided
+        eff_tpr = float(tpr_override) if tpr_override is not None else default_tpr
+        eff_fpr = float(fpr_override) if fpr_override is not None else default_fpr
+
         if by_type:
             for atk_type, lam in by_type.items():
-                tpr, _ = self.acc_tpr_fpr.get(str(atk_type), default_entry)
-                attack_drop += coverage * tpr * float(lam)
+                type_tpr, _ = self.acc_tpr_fpr.get(str(atk_type), default_entry)
+                # blend: use override TPR if provided, else per-type TPR
+                used_tpr = eff_tpr if tpr_override is not None else type_tpr
+                attack_drop += coverage * used_tpr * float(lam)
         else:
-            attack_drop = coverage * default_tpr * total_attack
+            attack_drop = coverage * eff_tpr * total_attack
 
         attack_pass = max(0.0, total_attack - attack_drop)
 
-        # users: expected false drops (single global FPR)
-        avg_fpr = default_fpr
+        # users: expected false drops
+        avg_fpr = eff_fpr
 
         # effective drop probability for a benign user request
         p_drop = min(1.0, max(0.0, coverage * avg_fpr))
