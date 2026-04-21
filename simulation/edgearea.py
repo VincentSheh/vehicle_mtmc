@@ -10,11 +10,6 @@ from service import IDS, VideoPipeline
 
 from request import User, Attacker, AttackTypeLibrary
 
-from offload import (
-    OffloadState,
-    OffloadDecision,
-)
-
 @dataclass
 class ResourceBudget:
     cpu: float
@@ -27,94 +22,6 @@ class ResourceSplit:
     """Split an EdgeArea budget into application (VA) and defense (IDS)."""
     va: ResourceBudget
     ids: ResourceBudget
-
-def cooperative_offload_ot(
-    states: List[OffloadState],
-    delay_ms: np.ndarray,
-) -> Tuple[List[OffloadState], List[OffloadDecision]]:
-    """
-    Synchronized greedy OT offloading.
-
-    states: list of OffloadState, one per edge area.
-    delay_ms[i, j]: propagation delay from i to j in ms.
-
-    Returns:
-    - updated states (q_obj redistributed)
-    - list of offload decisions
-    """
-    n = len(states)
-    for i, st in enumerate(states):
-        st.idx = i
-
-    decisions: List[OffloadDecision] = []
-
-    def finish_time_ms(st: OffloadState) -> float:
-        # time to finish OT queue if processed locally at this edge
-        if st.q_obj <= 0:
-            return 0.0
-        cycles = st.q_obj * st.track_cycles_per_obj
-        return cycles / max(1e-9, st.avail_cycles_per_ms)
-
-    # Build TOP by expected finish time (fastest first)
-    TOP = list(range(n))
-    TOP.sort(key=lambda i: finish_time_ms(states[i]))
-
-    changed = True
-    while changed:
-        changed = False
-
-        # process slower edges first (descending finish time)
-        slow_order = sorted(TOP, key=lambda i: finish_time_ms(states[i]), reverse=True)
-
-        for src in slow_order:
-            src_st = states[src]
-            if src_st.q_obj <= 0:
-                continue
-
-            # try offloading objects one by one from the tail of the slowest queue
-            obj_idx = 0
-            while obj_idx < src_st.q_obj:
-                # local completion time for this object if it stays
-                # approximate by completion time of the whole queue (coarse but consistent)
-                local_C = finish_time_ms(src_st)
-
-                moved = False
-                # TO candidates are fastest first
-                fast_order = sorted(TOP, key=lambda i: finish_time_ms(states[i]))
-                for dst in fast_order:
-                    if dst == src:
-                        continue
-                    dst_st = states[dst]
-                    if dst_st.avail_cycles_per_ms <= 0:
-                        continue
-                    # remote completion time if one object is added to dst
-                    remote_cycles = (dst_st.q_obj + 1) * dst_st.track_cycles_per_obj
-                    remote_C = remote_cycles / max(1e-9, dst_st.avail_cycles_per_ms)
-                    remote_C += float(delay_ms[src, dst])
-
-                    # detection-safe constraint at receiver
-                    if remote_C > dst_st.latest_track_finish_ms + 1e-9:
-                        continue
-
-                    # strict improvement
-                    if remote_C + 1e-9 < local_C:
-                        # apply offload
-                        src_st.q_obj -= 1
-                        dst_st.q_obj += 1
-
-                        decisions.append(OffloadDecision(src_idx=src, dst_idx=dst, num_obj=1))
-
-                        # update TOP ordering because finish times changed
-                        TOP.sort(key=lambda i: finish_time_ms(states[i]))
-                        changed = True
-                        moved = True
-                        break
-
-                if not moved:
-                    # cannot move this object beneficially
-                    obj_idx += 1
-
-    return states, decisions        
 
 class EdgeArea:
     """
@@ -147,7 +54,7 @@ class EdgeArea:
         attackers: List[Attacker],
         pipeline: VideoPipeline,
         attack_type_library: Optional[AttackTypeLibrary] = None,
-        t_max: int = 30000,
+        t_max: int = 0,
         dirichlet_alpha: float = 1.0,
     ):
         self.area_id = str(area_id)
@@ -165,14 +72,13 @@ class EdgeArea:
 
         self.ids = ids
         self.users = list(users)
-        self._all_attackers = list(attackers)  # original static list (legacy)
         self.attackers = list(attackers)
-
-        self.attack_type_library = attack_type_library
-        self._t_max = t_max
-        self.dirichlet_alpha = dirichlet_alpha
+        self.cur_attacker: List[Attacker] = list(attackers)
 
         self.pipeline = pipeline
+        self.attack_type_library = attack_type_library
+        self.t_max = int(t_max)
+        self.dirichlet_alpha = float(dirichlet_alpha)
 
         if attack_type_library is not None:
             print(f"\n[{area_id}] Attack type library (fixed for this run):")
@@ -188,96 +94,69 @@ class EdgeArea:
         self.va_cpu = self.budget.cpu - self.ids_cpu
 
         self._last_action: Optional[Tuple[str, int]] = None
-        
+
         # --- running attack EMA/momentum computed from *actual received* workload ---
         self._atk_ema_inited = False
         self._atk_ema = 0.0
-        self._atk_mom_ema = 0.0  # smoothed momentum
+        self._atk_mom_ema = 0.0
 
-        # half-life in seconds for smoothing (same spirit as your Attacker hl=50.0)
         hl_sec = 50.0
         hl_steps = max(1.0, hl_sec / (self.slot_ms / 1000.0))
         self._atk_alpha = 1.0 - math.exp(math.log(0.5) / hl_steps)
+        self._atk_mom_alpha = self._atk_alpha
 
-        # momentum smoothing can be same or a bit faster, here same
-        self._atk_mom_alpha = self._atk_alpha  
-        
     def reset_running_attack_stats(self):
         self._atk_ema_inited = False
         self._atk_ema = 0.0
-        self._atk_mom_ema = 0.0                    
+        self._atk_mom_ema = 0.0
 
-    def reset(self, seed: int | None = None):
+    def reset(self, seed: int | None = None, p_attack_type: np.ndarray | None = None):
         """
         Reset EdgeArea stochastic state.
 
-        - Re-seeds internal RNG
-        - Re-seeds all users and attackers independently
-        - Resets per-episode dynamic state
+        p_attack_type: pre-computed probability vector over attack types supplied by
+        Environment.reset() from a joint Dirichlet partition. If None, samples
+        independently using this edge's dirichlet_alpha.
+        Lower dirichlet_alpha → sparser joint distribution → each edge gets a more
+        unique attack type.
         """
 
-        # 1) Reset own RNG
         if seed is not None:
             self.rng = np.random.default_rng(seed)
         elif not hasattr(self, "rng"):
             self.rng = np.random.default_rng()
 
-
-        # 2) Reset users (independent seeds)
         for i, user in enumerate(self.users):
             user_seed = int(self.rng.integers(0, 2**32))
             user.reset(seed=user_seed)
 
-        # 3) Sample a new attack type from the library for this episode
         if self.attack_type_library is not None:
             n = self.attack_type_library.n_types
-            concentration = np.ones(n) * self.dirichlet_alpha
-            p_attack_type = self.rng.dirichlet(concentration)
-
+            if p_attack_type is None:
+                concentration = np.ones(n) * self.dirichlet_alpha
+                p_attack_type = self.rng.dirichlet(concentration)
             chosen_type_id = int(self.rng.choice(n, p=p_attack_type))
             spec = self.attack_type_library.get(chosen_type_id)
-
-            # print(f"[{self.area_id}] Sampled type_{chosen_type_id} "
-            #       f"(pattern={spec.pattern_type}, λ_base={spec.lambda_base:.1f})")
-
             atk_seed = int(self.rng.integers(0, 2**32))
             self.attackers = [Attacker(
                 attacker_id=f"atk_type_{chosen_type_id}",
                 spec=spec,
                 slot_ms=self.slot_ms,
-                t_max=self._t_max,
+                t_max=self.t_max,
                 seed=atk_seed,
                 cpu_cycle_per_ms=self.cpu_cycle_per_ms,
                 cpu_cores=int(self.budget.cpu),
             )]
+            self.cur_attacker = self.attackers
         else:
-            # Legacy path: select one from the static attacker list
-            for atk in self._all_attackers:
+            for atk in self.attackers:
                 atk_seed = int(self.rng.integers(0, 2**32))
                 atk.reset(seed=atk_seed)
-            idx = int(self.rng.integers(0, len(self._all_attackers)))
-            self.attackers = [self._all_attackers[idx]]
-        # 4) Reset IDS
-        self.ids_cpu = 4.0
-        
-    def get_state(self) -> dict:
-        return {
-            "ids_cpu": self.ids_cpu,
-            "va_cpu": self.va_cpu,
-            "_atk_ema_inited": self._atk_ema_inited,
-            "_atk_ema": self._atk_ema,
-            "_atk_mom_ema": self._atk_mom_ema,
-            "attacker_states": [atk.get_state() for atk in self.attackers],
-        }
-
-    def set_state(self, state: dict):
-        self.ids_cpu = state["ids_cpu"]
-        self.va_cpu = state["va_cpu"]
-        self._atk_ema_inited = state["_atk_ema_inited"]
-        self._atk_ema = state["_atk_ema"]
-        self._atk_mom_ema = state["_atk_mom_ema"]
-        for i, atk_state in enumerate(state["attacker_states"]):
-            self.attackers[i].set_state(atk_state)
+            if self.attackers:
+                idx = int(self.rng.integers(0, len(self.attackers)))
+                self.cur_attacker = [self.attackers[idx]]
+            else:
+                self.cur_attacker = []
 
     def get_state(self) -> dict:
         return {
@@ -291,10 +170,10 @@ class EdgeArea:
 
     def set_state(self, state: dict):
         self.ids_cpu = state["ids_cpu"]
-        self.va_cpu = state["va_cpu"]
+        self.va_cpu  = state["va_cpu"]
         self._atk_ema_inited = state["_atk_ema_inited"]
-        self._atk_ema = state["_atk_ema"]
-        self._atk_mom_ema = state["_atk_mom_ema"]
+        self._atk_ema        = state["_atk_ema"]
+        self._atk_mom_ema    = state["_atk_mom_ema"]
         for i, atk_state in enumerate(state["attacker_states"]):
             self.attackers[i].set_state(atk_state)
 
@@ -310,10 +189,7 @@ class EdgeArea:
         ema = 0.0
         mom = 0.0
 
-        for atk in self.attackers:
-
-            if not getattr(atk, "episode_active", True):
-                continue
+        for atk in self.cur_attacker:
             r = atk.load_at(t)
 
             if r is None:
@@ -327,12 +203,18 @@ class EdgeArea:
             ema += float(r.get("flows_per_step_ema", 0.0))
             mom += float(r.get("flows_per_step_ema_mom", 0.0))
 
+        slot_s = self.slot_ms / 1000.0
+        bw_per_flow = (total_bw_in / (total_flows * slot_s)) if total_flows > 0 else 0.0
+        cycle_per_flow = (total_cycles_per_step / (total_flows * slot_s)) if total_flows > 0 else 0.0
+
         return {
             "flows": total_flows,
-            "bw_in": total_bw_in,
-            "cycles_per_step": total_cycles_per_step,
+            "bw_in": total_bw_in,           # Mb/slot
+            "cycles_per_step": total_cycles_per_step,  # cycles/slot
             "ema": ema,
             "mom": mom,
+            "bw_per_flow": bw_per_flow,         # Mbps per flow
+            "cycle_per_flow": cycle_per_flow,   # cycles/s per flow
         }
 
     def aggregate_load_after_ids(self, t: int, attack_dict = Dict[str, Any]) -> Dict[str, float]:
@@ -342,6 +224,165 @@ class EdgeArea:
             user_rate=user_rate,
             ids_cpu=self.ids_cpu,
         )
+
+    # ------------------------------------------------------------------
+    # Multi-edge interface: split step_local into three stages so that
+    # Environment can orchestrate IDS/VA offloading across edges.
+    # ------------------------------------------------------------------
+
+    def observe_arrivals(self, t: int) -> Dict:
+        """Stage 1 — observe ingress loads before any offloading."""
+        total_req_in = float(sum(u.num_requests_at(t) for u in self.users))
+        user_req_in = int(np.floor(total_req_in))
+        attack_dict = self._attack_agg_at(t)
+        atk_req_in = int(np.floor(max(0.0, float(attack_dict["flows"]))))
+        return {
+            "total_req_in": total_req_in,
+            "user_req_in": user_req_in,
+            "atk_req_in": atk_req_in,
+            "total_workload_in": user_req_in + atk_req_in,
+            "attack_dict": attack_dict,
+            "local_num_request": user_req_in,
+        }
+
+    def process_ids(
+        self,
+        t: int,
+        user_in: int,
+        atk_in: int,
+        inspect_in: int,
+        attack_dict: Dict,
+    ) -> Dict:
+        """Stage 2 — executor-side IDS filtering on offloaded counts.
+        Wraps classify_rates() and adds count-key aliases for process_va() compat.
+        """
+        scaled_dict = dict(attack_dict)
+        scaled_dict["flows"] = float(max(atk_in, 0))
+
+        out = self.ids.classify_rates(
+            attack_dict=scaled_dict,
+            user_rate=float(max(user_in, 0)),
+            ids_cpu=float(self.ids_cpu),
+        )
+        # count-key aliases used by process_va() fallback lookups
+        out["atk_in_cnt"]    = out.get("attack_in_rate", 0.0)
+        out["atk_pass_cnt"]  = out.get("attack_pass_rate", 0.0)
+        out["atk_drop_cnt"]  = out.get("attack_drop_rate", 0.0)
+        out["user_pass_cnt"] = out.get("user_pass_rate", float(user_in))
+        out["user_drop_cnt"] = out.get("user_drop_rate", 0.0)
+        return out
+
+    def process_va(
+        self,
+        t: int,
+        admitted_user_req_in: int,
+        admitted_atk_req_in: int,
+        attack_dict: Dict,
+        ids_out: Dict,
+    ) -> Dict:
+        """Stage 3 — VA pipeline on post-IDS, post-offload counts.
+        Preserves single-edge resource accounting and QoE normalisation.
+        """
+        benign_req_in = int(admitted_user_req_in)
+        attack_req_in = int(admitted_atk_req_in)
+        local_num_request = benign_req_in
+
+        # Attack resource usage: scale bw_in/cycles_per_step by admitted pass fraction
+        total_attack = float(attack_dict.get("flows", 0.0))
+        atk_pass_frac = (attack_req_in / total_attack) if total_attack > 0 else 0.0
+        attack_uplink_in = attack_dict.get("bw_in", 0.0) * atk_pass_frac       # Mb/slot
+        attack_cycles_per_ms = (
+            attack_dict.get("cycles_per_step", 0.0) * atk_pass_frac / self.slot_ms
+        )
+
+        # EMA tracking on admitted attack signal (same as step_local)
+        atk_signal = float(ids_out.get("attack_in_rate", 0.0))
+        if not getattr(self, "_atk_ema_inited", False):
+            self._atk_ema_inited = True
+            self._atk_ema = atk_signal
+            self._atk_mom_ema = 0.0
+        else:
+            prev_ema = float(self._atk_ema)
+            a = float(self._atk_alpha)
+            self._atk_ema = a * atk_signal + (1.0 - a) * prev_ema
+            mom_raw = float(self._atk_ema) - prev_ema
+            ma = float(self._atk_mom_alpha)
+            self._atk_mom_ema = ma * mom_raw + (1.0 - ma) * float(self._atk_mom_ema)
+        attack_ema = float(self._atk_ema)
+        attack_mom = float(self._atk_mom_ema)
+
+        uplink_total_mb = self.budget.uplink / (1000.0 / self.slot_ms)
+        uplink_available = max(0.0, uplink_total_mb - attack_uplink_in)
+        total_cycles_per_ms = self.cpu_cycle_per_ms * self.budget.cpu
+        avail_cycles_per_ms = self.cpu_cycle_per_ms * self.va_cpu
+        avail_cycles_aft_atk_per_ms = max(0.0, avail_cycles_per_ms - attack_cycles_per_ms)
+
+        if avail_cycles_aft_atk_per_ms <= 1e-12 or uplink_available <= 1e-12:
+            return {
+                "ids_out": ids_out,
+                "local_num_request": local_num_request,
+                "ema": attack_ema,
+                "ema_mom": attack_mom,
+                "dropped_uplink": benign_req_in,
+                "od_plan": {},
+                "served_req": 0,
+                "dropped_compute": benign_req_in,
+                "va_cpu_utilization": min(1.0, (attack_cycles_per_ms + self.ids_cpu * self.cpu_cycle_per_ms) / max(total_cycles_per_ms, 1e-9)),
+                "attack_cpu_frac": min(1.0, attack_cycles_per_ms / max(avail_cycles_per_ms, 1e-9)),
+                "uplink_util": 1.0,
+                "mean_latency_ms": float("inf"),
+                "qoe": 0.0,
+            }
+
+        upload_plan, served_req_uplink, dropped_uplink, uplink_util, _ = self.select_resolution(
+            passed_req_pre_uplink=benign_req_in,
+            uplink_available=float(uplink_available),
+            uplink_attack_used=float(attack_uplink_in),
+            uplink_total_mb=float(uplink_total_mb),
+            upload_hs=(224, 320, 412),
+        )
+
+        D_Max = float(self.constraints["D_Max"])
+        gamma = float(self.constraints.get("Gamma", 0.0))
+        dets = sorted(self.pipeline.det_cycles.keys())
+        det_costs = {det: float(self.pipeline.detection_cycles(det)) for det in dets}
+        det_quality = {det: float(self.pipeline.det_quality[det]) for det in dets} if hasattr(self.pipeline, "det_quality") else None
+
+        od_plan, feasible_all, dropped_compute, used_cycles, mean_latency_ms, qoe = self.allocate_detectors(
+            det_costs=det_costs,
+            det_quality=det_quality,
+            N=int(served_req_uplink),
+            mu_cycles_per_ms=float(avail_cycles_aft_atk_per_ms),
+            gamma=float(gamma),
+        )
+        qoe, _ = self.match_detectors_to_resolutions(upload_plan, od_plan)
+
+        va_cpu_utilization = min(1.0, (used_cycles + attack_cycles_per_ms + self.ids_cpu * self.cpu_cycle_per_ms) / max(total_cycles_per_ms, 1e-9))
+        served_compute = int(sum(od_plan.values()))
+        assert served_compute + int(dropped_compute) == int(served_req_uplink)
+
+        # QoE normalisation: penalise drops relative to admitted benign demand (single-edge logic)
+        if benign_req_in <= 0:
+            qoe = 1.0
+        else:
+            drop_frac = 1.0 - served_compute / float(benign_req_in)
+            qoe = qoe * (1.0 - drop_frac) ** 2
+
+        return {
+            "ids_out": ids_out,
+            "local_num_request": local_num_request,
+            "ema": attack_ema,
+            "ema_mom": attack_mom,
+            "dropped_uplink": int(dropped_uplink),
+            "od_plan": od_plan,
+            "served_req": int(served_compute),
+            "dropped_compute": int(dropped_compute),
+            "va_cpu_utilization": float(va_cpu_utilization),
+            "attack_cpu_frac": min(1.0, attack_cycles_per_ms / max(avail_cycles_per_ms, 1e-9)),
+            "uplink_util": float(uplink_util),
+            "mean_latency_ms": float(mean_latency_ms),
+            "qoe": float(qoe),
+        }
 
     def estimate_detection_cycles_this_frame(
         self,
@@ -698,7 +739,7 @@ class EdgeArea:
         else:
             z_t = 0
             
-        for atk in self.attackers:
+        for atk in self.cur_attacker:
             if hasattr(atk, "z_t"):
                 atk.z_t = z_t
 

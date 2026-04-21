@@ -28,7 +28,7 @@ from request import User, Attacker, AttackTypeLibrary
 
 from edgearea import ResourceBudget, EdgeArea
 
-from offload import OffloadDecision, OffloadState
+from offload import OffloadPlan, balance_with_caps_and_prop_filter
 
 N_ACTION = 9
 
@@ -68,7 +68,11 @@ class StepMetrics:
     bw_utilization: float
 
     overhead: float
-    
+
+    # Multi-edge additions
+    qoe_weighted: float = 0.0
+    total_cpu_to_ids_ratio: float = 0.0
+
     # Per-step plan (detector mixing)
     od_plan: Dict[str, int] = field(default_factory=dict)
 
@@ -102,107 +106,65 @@ class Environment:
         delay_ms: np.ndarray,
         t_max: int,
         seed: int = 0,
+        offload: bool = True,
     ):
         self.edge_areas = edge_areas
-        self.delay_ms = delay_ms
+        self.delay_ms = np.asarray(delay_ms, dtype=np.float32)
+        self.offload = bool(offload)
         self.t_max = int(t_max)
         self.t = 0
         self.history: List[StepMetrics] = []
         self.last_history: List[StepMetrics] = []
         self.final_qoe = 0
 
+        # Multi-edge routing state
+        self.area_ids: List[str] = [str(e.area_id) for e in self.edge_areas]
+        self.id_to_idx: Dict[str, int] = {eid: i for i, eid in enumerate(self.area_ids)}
+
+        n = len(self.edge_areas)
+        assert self.delay_ms.shape == (n, n), f"delay_ms must be ({n},{n}), got {self.delay_ms.shape}"
+
+        self.prop_delay: Dict[Tuple[str, str], float] = {}
+        for s in self.area_ids:
+            si = self.id_to_idx[s]
+            for r in self.area_ids:
+                ri = self.id_to_idx[r]
+                self.prop_delay[(s, r)] = float(self.delay_ms[si, ri])
+
+        self.rng = np.random.default_rng(seed)
+        self.active_attack = None
+
         np.random.seed(seed)
+
+        # Sample attack type probability matrix once per run (fixed across episodes)
+        edges_with_lib = [e for e in self.edge_areas if e.attack_type_library is not None]
+        self._p_attack_type_matrix = None
+        self._dirichlet_alpha = None
+        if edges_with_lib:
+            n_types = edges_with_lib[0].attack_type_library.n_types
+            n_edges = len(self.edge_areas)
+            alpha = edges_with_lib[0].dirichlet_alpha
+            self._dirichlet_alpha = alpha
+            p_joint = self.rng.dirichlet(np.ones(n_types * n_edges) * alpha)
+            p_matrix = p_joint.reshape(n_edges, n_types)
+            self._p_attack_type_matrix = p_matrix / p_matrix.sum(axis=1, keepdims=True)
+            header = "  ".join(f"type_{j:02d}" for j in range(n_types))
+            print(f"\n[Attack type probabilities per edge (alpha={alpha:.3f}, fixed for this run)]")
+            print(f"{'Edge':<12}  {header}")
+            for i, edge in enumerate(self.edge_areas):
+                row = "  ".join(f"{self._p_attack_type_matrix[i, j]:.4f}" for j in range(n_types))
+                print(f"{str(edge.area_id):<12}  {row}")
 
     def reset(self, seed):
         self.t = 0
         self.last_history = list(self.history)
         self.history.clear()
         self.final_qoe = 0
+        p_matrix = self._p_attack_type_matrix
         for i, edge in enumerate(self.edge_areas):
-            edge.reset(seed=seed + i)        
+            p = p_matrix[i] if p_matrix is not None else None
+            edge.reset(seed=seed + i, p_attack_type=p)
 
-    def cooperative_offload_ot(
-        self,
-        states: List[OffloadState],
-    ) -> Tuple[List[OffloadState], List[OffloadDecision], np.ndarray]:
-        """
-        Synchronized greedy OT offloading across all edges.
-
-        Returns:
-        - updated states
-        - list of OffloadDecision
-        - I_net array of shape (n,) where I_net[i] = I_in[i] - I_out[i]
-        """
-        n = len(states)
-        for i, st in enumerate(states):
-            st.idx = i
-
-        decisions: List[OffloadDecision] = []
-
-        # per-slot offload counters
-        I_in = np.zeros(n, dtype=np.int64)
-        I_out = np.zeros(n, dtype=np.int64)
-
-        def finish_time_ms(st: OffloadState) -> float:
-            q = st.total_q()
-            if q <= 0:
-                return 0.0
-            if st.avail_cycles_aft_atk_per_ms <= 0:
-                return float("inf")
-            cycles = q * st.track_cycles_per_obj
-            return cycles / max(1e-9, st.avail_cycles_aft_atk_per_ms)
-
-        TOP = list(range(n))
-        TOP.sort(key=lambda i: finish_time_ms(states[i]))
-
-        changed = True
-        while changed:
-            changed = False
-
-            slow_order = sorted(TOP, key=lambda i: finish_time_ms(states[i]), reverse=True)
-
-            for src in slow_order:
-                src_st = states[src]
-                if src_st.total_q() <= 0:
-                    continue
-
-                local_C = finish_time_ms(src_st)
-
-                for dst in TOP:
-                    if dst == src:
-                        continue
-
-                    dst_st = states[dst]
-
-                    remote_cycles = (dst_st.total_q() + 1) * dst_st.track_cycles_per_obj
-                    remote_C = (
-                        remote_cycles / max(1e-9, dst_st.avail_cycles_aft_atk_per_ms)
-                        + float(self.delay_ms[src, dst])
-                    )
-
-                    # must still meet dst slack window
-                    if remote_C > dst_st.latest_track_finish_ms:
-                        continue
-
-                    # beneficial move
-                    if remote_C < local_C:
-                        # move exactly one object
-                        src_st.local_q_obj -= 1
-                        dst_st.recv_q_obj += 1
-
-                        I_out[src] += 1
-                        I_in[dst] += 1
-
-                        decisions.append(OffloadDecision(src_idx=src, dst_idx=dst, num_obj=1))
-
-                        # resort since workloads changed
-                        TOP.sort(key=lambda i: finish_time_ms(states[i]))
-                        changed = True
-                        break
-
-        I_net = I_in - I_out  # shape: (n,)
-        return states, decisions, I_net
-    
     def _snapshot_edges(self):
         return [edge.get_state() for edge in self.edge_areas], np.random.get_state()
 
@@ -215,10 +177,9 @@ class Environment:
     def step(self, ids_cpus, overhead=0):
         snapshot = self._snapshot_edges()
 
-        # 1. ideal from pre-step state
-        ideal_ids_cpus = [0.0] * len(self.edge_areas)
-        ideal_cache = self._run_step_once(
-            ids_cpus=ideal_ids_cpus,
+        # 1. ideal pass: attacks disabled, IDS CPU = 0 (max VA)
+        ideal_cache = self._run_step_multi_edge(
+            ids_cpus=[0.0] * len(self.edge_areas),
             overhead=overhead,
             disable_attack=True,
         )
@@ -226,24 +187,42 @@ class Environment:
         # 2. restore pre-step state
         self._restore_edges(snapshot)
 
-        # 3. actual from the same pre-step state
-        real_cache = self._run_step_once(
+        # 3. real pass from same pre-step state
+        real_cache = self._run_step_multi_edge(
             ids_cpus=ids_cpus,
             overhead=overhead,
             disable_attack=False,
-        )    
-        for edge in self.edge_areas:
-            cache = real_cache[edge.area_id]
-            cache_ideal = ideal_cache[edge.area_id]
+        )
+
+        edges_by_id = {e.area_id: e for e in self.edge_areas}
+        tot_req = sum(int(real_cache[aid].get("local_num_request", 0)) for aid in self.area_ids)
+        total_cpu_to_ids_ratio = sum(
+            edges_by_id[aid].ids_cpu / edges_by_id[aid].budget.cpu for aid in self.area_ids
+        )
+
+        overheads = (
+            [float(x) for x in overhead]
+            if isinstance(overhead, (list, tuple, np.ndarray))
+            else [float(overhead)] * len(self.edge_areas)
+        )
+
+        for i, edge in enumerate(self.edge_areas):
+            aid = edge.area_id
+            cache = real_cache[aid]
+            cache_ideal = ideal_cache[aid]
             ids_out = cache["ids_out"]
+            n = int(cache.get("local_num_request", 0))
+            qoe_weighted = float(cache["qoe"]) * (n / tot_req) if tot_req > 0 else float(cache["qoe"])
 
             self.history.append(
                 StepMetrics(
                     t=self.t,
-                    area_id=edge.area_id,
+                    area_id=aid,
                     qoe_mean=float(cache["qoe"]),
                     qoe_mean_ideal=float(cache_ideal["qoe"]),
                     benign_col_dmg=float(cache_ideal["qoe"] - cache["qoe"]),
+                    qoe_weighted=qoe_weighted * len(self.edge_areas),
+                    total_cpu_to_ids_ratio=total_cpu_to_ids_ratio,
 
                     ids_coverage=float(ids_out.get("coverage", 0.0)),
                     attack_in_rate=float(ids_out.get("attack_in_rate", 0.0)),
@@ -251,7 +230,7 @@ class Environment:
                     attack_drop_rate=float(ids_out.get("attack_drop_rate", 0.0)),
                     od_plan=cache["od_plan"],
 
-                    local_num_req=int(cache["local_num_request"]),
+                    local_num_req=n,
                     ema=float(cache["ema"]),
                     ema_mom=float(cache["ema_mom"]),
                     cpu_to_ids_ratio=edge.ids_cpu / edge.budget.cpu,
@@ -260,73 +239,174 @@ class Environment:
                     ids_cpu_utilization=float(ids_out["ids_cpu_util"]),
                     bw_utilization=float(cache["uplink_util"]),
 
-                    overhead=float(overhead),
+                    overhead=float(overheads[i]),
                 )
             )
 
         self.t += 1
 
         if self.t >= self.t_max:
-            qoe_slo = []
+            num = 0.0
+            den = 0.0
             for edge in self.edge_areas:
                 h = [m for m in self.history if m.area_id == edge.area_id]
-                if len(h) == 0:
+                if not h:
                     continue
-
                 last_block = h[-self.t_max:]
                 qoes = np.asarray([float(m.qoe_mean) for m in last_block], dtype=np.float32)
-
                 viol = (qoes < edge.slo_threshold).astype(np.float32)
-                viol_rate = float(viol.mean()) if len(viol) > 0 else 0.0
-                V_edge = np.exp(-edge.slo_beta * viol_rate)
+                viol_rate = float(viol.mean()) if viol.size else 0.0
+                V_edge = float(np.exp(-float(edge.slo_beta) * viol_rate))
+                score = float(qoes.mean()) * V_edge
+                w = float(sum(int(m.local_num_req) for m in last_block))
+                num += w * score
+                den += w
+            self.final_qoe = (num / den) if den > 0.0 else 0.0
 
-                # qoe_slo.append(float(qoes.mean()) * 1)
-                qoe_slo.append(float(qoes.mean()) * V_edge)
-
-            self.final_qoe = np.mean(qoe_slo) if len(qoe_slo) > 0 else 0.0        
-        
-        
-    def _run_step_once(self, ids_cpus, overhead=0.0, disable_attack=False):
-        local_cache = {}
+    def _run_step_multi_edge(self, ids_cpus, overhead=0.0, disable_attack=False):
+        """Two-stage IDS→VA offload step. Preserves single-edge overhead logic."""
+        edges = {e.area_id: e for e in self.edge_areas}
 
         if isinstance(ids_cpus, torch.Tensor):
             ids_cpus = ids_cpus.detach().cpu().tolist()
 
+        overheads = (
+            [float(x) for x in overhead]
+            if isinstance(overhead, (list, tuple, np.ndarray))
+            else [float(overhead)] * len(self.edge_areas)
+        )
+
+        # Set CPU splits (single-edge overhead logic)
         for i, edge in enumerate(self.edge_areas):
-            val = float(ids_cpus[i])
-
-            overhead_ids = float(overhead) if overhead > 0.0 else 0.0
-            overhead_va  = float(-overhead) if overhead < 0.0 else 0.0
-
-            ids_cpu_eff = val - overhead_ids
-            va_cpu_eff  = edge.budget.cpu - val - overhead_va
-
-            ids_cpu_eff = float(np.clip(ids_cpu_eff, 0.0, edge.budget.cpu))
-            va_cpu_eff  = float(np.clip(va_cpu_eff,  0.0, edge.budget.cpu))
-
+            oh = overheads[i]
+            overhead_ids = oh if oh > 0.0 else 0.0
+            overhead_va  = abs(oh) if oh < 0.0 else 0.0
+            ids_cpu_eff = float(np.clip(float(ids_cpus[i]) - overhead_ids, 0.0, edge.budget.cpu))
+            va_cpu_eff  = float(np.clip(edge.budget.cpu - float(ids_cpus[i]) - overhead_va, 0.5, edge.budget.cpu))
             total = ids_cpu_eff + va_cpu_eff
             if total > edge.budget.cpu:
-                excess = total - edge.budget.cpu
-                va_cpu_eff = max(0.5, va_cpu_eff - excess)
-
+                va_cpu_eff = max(0.5, va_cpu_eff - (total - edge.budget.cpu))
             edge.ids_cpu = ids_cpu_eff
             edge.va_cpu  = va_cpu_eff
 
-            if disable_attack:
-                for atk in getattr(edge, "attackers", []):
-                    atk_active_prev = getattr(atk, "episode_active", True)
-                    atk._tmp_prev_episode_active = atk_active_prev
-                    atk.episode_active = False
+        # Temporarily disable attacks for ideal pass
+        if disable_attack:
+            for edge in self.edge_areas:
+                edge._tmp_cur_attacker = edge.cur_attacker
+                edge.cur_attacker = []
 
-            cache = edge.step_local(self.t)
-            local_cache[edge.area_id] = cache
+        # Stage A: observe arrivals at each edge
+        obs = {aid: edges[aid].observe_arrivals(self.t) for aid in self.area_ids}
 
-            if disable_attack:
-                for atk in getattr(edge, "attackers", []):
-                    if hasattr(atk, "_tmp_prev_episode_active"):
-                        atk.episode_active = atk._tmp_prev_episode_active
-                        del atk._tmp_prev_episode_active
+        # Stage B: IDS — offload or process locally
+        if self.offload:
+            W_ids = {aid: float(obs[aid]["total_workload_in"]) for aid in self.area_ids}
+            c_ids = {aid: float(edges[aid].ids_cpu) for aid in self.area_ids}
+            kappa_ids_min = min(float(edges[aid].ids.cycles_per_packet) for aid in self.area_ids)
+            plan_ids = balance_with_caps_and_prop_filter(
+                area_ids=self.area_ids,
+                edges=edges,
+                W_src=W_ids,
+                c_dst=c_ids,
+                kappa_min=kappa_ids_min,
+                prop_delay=self.prop_delay,
+                tau_loc=None,
+            )
+            exec_user_in: Dict[str, int] = {aid: 0 for aid in self.area_ids}
+            exec_atk_in:  Dict[str, int] = {aid: 0 for aid in self.area_ids}
+            for src in self.area_ids:
+                u = float(obs[src]["user_req_in"])
+                a = float(obs[src]["atk_req_in"])
+                tot = max(u + a, 1.0)
+                for dst, n_sent in plan_ids.flow.get(src, {}).items():
+                    n_sent = float(n_sent)
+                    exec_user_in[dst] += int(round(n_sent * u / tot))
+                    exec_atk_in[dst]  += int(round(n_sent * a / tot))
+        else:
+            plan_ids = OffloadPlan(
+                flow={aid: {aid: int(obs[aid]["total_workload_in"])} for aid in self.area_ids},
+                assigned_dst={aid: int(obs[aid]["total_workload_in"]) for aid in self.area_ids},
+            )
+            exec_user_in = {aid: obs[aid]["user_req_in"] for aid in self.area_ids}
+            exec_atk_in  = {aid: obs[aid]["atk_req_in"]  for aid in self.area_ids}
 
+        # Execute IDS at each executor
+        ids_out_exec: Dict[str, dict] = {
+            aid: edges[aid].process_ids(
+                t=self.t,
+                user_in=exec_user_in[aid],
+                atk_in=exec_atk_in[aid],
+                inspect_in=exec_user_in[aid] + exec_atk_in[aid],
+                attack_dict=obs[aid]["attack_dict"],
+            )
+            for aid in self.area_ids
+        }
+
+        # Executor keeps admitted workload (no return to owner)
+        admitted_user: Dict[str, int] = {
+            aid: int(ids_out_exec[aid].get("user_pass_cnt", exec_user_in[aid]))
+            for aid in self.area_ids
+        }
+        admitted_atk: Dict[str, int] = {
+            aid: int(ids_out_exec[aid].get("atk_pass_cnt", 0))
+            for aid in self.area_ids
+        }
+
+        # Stage C: VA — offload or process locally
+        W_va = {aid: float(admitted_user[aid] + admitted_atk[aid]) for aid in self.area_ids}
+        if self.offload:
+            c_va = {aid: float(edges[aid].va_cpu) for aid in self.area_ids}
+            tau_loc = {aid: W_va[aid] / max(c_va[aid], 1e-9) for aid in self.area_ids}
+            kappa_va_min = min(
+                float(edges[aid].pipeline.detection_cycles("nanoDet-m")) for aid in self.area_ids
+            )
+            plan_va = balance_with_caps_and_prop_filter(
+                area_ids=self.area_ids,
+                edges=edges,
+                W_src=W_va,
+                c_dst=c_va,
+                kappa_min=kappa_va_min,
+                prop_delay=self.prop_delay,
+                tau_loc=tau_loc,
+            )
+            va_user_in: Dict[str, int] = {aid: 0 for aid in self.area_ids}
+            va_atk_in:  Dict[str, int] = {aid: 0 for aid in self.area_ids}
+            for src in self.area_ids:
+                u = float(admitted_user[src])
+                a = float(admitted_atk[src])
+                tot = max(u + a, 1.0)
+                for dst, n_sent in plan_va.flow.get(src, {}).items():
+                    n_sent = float(n_sent)
+                    va_user_in[dst] += int(round(n_sent * u / tot))
+                    va_atk_in[dst]  += int(round(n_sent * a / tot))
+        else:
+            plan_va = OffloadPlan(
+                flow={aid: {aid: int(W_va[aid])} for aid in self.area_ids},
+                assigned_dst={aid: int(W_va[aid]) for aid in self.area_ids},
+            )
+            va_user_in = {aid: admitted_user[aid] for aid in self.area_ids}
+            va_atk_in  = {aid: admitted_atk[aid]  for aid in self.area_ids}
+
+        # Execute VA at each executor
+        local_cache: Dict[str, dict] = {
+            aid: edges[aid].process_va(
+                t=self.t,
+                admitted_user_req_in=va_user_in[aid],
+                admitted_atk_req_in=va_atk_in[aid],
+                attack_dict=obs[aid]["attack_dict"],
+                ids_out=ids_out_exec[aid],
+            )
+            for aid in self.area_ids
+        }
+
+        # Restore attack active flags
+        if disable_attack:
+            for edge in self.edge_areas:
+                if hasattr(edge, "_tmp_cur_attacker"):
+                    edge.cur_attacker = edge._tmp_cur_attacker
+                    del edge._tmp_cur_attacker
+
+        for edge in self.edge_areas:
             assert edge.ids_cpu >= 0.0
             assert edge.va_cpu >= 0.0
             assert edge.ids_cpu + edge.va_cpu <= edge.budget.cpu + 1e-6
@@ -426,6 +506,7 @@ def build_env_from_cfg(cfg: dict):
         delay_ms=delay_ms,
         t_max=cfg["run"]["t_max"],
         seed=cfg["run"]["seed"],
+        offload=bool(cfg["globals"].get("offload", True)),
     )
     env.reset(cfg["run"]["seed"])
     return env
@@ -574,13 +655,14 @@ class TorchRLEnvWrapper(EnvBase):
             ),
         )
 
-        self.action_spec = CompositeSpec(
-            action=DiscreteTensorSpec(
-                n=self.n_actions,   # e.g., 9 for {-4, ..., 0, ..., +4} * scale_step
-                # shape=(self.n_edges,),
+        if self.n_edges == 1:
+            action_spec = DiscreteTensorSpec(n=self.n_actions, device=self.device)
+        else:
+            action_spec = MultiDiscreteTensorSpec(
+                nvec=[self.n_actions] * self.n_edges,
                 device=self.device,
             )
-        )
+        self.action_spec = CompositeSpec(action=action_spec)
 
         self.reward_spec = CompositeSpec(
             reward=UnboundedContinuousTensorSpec(
@@ -679,50 +761,42 @@ class TorchRLEnvWrapper(EnvBase):
         return 0.0        
 
     def _step(self, tensordict: TensorDict) -> TensorDict:
-        action = tensordict["action"]                       # scalar 0 to n_actions-1
-        # propose change: center at (n_actions - 1) / 2
-        delta_cmd = (action.to(self.device).float() - ((self.n_actions - 1) / 2.0)) * self.scale_step
-        # delta_cmd = self._reactive_delta() * self.scale_step  # -1, 0, +1
+        action = tensordict["action"].to(self.device)
+        # Normalise to shape (n_edges,) for both single- and multi-edge
+        if action.dim() == 0:
+            action = action.unsqueeze(0).expand(self.n_edges)
+        elif action.dim() == 1 and action.shape[0] == 1 and self.n_edges > 1:
+            action = action.expand(self.n_edges)
 
-        prev_ids = self.ids_cpu[0].clone()
-        edge = self.env.edge_areas[0]
-        ids_cpu_max_val = float(edge.budget.cpu - 0.5)
+        # Apply per-edge delta commands
+        for i in range(self.n_edges):
+            delta_cmd = (action[i].float() - ((self.n_actions - 1) / 2.0)) * self.scale_step
+            ids_cpu_max = float(self.env.edge_areas[i].budget.cpu - 0.5)
+            prev = self.ids_cpu[i].clone()
+            self.ids_cpu[i] = torch.clamp(
+                self.ids_cpu[i] + delta_cmd, min=self.ids_cpu_min, max=ids_cpu_max
+            )
+            delta_eff = float((self.ids_cpu[i] - prev).item())
 
-        # ids_cpu tracks the desired ("queued") target.
-        # Netting queue: delta is applied on top of the current queue, not settled.
-        # Commands issued during a transition accumulate; they do not reset to settled.
-        self.ids_cpu[0] = torch.clamp(
-            self.ids_cpu[0] + delta_cmd,
-            min=self.ids_cpu_min,
-            max=ids_cpu_max_val,
-        )
-        delta_eff = float((self.ids_cpu[0] - prev_ids).item())
-
-        # Settled: apply delta immediately (start transition).
-        # In transition: net delta onto queue; ids_cpu_target unchanged until current
-        # transition completes, then the accumulated queue fires as the next command.
-        if self.transition_ticks_remaining <= 0:
-            if abs(delta_eff) > 1e-9:
-                self.ids_cpu_target[0] = self.ids_cpu[0]
-                gap = abs(float(self.ids_cpu_target[0].item()) - float(self.ids_cpu_settled[0].item()))
+            if self.transition_ticks_remaining <= 0 and abs(delta_eff) > 1e-9:
+                self.ids_cpu_target[i] = self.ids_cpu[i]
+                gap = abs(float(self.ids_cpu_target[i].item()) - float(self.ids_cpu_settled[i].item()))
                 self.transition_ticks_total     = self._lookup_scaling_duration(gap)
                 self.transition_ticks_remaining = self.transition_ticks_total
-        # else: in transition — ids_cpu already updated as queue; ids_cpu_target unchanged
 
-        # --- Asymmetric effective allocation for the transition in progress ---
-        # scale-up:   IDS holds at settled, VA drops immediately to budget-target
-        # scale-down: IDS drops immediately to target, VA holds at budget-settled
-        target  = float(self.ids_cpu_target[0].item())
-        settled = float(self.ids_cpu_settled[0].item())
-        delta_to_settled = target - settled
-
+        # Compute per-edge effective CPU for this transition (asymmetric scale-up/down)
         ids_cpu_eff = self.ids_cpu_settled.clone()
+        step_overhead = 0.0
         if self.transition_ticks_remaining > 0:
-            if delta_to_settled > 1e-9:   # scale-up: IDS holds at settled
-                ids_cpu_eff[0] = settled
-            else:                          # scale-down: IDS drops immediately
-                ids_cpu_eff[0] = target
-        step_overhead = -abs(delta_to_settled) if self.transition_ticks_remaining > 0 else 0.0
+            for i in range(self.n_edges):
+                target  = float(self.ids_cpu_target[i].item())
+                settled = float(self.ids_cpu_settled[i].item())
+                delta_to_settled = target - settled
+                if delta_to_settled > 1e-9:      # scale-up: IDS holds at settled
+                    ids_cpu_eff[i] = settled
+                else:                             # scale-down: IDS drops immediately
+                    ids_cpu_eff[i] = target
+                step_overhead = min(step_overhead, -abs(delta_to_settled))
 
         total_reward = 0.0
         total_lambda_res = 0.0
@@ -731,29 +805,28 @@ class TorchRLEnvWrapper(EnvBase):
         terminated_flag = False
         steps = 0
 
-        # 2) Simulate decision_interval internal timesteps
+        # Simulate decision_interval internal timesteps
         for _ in range(self.decision_interval):
             if self.transition_ticks_remaining > 0:
                 self.transition_ticks_remaining -= 1
                 if self.transition_ticks_remaining == 0:
-                    # Commit: settle at ids_cpu_target
-                    self.ids_cpu_settled[0] = self.ids_cpu_target[0]
-                    # Fire queued command if ids_cpu diverged from new settled
-                    queued_delta = float(self.ids_cpu[0].item()) - float(self.ids_cpu_settled[0].item())
-                    if abs(queued_delta) > 1e-9:
-                        self.ids_cpu_target[0] = self.ids_cpu[0]
-                        gap = abs(queued_delta)
-                        self.transition_ticks_total     = self._lookup_scaling_duration(gap)
-                        self.transition_ticks_remaining = self.transition_ticks_total
-                        new_d = float(self.ids_cpu_target[0].item()) - float(self.ids_cpu_settled[0].item())
-                        step_overhead = -abs(new_d)
-                        if new_d > 1e-9:   # scale-up: IDS holds
-                            ids_cpu_eff[0] = float(self.ids_cpu_settled[0].item())
-                        else:              # scale-down: IDS drops
-                            ids_cpu_eff[0] = float(self.ids_cpu_target[0].item())
-                    else:
-                        ids_cpu_eff[0] = float(self.ids_cpu_settled[0].item())
-                        step_overhead = 0.0
+                    for i in range(self.n_edges):
+                        self.ids_cpu_settled[i] = self.ids_cpu_target[i]
+                        queued_delta = float(self.ids_cpu[i].item()) - float(self.ids_cpu_settled[i].item())
+                        if abs(queued_delta) > 1e-9:
+                            self.ids_cpu_target[i] = self.ids_cpu[i]
+                            gap = abs(queued_delta)
+                            self.transition_ticks_total     = self._lookup_scaling_duration(gap)
+                            self.transition_ticks_remaining = self.transition_ticks_total
+                            new_d = float(self.ids_cpu_target[i].item()) - float(self.ids_cpu_settled[i].item())
+                            step_overhead = -abs(new_d)
+                            if new_d > 1e-9:
+                                ids_cpu_eff[i] = float(self.ids_cpu_settled[i].item())
+                            else:
+                                ids_cpu_eff[i] = float(self.ids_cpu_target[i].item())
+                        else:
+                            ids_cpu_eff[i] = float(self.ids_cpu_settled[i].item())
+                            step_overhead = 0.0
 
             self.env.step(ids_cpu_eff, step_overhead)
             r = self._build_reward()
@@ -846,12 +919,11 @@ class TorchRLEnvWrapper(EnvBase):
         max_dur = float(self.scaling_time_steps[-1])
         obs[:, -2] = float(self.transition_ticks_remaining) / max(max_dur, 1.0)
 
-        # Feature -1: delta in flight — (ids_cpu_target - ids_cpu_settled) / max_possible_delta ∈ [-1, 1]
-        # Normalise by the largest single command so the feature fills [-1, +1].
-        # max_delta = scale_step * (n_actions - 1) / 2  e.g. 0.5 * 4 = 2.0 for n_actions=9
+        # Feature -1: per-edge delta in flight — (ids_cpu_target - ids_cpu_settled) / max_delta ∈ [-1, 1]
         max_delta = self.scale_step * (self.n_actions - 1) / 2.0
-        delta_in_flight = float(self.ids_cpu_target[0].item()) - float(self.ids_cpu_settled[0].item())
-        obs[:, -1] = float(np.clip(delta_in_flight / max(max_delta, 1e-6), -1.0, 1.0))
+        for i in range(self.n_edges):
+            delta_in_flight = float(self.ids_cpu_target[i].item()) - float(self.ids_cpu_settled[i].item())
+            obs[i, -1] = float(np.clip(delta_in_flight / max(max_delta, 1e-6), -1.0, 1.0))
 
         return obs
 
@@ -937,7 +1009,7 @@ def test_environment_run(cfg_path: str, plot=False, decision_interval: int = 500
     env = build_env_base(cfg_path)
 
     dfs = []
-    for i in range(5):
+    for i in range(3):
         env.reset(seed=1000 + i)
 
         n_edges = len(env.edge_areas)
@@ -1032,4 +1104,4 @@ def test_environment_run(cfg_path: str, plot=False, decision_interval: int = 500
     print(f"Plots saved to {out_dir}/")    
         
 if __name__ == "__main__":
-    test_environment_run("./configs/simulation_0.yaml", plot=True, method="constant", constant_cpu=0.0)
+    test_environment_run("./configs/simulation_ma_0.yaml", plot=True, method="constant", constant_cpu=4.0)
