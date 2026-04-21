@@ -189,7 +189,10 @@ class EdgeArea:
         ema = 0.0
         mom = 0.0
 
-        for atk in self.cur_attacker:
+        for atk in self.attackers:
+
+            if not getattr(atk, "episode_active", True):
+                continue
             r = atk.load_at(t)
 
             if r is None:
@@ -202,19 +205,12 @@ class EdgeArea:
 
             ema += float(r.get("flows_per_step_ema", 0.0))
             mom += float(r.get("flows_per_step_ema_mom", 0.0))
-
-        slot_s = self.slot_ms / 1000.0
-        bw_per_flow = (total_bw_in / (total_flows * slot_s)) if total_flows > 0 else 0.0
-        cycle_per_flow = (total_cycles_per_step / (total_flows * slot_s)) if total_flows > 0 else 0.0
-
         return {
             "flows": total_flows,
-            "bw_in": total_bw_in,           # Mb/slot
-            "cycles_per_step": total_cycles_per_step,  # cycles/slot
+            "bw_in": total_bw_in,
+            "cycles_per_step": total_cycles_per_step,
             "ema": ema,
             "mom": mom,
-            "bw_per_flow": bw_per_flow,         # Mbps per flow
-            "cycle_per_flow": cycle_per_flow,   # cycles/s per flow
         }
 
     def aggregate_load_after_ids(self, t: int, attack_dict = Dict[str, Any]) -> Dict[str, float]:

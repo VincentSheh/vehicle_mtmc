@@ -124,10 +124,11 @@ class Attacker:
 
         self.base_seed = seed
         self.rng = np.random.default_rng(seed)
+        self.active_len = self.t_max // 10
         self._init_start()
 
     def _generate_patterned_trace(self):
-        self.active_len = self.t_max // 5
+        
         dt = self.slot_ms / 1000.0
         t_full = np.arange(0, self.active_len * dt, dt)
         g = np.zeros_like(t_full, dtype=float)
@@ -173,11 +174,10 @@ class Attacker:
         self._flows_ema = pd.Series(self._flows).ewm(alpha=alpha, adjust=False).mean().to_numpy(dtype=np.float32)
 
     def _init_start(self):
-        self.active_len = self.t_max // 2
         max_start = self.t_max - self.active_len
         # Sample start and scaling BEFORE trace generation so these are
         # identical across pattern types for the same seed.
-        self.start = int(self.rng.uniform(500, self.active_len))
+        self.start = int(self.rng.uniform(0, self.t_max - self.active_len))
         self.scaling = float(self.rng.uniform(0.8, 1.4))
         self.rep = 1
         self.tau = 0

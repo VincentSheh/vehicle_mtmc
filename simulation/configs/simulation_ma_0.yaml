@@ -20,11 +20,12 @@ globals:
     n_types: 10
     dirichlet_alpha: 0.2  # symmetric Dirichlet concentration over edges per type; higher=uniform, lower=concentrated on one edge
     pattern_types: ["sinus", "pw", "expo"]
-    lambda_base:      [7000, 7000]   # flows/sec
+    pattern_types: ["pw"]
+    lambda_base:      [12000, 12000]   # flows/sec
     noise_std:        [0.05, 0.10]
     t_cycle_min:      [300, 500]     # seconds (lower bound on cycle duration)
     t_cycle_delta:    [300, 800]     # seconds added to t_min to get t_max
-    latency_per_flow: [0.01, 0.02]   # ms per flow
+    latency_per_flow: [2, 4]   # ms per flow
     bw_per_flow:      [0.0, 0.0]     # Mbps per flow
     non_defendable_bw_const: 0.0
 
@@ -34,7 +35,7 @@ globals:
     gamma_inv: 15    # Benign collateral normalizer     (gamma = 1/gamma_inv ≈ 8.33)
     q_th:      0.20  # QoE shortfall threshold
 
-  offload_mode: "none"  # "none" | "balance" | "delay_workload" | "full"
+  offload_mode: "cto"  # "none" | "balance" | "cto" | "cto_acc" | "full"
   max_prop_delay_ms: 50.0        # hard delay cutoff for modes delay_workload / full
 
   # Score-based offload weights (modes delay_workload / full)
@@ -43,9 +44,9 @@ globals:
   #                  + (FPR_local - FPR_remote) * w2   [full only]
   #                  + (util_src  - util_dst)   * w4   [full only]
   offload_weights:
-    w1: 0.0   # FNR accuracy improvement
-    w2: 1.5   # FPR accuracy improvement
-    w3: 1.0  # propagation delay penalty
+    w1: 1.0   # FNR accuracy improvement
+    w2: 0.0   # FPR accuracy improvement
+    w3: 0.000  # propagation delay penalty
     w4: 0.5   # IDS utilization balancing
 
   # Accuracy-by-region matrix: [src_edge_idx][exec_edge_idx] = [FPR, FNR]
@@ -54,9 +55,21 @@ globals:
   # Off-diagonal = cross-edge accuracy (typically higher error due to domain shift).
   # Order matches edge_areas list: E1=0, E2=1.
   accuracy_by_region:
-    - [[0.0, 0.00], [0.1, 0.00], [0.1, 0.00]]   # traffic from E1: inspected at [E1, E2, E3]
-    - [[0.1, 0.00], [0.0, 0.00], [0.1, 0.00]]   # traffic from E2: inspected at [E1, E2, E3]
-    - [[0.1, 0.00], [0.1, 0.00], [0.0, 0.00]]   # traffic from E3: inspected at [E1, E2, E3]
+    # - [[0.0, 0.0], [0.0, 1.0], [0.0, 0.5]]   # traffic from E1: inspected at [E1, E2, E3]
+    # - [[0.0, 0.2], [0.0, 0.00], [0.0, 0.8]]   # traffic from E2: inspected at [E1, E2, E3]
+    # - [[0.0, 0.8], [0.0, 0.3], [0.0, 0.0]]   # traffic from E3: inspected at [E1, E2, E3]    
+    # - [[0.00, 0.00], [0.5, 0.00], [0.5, 0.00]]  # E1→E2 similar; E1→E3 more domain shift                                                                                                                                                                        
+    # - [[0.5, 0.00], [0.00, 0.00], [0.5, 0.00]]  # E2→E3 more similar than E2→E1                                                                                                                                                                                   
+    # - [[0.5, 0.00], [0.5, 0.00], [0.5, 0.00]]  # E3→E2 more similar than E3→E1         
+    # - [[0.0, 0.00], [0.1, 0.00], [0.1, 0.00]]   # traffic from E1: inspected at [E1, E2, E3]
+    # - [[0.1, 0.00], [0.0, 0.00], [0.1, 0.00]]   # traffic from E2: inspected at [E1, E2, E3]
+    # - [[0.1, 0.00], [0.1, 0.00], [0.0, 0.00]]   # traffic from E3: inspected at [E1, E2, E3]
+    - [[0.0, 0.00], [0.0, 0.1], [0.0, 0.1]]   # traffic from E1: inspected at [E1, E2, E3]
+    - [[0.0, 0.1], [0.0, 0.00], [0.0, 0.1]]   # traffic from E2: inspected at [E1, E2, E3]
+    - [[0.0, 0.1], [0.0, 0.1], [0.0, 0.00]]   # traffic from E3: inspected at [E1, E2, E3]
+    # - [[0.0, 0.00], [0.0, 0.00], [0.0, 0.00]]   # traffic from E1: inspected at [E1, E2, E3]
+    # - [[0.0, 0.00], [0.0, 0.00], [0.0, 0.00]]   # traffic from E2: inspected at [E1, E2, E3]
+    # - [[0.0, 0.00], [0.0, 0.00], [0.0, 0.00]]   # traffic from E3: inspected at [E1, E2, E3]
 
 
   # Propagation delay matrix in ms: row=source edge index, col=target edge index.
@@ -65,9 +78,12 @@ globals:
   # - City-scale (intersection to intersection): 5–20 ms
   # - Metro area / across districts: 20–50 ms
   delay_ms:
-    - [0.0,  20.0, 35.0]
-    - [20.0,  0.0, 20.0]
-    - [35.0, 20.0,  0.0]
+    # - [0.0,  0.0, 0.0]
+    # - [0.0,  0.0, 0.0]
+    # - [0.0, 0.0,  0.0]
+    - [0.0,  20.0, 30.0]
+    - [20.0,  0.0, 40.0]
+    - [30.0, 40.0,  0.0]
 
   video_pipeline:
     reid_latency: 20 #! Should consider batch processing
@@ -157,7 +173,7 @@ edge_areas:
         synthetic:
           rw_sigma_per_sqrt_sec: 1.2
           mu_min: 20.0
-          mu_max: 250.0
+          mu_max: 200.0
           kappa: 0.25
           sigma: 8
 
@@ -179,6 +195,6 @@ edge_areas:
         synthetic:
           rw_sigma_per_sqrt_sec: 1.2
           mu_min: 20.0
-          mu_max: 250.0
+          mu_max: 200.0
           kappa: 0.25
           sigma: 8

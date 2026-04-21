@@ -33,6 +33,8 @@ from offload import (
     no_offload,
     balance_workload,
     score_based_offload,
+    balance_workload_cto,
+    balance_workload_cto_acc,
     balance_with_caps_and_prop_filter,
 )
 
@@ -172,7 +174,7 @@ class Environment:
         p_matrix = self._p_attack_type_matrix
         for i, edge in enumerate(self.edge_areas):
             p = p_matrix[i] if p_matrix is not None else None
-            edge.reset(seed=seed + i, p_attack_type=p)
+            edge.reset(seed=seed + i*100, p_attack_type=p)
 
     def _snapshot_edges(self):
         return [edge.get_state() for edge in self.edge_areas], np.random.get_state()
@@ -287,6 +289,34 @@ class Environment:
         if mode == "balance":
             return balance_workload(self.area_ids, W_src, c_dst)
 
+        if mode == "cto":
+            nested: Dict[str, Dict[str, float]] = {
+                s: {r: float(self.prop_delay.get((s, r), 0.0)) for r in self.area_ids}
+                for s in self.area_ids
+            }
+            return balance_workload_cto(self.area_ids, W_src, c_dst, nested)
+
+        if mode == "cto_acc":
+            nested = {
+                s: {r: float(self.prop_delay.get((s, r), 0.0)) for r in self.area_ids}
+                for s in self.area_ids
+            }
+            fnr_mat = fpr_mat = None
+            if self.acc_by_region is not None and stage == "ids":
+                fpr_mat = self.acc_by_region[:, :, 0]
+                fnr_mat = self.acc_by_region[:, :, 1]
+            w1, w2, w3, _ = self._offload_weights
+            return balance_workload_cto_acc(
+                area_ids=self.area_ids,
+                W_src=W_src,
+                c_dst=c_dst,
+                propagation_delays=nested,
+                weights=(w1, w2, w3),
+                fnr_matrix=fnr_mat,
+                fpr_matrix=fpr_mat,
+                id_to_idx=self.id_to_idx,
+            )
+
         # modes "delay_workload" and "full" use score_based_offload
         max_d = float(getattr(self, "_max_prop_delay_ms", 1e9))
         fnr_matrix = fpr_matrix = None
@@ -351,7 +381,13 @@ class Environment:
 
         # Stage B: IDS offload plan
         W_ids = {aid: float(obs[aid]["total_workload_in"]) for aid in self.area_ids}
-        c_ids = {aid: float(edges[aid].ids_cpu) for aid in self.area_ids}
+        if self.offload_mode in ("cto", "cto_acc"):
+            c_ids = {
+                aid: float(edges[aid].ids.effective_speed_pkt_per_step(edges[aid].ids_cpu))
+                for aid in self.area_ids
+            }
+        else:
+            c_ids = {aid: float(edges[aid].ids_cpu) for aid in self.area_ids}
         plan_ids = self._make_offload_plan(W_ids, c_ids, stage="ids")
 
         exec_user_in: Dict[str, int] = {aid: 0 for aid in self.area_ids}
@@ -432,7 +468,27 @@ class Environment:
 
         # Stage C: VA offload plan (VA has no accuracy benefit; delay/load only)
         W_va = {aid: float(admitted_user[aid] + admitted_atk[aid]) for aid in self.area_ids}
-        c_va = {aid: float(edges[aid].va_cpu) for aid in self.area_ids}
+        # Deduct admitted-attack CPU consumption from VA capacity so the planner
+        # routes work away from attack-saturated edges (mirrors edgearea.process_va).
+        c_va: Dict[str, float] = {}
+        for aid in self.area_ids:
+            edge = edges[aid]
+            total_atk = float(obs[aid]["attack_dict"].get("flows", 0.0))
+            atk_pass_frac = (float(admitted_atk[aid]) / total_atk) if total_atk > 0 else 0.0
+            atk_cycles_per_ms = (
+                float(obs[aid]["attack_dict"].get("cycles_per_step", 0.0))
+                * atk_pass_frac / edge.slot_ms
+            )
+            if self.offload_mode in ("cto", "cto_acc"):
+                avail_cycles = max(
+                    0.0,
+                    float(edge.va_cpu) * edge.cpu_cycle_per_ms * edge.slot_ms
+                    - atk_cycles_per_ms * edge.slot_ms,
+                )
+                min_det_cycles = min(edge.pipeline.det_cycles.values())
+                c_va[aid] = avail_cycles / min_det_cycles if min_det_cycles > 0 else 0.0
+            else:
+                c_va[aid] = max(0.0, float(edge.va_cpu) - atk_cycles_per_ms / edge.cpu_cycle_per_ms)
         plan_va = self._make_offload_plan(W_va, c_va, stage="va")
 
         va_user_in: Dict[str, int] = {aid: 0 for aid in self.area_ids}
@@ -897,19 +953,20 @@ class TorchRLEnvWrapper(EnvBase):
                 self.transition_ticks_total     = self._lookup_scaling_duration(gap)
                 self.transition_ticks_remaining = self.transition_ticks_total
 
-        # Compute per-edge effective CPU for this transition (asymmetric scale-up/down)
-        ids_cpu_eff = self.ids_cpu_settled.clone()
-        step_overhead = 0.0
+        # Effective allocation during a transition.
+        # Both directions: IDS holds at settled for the full duration.
+        # scale-up   (delta > 0): step_overhead = -delta < 0  → overhead_va  = delta  (VA  pays)
+        # scale-down (delta < 0): step_overhead = -delta > 0  → overhead_ids = |delta| (IDS pays)
+        # Symmetric: the scaling side absorbs the overhead cost in both directions.
+        ids_cpu_eff = self.ids_cpu_settled.clone()   # IDS holds at settled in all cases
+        step_overhead = [0.0] * self.n_edges
         if self.transition_ticks_remaining > 0:
             for i in range(self.n_edges):
                 target  = float(self.ids_cpu_target[i].item())
                 settled = float(self.ids_cpu_settled[i].item())
                 delta_to_settled = target - settled
-                if delta_to_settled > 1e-9:      # scale-up: IDS holds at settled
-                    ids_cpu_eff[i] = settled
-                else:                             # scale-down: IDS drops immediately
-                    ids_cpu_eff[i] = target
-                step_overhead = min(step_overhead, -abs(delta_to_settled))
+                if abs(delta_to_settled) > 1e-9:
+                    step_overhead[i] = -delta_to_settled
 
         total_reward = 0.0
         total_lambda_res = 0.0
@@ -932,14 +989,11 @@ class TorchRLEnvWrapper(EnvBase):
                             self.transition_ticks_total     = self._lookup_scaling_duration(gap)
                             self.transition_ticks_remaining = self.transition_ticks_total
                             new_d = float(self.ids_cpu_target[i].item()) - float(self.ids_cpu_settled[i].item())
-                            step_overhead = -abs(new_d)
-                            if new_d > 1e-9:
-                                ids_cpu_eff[i] = float(self.ids_cpu_settled[i].item())
-                            else:
-                                ids_cpu_eff[i] = float(self.ids_cpu_target[i].item())
+                            step_overhead[i] = -new_d if abs(new_d) > 1e-9 else 0.0
+                            ids_cpu_eff[i] = float(self.ids_cpu_settled[i].item())
                         else:
                             ids_cpu_eff[i] = float(self.ids_cpu_settled[i].item())
-                            step_overhead = 0.0
+                            step_overhead[i] = 0.0
 
             self.env.step(ids_cpu_eff, step_overhead)
             r = self._build_reward()
@@ -1119,10 +1173,14 @@ def test_environment_run(cfg_path: str, plot=False, decision_interval: int = 500
     method: "reactive"    - threshold-based IDS CPU adjustment every decision_interval steps
             "constant"    - fixed ids_cpu = constant_cpu for all steps
     """
+    with open(cfg_path) as _f:
+        _cfg = yaml.safe_load(_f)
+    q_th = float(_cfg["globals"].get("reward", {}).get("q_th", 0.20))
+
     env = build_env_base(cfg_path)
 
     dfs = []
-    for i in range(3):
+    for i in range(5):
         env.reset(seed=1000 + i)
 
         n_edges = len(env.edge_areas)
@@ -1159,12 +1217,10 @@ def test_environment_run(cfg_path: str, plot=False, decision_interval: int = 500
     os.makedirs(out_dir, exist_ok=True)
 
     # QoE over time
-    (
-        all_df.pivot(index="t", columns="area_id", values=["qoe_mean", "qoe_mean_ideal", "benign_col_dmg"])
-        .plot(figsize=(10, 4), title="QoE over time")
-        .get_figure()
-        .savefig(f"{out_dir}/qoe_over_time.png", bbox_inches="tight")
-    )
+    qoe_pivot = all_df.pivot(index="t", columns="area_id", values="qoe_mean")
+    ax_qoe = qoe_pivot.plot(figsize=(10, 4), title="QoE over time", alpha=0.25)
+    qoe_pivot.rolling(500, min_periods=1).mean().plot(ax=ax_qoe, linewidth=2)
+    ax_qoe.get_figure().savefig(f"{out_dir}/qoe_over_time.png", bbox_inches="tight")
 
     # Latency over time
     (
@@ -1211,10 +1267,18 @@ def test_environment_run(cfg_path: str, plot=False, decision_interval: int = 500
         .savefig(f"{out_dir}/machine_count.png", bbox_inches="tight")
     )    
 
-    avg_qoe = df["qoe_mean"].mean()
-    print(f"Average QoE (qoe_mean): {avg_qoe:.4f}")
-    print(f"Average QoE (benign_col_dmg): {df['benign_col_dmg'].mean():.4f}")
+    violation_rate = float((all_df["qoe_mean"] < q_th).mean())
+
+    atk_in   = all_df["attack_in_rate"].sum()
+    atk_drop = all_df["attack_drop_rate"].sum()
+    malicious_drop_pct = 100.0 * atk_drop / atk_in if atk_in > 0 else 0.0
+
+    avg_qoe = all_df["qoe_mean"].mean()
+    print(f"Average QoE (qoe_mean):       {avg_qoe:.4f}")
+    print(f"Average QoE (benign_col_dmg): {all_df['benign_col_dmg'].mean():.4f}")
+    print(f"SLO violation rate (q_th={q_th:.2f}): {violation_rate:.4f} ({100*violation_rate:.1f}%)")
+    print(f"Malicious traffic dropped:    {malicious_drop_pct:.1f}%")
     print(f"Plots saved to {out_dir}/")    
         
 if __name__ == "__main__":
-    test_environment_run("./configs/simulation_ma_0.yaml", plot=True, method="constant", constant_cpu=4.0)
+    test_environment_run("./configs/simulation_ma_0.yaml", plot=True, method="constant", constant_cpu=2.0)

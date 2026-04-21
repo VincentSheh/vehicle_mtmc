@@ -109,6 +109,150 @@ def balance_workload(
 
 
 # ---------------------------------------------------------------------------
+# Mode b2 — CTO (Collaborative Task Offloading, propagation-aware greedy)
+# ---------------------------------------------------------------------------
+
+def balance_workload_cto(
+    area_ids: List[Any],
+    W_src: Dict[Any, float],
+    c_dst: Dict[Any, float],
+    propagation_delays: Dict[Any, Dict[Any, float]],
+    cap_dst: Optional[Dict[Any, float]] = None,
+) -> OffloadPlan:
+    """
+    CTO: proportional redistribution target, then greedy forwarding over
+    sender→receiver links sorted by ascending propagation delay.
+    """
+    W_tot = float(sum(W_src[e] for e in area_ids))
+    W     = {e: float(W_src[e]) for e in area_ids}
+
+    if W_tot <= EPS:
+        flow = {e: {e: int(round(W[e]))} for e in area_ids}
+        return _build_plan(flow, area_ids)
+
+    # c_dst is task throughput capacity (tasks/slot); use directly as the target.
+    N_star = {e: float(c_dst[e]) for e in area_ids}
+    if cap_dst is not None:
+        N_star = {e: min(N_star[e], float(cap_dst[e])) for e in area_ids}
+    supply    = {e: max(0.0, W[e] - N_star[e]) for e in area_ids}
+    demand    = {e: max(0.0, N_star[e] - W[e]) for e in area_ids}
+    senders   = [e for e in area_ids if supply[e] > EPS]
+    receivers = [e for e in area_ids if demand[e] > EPS]
+
+    all_links: List[Tuple[Any, Any, float]] = [
+        (s, r, propagation_delays[s][r])
+        for s in senders
+        for r in receivers
+        if s != r
+    ]
+    all_links.sort(key=lambda x: x[2])
+
+    flow_float: Dict[Any, Dict[Any, float]] = {e: {e: W[e]} for e in area_ids}
+    rem_supply = {e: supply[e] for e in senders}
+    rem_demand = {e: demand[e] for e in receivers}
+
+    for s, r, _ in all_links:
+        if rem_supply[s] <= EPS or rem_demand[r] <= EPS:
+            continue
+        u = min(rem_supply[s], rem_demand[r])
+        flow_float[s][s] -= u
+        flow_float[s][r]  = flow_float[s].get(r, 0.0) + u
+        rem_supply[s]    -= u
+        rem_demand[r]    -= u
+
+    return _build_plan(_round_and_conserve(flow_float, W), area_ids)
+
+
+# ---------------------------------------------------------------------------
+# Mode b3 — CTO with accuracy-aware link scoring (cto_acc)
+# ---------------------------------------------------------------------------
+# Link cost (s → r):
+#   cost = d_prop(s,r)          * w3       ← propagation delay penalty
+#        - (FNR[s,s] - FNR[s,r]) * w1     ← FNR improvement reduces cost
+#        - (FPR[s,s] - FPR[s,r]) * w2     ← FPR improvement reduces cost
+#
+# Links are sorted ascending by cost (lowest cost = closest + most accurate first).
+# With w1=w2=0 this reduces to ascending delay, identical to balance_workload_cto.
+# Redistribution target and greedy forwarding are identical to balance_workload_cto.
+# ---------------------------------------------------------------------------
+
+def balance_workload_cto_acc(
+    area_ids: List[Any],
+    W_src: Dict[Any, float],
+    c_dst: Dict[Any, float],
+    propagation_delays: Dict[Any, Dict[Any, float]],
+    weights: Tuple[float, float, float] = (1.0, 1.0, 0.01),
+    fnr_matrix: Optional[np.ndarray] = None,
+    fpr_matrix: Optional[np.ndarray] = None,
+    id_to_idx: Optional[Dict[Any, int]] = None,
+    cap_dst: Optional[Dict[Any, float]] = None,
+) -> OffloadPlan:
+    """
+    CTO with accuracy-aware link scoring: same redistribution target as
+    balance_workload_cto, but links are sorted by a composite score that
+    rewards FNR/FPR improvement and penalises propagation delay.
+    """
+    w1, w2, w3 = weights
+
+    W_tot = float(sum(W_src[e] for e in area_ids))
+    W     = {e: float(W_src[e]) for e in area_ids}
+
+    if W_tot <= EPS:
+        flow = {e: {e: int(round(W[e]))} for e in area_ids}
+        return _build_plan(flow, area_ids)
+
+    N_star = {e: float(c_dst[e]) for e in area_ids}
+    if cap_dst is not None:
+        N_star = {e: min(N_star[e], float(cap_dst[e])) for e in area_ids}
+
+    supply    = {e: max(0.0, W[e] - N_star[e]) for e in area_ids}
+    demand    = {e: max(0.0, N_star[e] - W[e]) for e in area_ids}
+    senders   = [e for e in area_ids if supply[e] > EPS]
+    receivers = [e for e in area_ids if demand[e] > EPS]
+
+    scored_links: List[Tuple[float, Any, Any]] = []
+    for s in senders:
+        si = id_to_idx[s] if id_to_idx is not None else None
+        for r in receivers:
+            if s == r:
+                continue
+            d_prop = float(propagation_delays[s][r])
+            delay_penalty = d_prop * w3
+
+            acc = 0.0
+            if (fnr_matrix is not None and fpr_matrix is not None
+                    and si is not None and id_to_idx is not None):
+                ri = id_to_idx[r]
+                acc = (
+                    (float(fnr_matrix[si, si]) - float(fnr_matrix[si, ri])) * w1
+                    + (float(fpr_matrix[si, si]) - float(fpr_matrix[si, ri])) * w2
+                )
+
+            # cost = delay_penalty - acc:
+            # lower cost = better link (closer + more accurate)
+            # with w1=w2=0 this reduces to ascending delay, identical to plain cto
+            cost = delay_penalty - acc
+            scored_links.append((cost, s, r))
+
+    scored_links.sort(key=lambda x: x[0])
+
+    flow_float: Dict[Any, Dict[Any, float]] = {e: {e: W[e]} for e in area_ids}
+    rem_supply = {e: supply[e] for e in senders}
+    rem_demand = {e: demand[e] for e in receivers}
+
+    for _, s, r in scored_links:
+        if rem_supply[s] <= EPS or rem_demand[r] <= EPS:
+            continue
+        u = min(rem_supply[s], rem_demand[r])
+        flow_float[s][s] -= u
+        flow_float[s][r]  = flow_float[s].get(r, 0.0) + u
+        rem_supply[s]    -= u
+        rem_demand[r]    -= u
+
+    return _build_plan(_round_and_conserve(flow_float, W), area_ids)
+
+
+# ---------------------------------------------------------------------------
 # Modes c & d — score-based routing
 # ---------------------------------------------------------------------------
 # Score for routing src's traffic to dst:
