@@ -26,14 +26,14 @@ from tbsa_offline import TBSAPolicy
 class ActContext:
     """All information a policy may need to make a decision."""
     env: object                    # Environment instance (for history, edge_areas)
-    ids_cpu: np.ndarray            # last-committed (settled) IDS CPU, shape (n_edges,)
+    ids_cpu: np.ndarray            # current queue position (ids_cpu), shape (n_edges,)
     ids_cpu_min: float
     ids_cpu_max: np.ndarray        # shape (n_edges,)
-    cpu_util: float                # scalar decision-window CPU utilisation
+    cpu_util: float                # scalar decision-window CPU utilisation (max across edges)
     decision_interval: int
     rng: np.random.Generator       # seeded RNG for stochastic policies
-    transition_ticks_norm: float = 0.0   # remaining ticks / max_duration ∈ [0, 1]
-    delta_in_flight_norm: float = 0.0    # (ids_cpu_target - ids_cpu_settled) / ids_cpu_max ∈ [-1, 1]
+    transition_ticks_norm: np.ndarray    # shape (n_edges,)
+    delta_in_flight_norm: np.ndarray     # shape (n_edges,)
     obs_flat: Optional[np.ndarray] = None  # pre-built normalised obs for RL policies
 
 
@@ -41,6 +41,8 @@ class ActContext:
 # Abstract base
 # ---------------------------------------------------------------------------
 class BaselinePolicy(abc.ABC):
+    min_cpu_override: Optional[float] = None
+
     @abc.abstractmethod
     def act(self, ctx: ActContext) -> tuple[Optional[np.ndarray], np.ndarray]:
         """
@@ -81,6 +83,17 @@ class RandomPolicy(BaselinePolicy):
 
 
 # ---------------------------------------------------------------------------
+# No IDS policy (IDS fully disabled, CPU = 0)
+# ---------------------------------------------------------------------------
+class NoIDSPolicy(BaselinePolicy):
+    min_cpu_override = 0.0
+
+    def act(self, ctx: ActContext) -> tuple[Optional[np.ndarray], np.ndarray]:
+        n = len(ctx.ids_cpu)
+        return np.zeros(n, dtype=np.float32), np.zeros(n, dtype=np.int64)
+
+
+# ---------------------------------------------------------------------------
 # Reactive threshold policy
 # ---------------------------------------------------------------------------
 class ReactivePolicy(BaselinePolicy):
@@ -96,6 +109,33 @@ class ReactivePolicy(BaselinePolicy):
             delta = -np.ones(n_edges, dtype=np.int64)
         else:
             delta = np.zeros(n_edges, dtype=np.int64)
+        return None, delta
+
+
+# ---------------------------------------------------------------------------
+# App workload autoscaling policy (wrong signal: VA utilization, not attack load)
+# ---------------------------------------------------------------------------
+class AppAutoscalePolicy(BaselinePolicy):
+    def __init__(self, high_threshold: float = 0.80, low_threshold: float = 0.20):
+        self.high_threshold = high_threshold
+        self.low_threshold  = low_threshold
+
+    def act(self, ctx: ActContext) -> tuple[Optional[np.ndarray], np.ndarray]:
+        import pandas as pd
+        n   = len(ctx.ids_cpu)
+        env = ctx.env
+        va_util = 0.0
+        if env.history:
+            records = env.history[-ctx.decision_interval * n:]
+            df = pd.DataFrame([m.__dict__ for m in records])
+            if "va_cpu_utilization" in df.columns:
+                va_util = float(np.mean(df["va_cpu_utilization"].values))
+        if va_util >= self.high_threshold:
+            delta = np.ones(n, dtype=np.int64)
+        elif va_util <= self.low_threshold:
+            delta = -np.ones(n, dtype=np.int64)
+        else:
+            delta = np.zeros(n, dtype=np.int64)
         return None, delta
 
 
@@ -166,9 +206,10 @@ class LSTMRLPolicy(BaselinePolicy):
         temporal_idx  = train_cfg["model"]["temporal_idx"]
         static_idx    = train_cfg["model"]["static_idx"]
 
-        self.n_actions  = n_actions
-        self.scale_step = 0.5
-        self.h_size     = feature_dim
+        self.n_actions       = n_actions
+        self.scale_step      = 0.5
+        self.h_size          = feature_dim
+        self.expected_obs_dim = n_temporal + n_static
 
         # Reconstruct the same topology used during training
         split_module = TensorDictModule(
@@ -281,13 +322,14 @@ class LSTMRLPolicy(BaselinePolicy):
                 print(f"[LSTMRLPolicy] WARNING: no loc/scale keys found in obsnorm "
                       f"(keys: {list(obsnorm.keys())}) — running WITHOUT normalisation")
 
-        self._h: Optional[object] = None
-        self._c: Optional[object] = None
+        # Per-edge LSTM hidden states (list of (h, c) tensors, one per edge)
+        self._hs: Optional[list] = None
+        self._cs: Optional[list] = None
 
     # ------------------------------------------------------------------
     def reset(self) -> None:
-        self._h = None
-        self._c = None
+        self._hs = None
+        self._cs = None
 
     def _normalise(self, obs_flat: np.ndarray) -> np.ndarray:
         if self.obs_loc is None:
@@ -296,53 +338,88 @@ class LSTMRLPolicy(BaselinePolicy):
         scale = self.obs_scale.detach().cpu().numpy()
         return (obs_flat - loc) / (scale + 1e-8)
 
-    def act(self, ctx: ActContext) -> tuple[Optional[np.ndarray], np.ndarray]:
+    def _extract_per_edge_obs(self, obs_flat: np.ndarray, n_edges: int) -> np.ndarray:
+        """
+        Returns array of shape (n_edges, expected_obs_dim).
+
+        When obs_flat matches expected_obs_dim exactly (single-edge), wraps it.
+        When obs_flat is larger (multi-edge with neighbor features), reshapes to
+        (n_edges, per_edge_full) then strips the neighbor columns in the middle,
+        producing (n_edges, expected_obs_dim).
+
+        Obs layout assumed (from _build_obs_flat in eval_baselines.py):
+          [base(n_base) | neighbor(n_nbr, multi-edge only) | slo(1) | transition(2)]
+        where n_tail = 3 (slo + transition) and n_base = expected_obs_dim - n_tail.
+        """
+        if obs_flat.shape[0] == self.expected_obs_dim:
+            return obs_flat.reshape(1, self.expected_obs_dim)
+
+        per_edge_full = obs_flat.shape[0] // n_edges
+        obs_2d = obs_flat.reshape(n_edges, per_edge_full)
+        n_tail  = 3   # slo_vio + transition_ticks_norm + delta_in_flight_norm
+        n_base  = self.expected_obs_dim - n_tail
+        n_nbr   = per_edge_full - self.expected_obs_dim
+        return np.concatenate([obs_2d[:, :n_base], obs_2d[:, n_base + n_nbr:]], axis=1)
+
+    def _run_one_edge(self, obs_np: np.ndarray, h: object, c: object):
+        """Run one forward pass for a single edge. Returns (logits, h_next, c_next)."""
         import torch
         from tensordict import TensorDict
+
+        obs_t = torch.from_numpy(obs_np).to(self.device).unsqueeze(0)  # [1, obs_dim]
+        td = TensorDict(
+            {
+                "observation_flat":  obs_t,
+                "recurrent_state_h": h,
+                "recurrent_state_c": c,
+                "is_init": torch.zeros(1, 1, device=self.device, dtype=torch.bool),
+            },
+            batch_size=[1],
+            device=self.device,
+        )
+        with torch.no_grad():
+            td = self.net(td)
+        return (
+            td.get("logits").squeeze(0),
+            td.get(("next", "recurrent_state_h")),
+            td.get(("next", "recurrent_state_c")),
+        )
+
+    def act(self, ctx: ActContext) -> tuple[Optional[np.ndarray], np.ndarray]:
+        import torch
 
         n_edges = len(ctx.ids_cpu)
 
         if ctx.obs_flat is None:
             return None, np.zeros(n_edges, dtype=np.int64)
 
-        obs_np = self._normalise(ctx.obs_flat.astype(np.float32))
-        obs_t  = torch.from_numpy(obs_np).to(self.device).unsqueeze(0)   # [1, obs_size]
+        # Lazily init one (h, c) pair per edge
+        if self._hs is None:
+            self._hs = [torch.zeros(1, 1, self.h_size, device=self.device) for _ in range(n_edges)]
+            self._cs = [torch.zeros(1, 1, self.h_size, device=self.device) for _ in range(n_edges)]
 
-        if self._h is None:
-            self._h = torch.zeros(1, 1, self.h_size, device=self.device)
-            self._c = torch.zeros(1, 1, self.h_size, device=self.device)
+        # Extract per-edge obs slices (strips neighbor features when in multi-edge env)
+        per_edge_obs = self._extract_per_edge_obs(ctx.obs_flat.astype(np.float32), n_edges)
 
-        td = TensorDict(
-            {
-                "observation_flat":  obs_t,
-                "recurrent_state_h": self._h,
-                "recurrent_state_c": self._c,
-                "is_init": torch.zeros(1, 1, device=self.device, dtype=torch.bool),
-            },
-            batch_size=[1],
-            device=self.device,
-        )
+        ids_cpu_abs = np.empty(n_edges, dtype=np.float32)
+        for i in range(n_edges):
+            obs_np = self._normalise(per_edge_obs[i])
+            logits, h_next, c_next = self._run_one_edge(obs_np, self._hs[i], self._cs[i])
+            self._hs[i] = h_next
+            self._cs[i] = c_next
 
-        with torch.no_grad():
-            td = self.net(td)
+            if self.greedy:
+                action = int(torch.argmax(logits).item())
+            else:
+                probs  = torch.softmax(logits, dim=-1)
+                action = int(torch.multinomial(probs, 1).item())
 
-        self._h = td.get("recurrent_state_h")
-        self._c = td.get("recurrent_state_c")
-
-        logits = td.get("logits").squeeze(0)
-        if self.greedy:
-            action = int(torch.argmax(logits).item())
-        else:
-            probs  = torch.softmax(logits, dim=-1)
-            action = int(torch.multinomial(probs, 1).item())
-
-        # Map discrete action → absolute CPU (netting: relative to current queue)
-        delta_cmd = (action - (self.n_actions - 1) / 2.0) * self.scale_step
-        ids_cpu_abs = np.clip(
-            ctx.ids_cpu + float(delta_cmd),   # ctx.ids_cpu == current queue position
-            ctx.ids_cpu_min,
-            ctx.ids_cpu_max,
-        ).astype(np.float32)
+            delta_cmd = (action - (self.n_actions - 1) / 2.0) * self.scale_step
+            ids_cpu_abs[i] = float(np.clip(
+                ctx.ids_cpu[i] + delta_cmd,
+                ctx.ids_cpu_min,
+                ctx.ids_cpu_max[i],
+            ))
 
         return ids_cpu_abs, np.zeros(n_edges, dtype=np.int64)
 
@@ -363,13 +440,23 @@ def make_baseline_policy(
     if name.startswith("constant_"):
         cpu_val = float(name.split("_", 1)[1])
         return ConstantPolicy(cpu_val)
+    elif name == "no_ids":
+        return NoIDSPolicy()
+    elif name == "static_low":
+        return ConstantPolicy(0.5)
+    elif name == "static_balanced":
+        return ConstantPolicy(2.0)
+    elif name == "static_high":
+        return ConstantPolicy(4.0)
     elif name == "random":
         return RandomPolicy()
-    elif name == "reactive":
+    elif name in ("reactive", "autoscale_def"):
         return ReactivePolicy()
-    elif name == "tbsa":
+    elif name == "autoscale_app":
+        return AppAutoscalePolicy()
+    elif name in ("tbsa", "offline_optimal"):
         if tbsa_table_path is None:
-            raise ValueError("tbsa_table_path must be provided for 'tbsa' policy")
+            raise ValueError(f"tbsa_table_path must be provided for '{name}' policy")
         tbsa = TBSAPolicy(tbsa_table_path)
         return TBSAWrapperPolicy(tbsa)
     elif name == "lstm_rl":
@@ -377,6 +464,6 @@ def make_baseline_policy(
             raise ValueError("ckpt_path must be provided for 'lstm_rl' policy")
         if obs_keys is None:
             raise ValueError("obs_keys must be provided for 'lstm_rl' policy")
-        return LSTMRLPolicy(ckpt_path=ckpt_path, obs_keys=obs_keys, device=device)
+        return LSTMRLPolicy(ckpt_path=ckpt_path, obs_keys=obs_keys, device=device, greedy=False)
     else:
         raise ValueError(f"Unknown baseline policy name: {name!r}")

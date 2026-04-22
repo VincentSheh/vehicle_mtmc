@@ -756,9 +756,9 @@ class TorchRLEnvWrapper(EnvBase):
         # Reward weights — config keys are *_inv (the denominator), so invert to get the weight.
         # alpha = 1/alpha_inv (e.g. alpha_inv=5.0 → alpha=0.2)
         _reward_cfg = _cfg["globals"].get("reward", {})
-        self.reward_alpha = 1.0 / float(_reward_cfg.get("alpha_inv", 10.0))
-        self.reward_beta  = 1.0 / float(_reward_cfg.get("beta_inv",  5.0))
-        self.reward_gamma = 1.0 / float(_reward_cfg.get("gamma_inv", 8.33))
+        self.reward_alpha = float(_reward_cfg.get("alpha_inv", 10.0))
+        self.reward_beta  = float(_reward_cfg.get("beta_inv",  5.0))
+        self.reward_gamma = float(_reward_cfg.get("gamma_inv", 8.33))
         self.reward_q_th  = float(_reward_cfg.get("q_th", 0.20))
         self.scaling_quanta: List[float] = [0.5, 1.0, 1.5, 2.0]
 
@@ -1347,4 +1347,4 @@ def test_environment_run(cfg_path: str, plot=False, decision_interval: int = 500
     print(f"Plots saved to {out_dir}/")    
         
 if __name__ == "__main__":
-    test_environment_run("./configs/simulation_ma_0.yaml", plot=True, method="constant", constant_cpu=2.0)
+    test_environment_run("./configs/simulation_ma_0.yaml", plot=True, method="constant", constant_cpu=0.0)

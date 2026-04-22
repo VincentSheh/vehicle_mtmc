@@ -22,14 +22,230 @@ import pandas as pd
 import yaml
 from tqdm import tqdm
 
-from environment import build_env_base, TorchRLEnvWrapper, VA_CPU_RESERVE
+from environment import build_env_base, TorchRLEnvWrapper
 from method_policy import ActContext, BaselinePolicy, make_baseline_policy
-from old_policy import plot_ts_continuous, plot_qoe_vio_bars
+from matplotlib import pyplot as plt
 
 SCALING_QUANTA = [0.5, 1.0, 1.5, 2.0]
 
-DEFAULT_METHODS = ["random", "constant_0.5", "constant_1.5", "tbsa", "reactive"]
-DEFAULT_METHODS = ["reactive", "lstm_rl"]
+DEFAULT_METHODS = [
+    "no_ids",
+    "static_low", 
+    # "static_balanced",
+    "static_high",
+    # "autoscale_app", 
+    "autoscale_def",
+    "offline_optimal",
+    "lstm_rl",
+]
+# DEFAULT_METHODS = [
+#     "autoscale_def",
+#     "offline_optimal",
+#     "lstm_rl",
+# ]
+
+# Human-readable labels used in plots and summary table
+DISPLAY_NAMES: Dict[str, str] = {
+    "no_ids":          "No IDS",
+    "static_low":      "Static Low",
+    "static_balanced": "Static Balanced ",
+    "static_high":     "Static High",
+    "autoscale_app":   "Autoscale (App load)",
+    "autoscale_def":   "Autoscale (Defense load)",
+    "offline_optimal": "Offline Optimal (TBSA)",
+    "lstm_rl":         "LSTM RL",
+    # legacy / custom names fall through to raw name
+}
+
+def plot_ts_continuous(results: Dict[str, Dict[str, np.ndarray]], outpath: Path, slo_qoe_min: float = 0.2, beta=3):
+    fig, axes = plt.subplots(12, 1, figsize=(15, 22), sharex=True)
+
+    panels = [
+        ("qoe", "QoE"),
+        ("benign_col_dmg", "Benign Collateral Damage"),
+        ("local_num_req", "Local #Req"),
+        ("attack_in_rate", "Attack in rate"),
+        ("attack_drop_rate", "Attack drop rate"),
+        ("cpu_util", "CPU Utilization"),
+        ("cpu_to_ids_ratio", "CPU→IDS Ratio"),
+        ("ema_mom", "EMA Momentum"),
+        ("reward_lambda_res", "Raw Factor: λ_res (leakage)"),
+        ("reward_benign_col_dmg", "Raw Factor: Benign Collateral Dmg"),
+        ("reward_qoe_penalty", "Raw Factor: QoE Shortfall"),
+    ]
+
+    for ax, (k, ylabel) in zip(axes, panels):
+        for method, series in results.items():
+            y_raw = series.get(k, None)
+            if y_raw is None or y_raw.size == 0:
+                continue
+
+            # y_raw shape: (T,) or (T, E)
+            if y_raw.ndim == 2:
+                y = np.mean(y_raw, axis=1)  # Mean across edges
+                y_min = np.min(y_raw, axis=1)
+                y_max = np.max(y_raw, axis=1)
+            else:
+                y = y_raw
+                y_min = y_max = None
+
+            x = np.arange(len(y))
+
+            if k == "qoe":
+                y_valid = y[np.isfinite(y)]
+                avg_qoe = float(np.nanmean(y_valid)) if y_valid.size else 0.0
+                
+                # Prefer pre-calculated per-step violation rate if available
+                vio_series = series.get("qoe_vio_rate", None)
+                if vio_series is not None and vio_series.size > 0:
+                    vio_rate = float(np.mean(vio_series))
+                elif y_raw.ndim == 2:
+                    vio_rate = float(np.mean(y_raw < float(slo_qoe_min)))
+                else:
+                    vio_rate = float(np.nanmean((y_valid < float(slo_qoe_min)).astype(np.float32))) if y_valid.size else 0.0
+                
+                label = f"{method} (avg={avg_qoe:.3f}, vio={vio_rate:.2%})"
+            else:
+                label = method
+
+            line = ax.plot(x, y, label=label)[0]
+            if y_min is not None and y_max is not None:
+                ax.fill_between(x, y_min, y_max, color=line.get_color(), alpha=0.15)
+
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.3)
+
+    axes[-1].set_xlabel("decision step")
+    axes[0].legend(loc="upper right")
+    plt.tight_layout()
+    plt.savefig(outpath, dpi=200)
+    plt.close()
+
+
+def plot_qoe_vio_bars(results: Dict[str, Dict[str, np.ndarray]],
+                      outpath: Path,
+                      qoe_slo_min: float = 0.2,
+                      beta: float = 3.0):
+    methods, avg_qoe, vio_rate = [], [], []
+    avg_benign_col_dmg, avg_attack_drop_pct = [], []
+
+    for method, series in results.items():
+        qoe_raw = series.get("qoe", None)
+        if qoe_raw is None or qoe_raw.size == 0:
+            continue
+
+        # qoe_raw shape: (T,) or (T, E)
+        if qoe_raw.ndim == 2:
+            q = np.mean(qoe_raw, axis=1)  # average across edges for QoE bar
+            vr = float(np.mean(qoe_raw < qoe_slo_min))  # per-edge violation across all steps
+        else:
+            q = qoe_raw
+            # Prefer pre-calculated per-step violation rate if available
+            vio_series = series.get("qoe_vio_rate", None)
+            if vio_series is not None and vio_series.size > 0:
+                vr = float(np.mean(vio_series))
+            else:
+                vr = float(np.nanmean((q < qoe_slo_min).astype(np.float32)))
+        
+        v = float(np.exp(-beta * vr))
+        methods.append(method)
+        vio_rate.append(vr)
+        avg_qoe.append(float(np.mean(q)) * v)
+
+        # Benign Collateral Damage
+        bcd_raw = series.get("benign_col_dmg", None)
+        if bcd_raw is None:
+            avg_benign_col_dmg.append(np.nan)
+        else:
+            avg_benign_col_dmg.append(float(np.mean(bcd_raw)))
+
+        # Attack Drop %
+        # 1 - lambda_res (leakage)
+        lres_raw = series.get("reward_lambda_res", None)
+        if lres_raw is not None and lres_raw.size > 0:
+            avg_attack_drop_pct.append(float(1.0 - np.mean(lres_raw)))
+        else:
+            avg_attack_drop_pct.append(np.nan)
+
+    x = np.arange(len(methods), dtype=np.int32)
+    width = 0.7
+
+    fig, axes = plt.subplots(1, 4, figsize=(20, 4))
+
+    bars_qoe = axes[0].bar(x, avg_qoe, width)
+    axes[0].set_xticks(x)
+    axes[0].set_xticklabels(methods, rotation=20, ha="right")
+    axes[0].set_ylabel("Average QoE")
+    axes[0].set_title("Average QoE")
+    axes[0].grid(axis="y", alpha=0.3)
+    for bar in bars_qoe:
+        h = float(bar.get_height())
+        axes[0].text(
+            bar.get_x() + bar.get_width() / 2,
+            h,
+            f"{h:.3f}",
+            ha="center",
+            va="bottom",
+            fontsize=9,
+        )
+
+    bars_vio = axes[1].bar(x, vio_rate, width)
+    axes[1].set_xticks(x)
+    axes[1].set_xticklabels(methods, rotation=20, ha="right")
+    axes[1].set_ylabel("Violation Rate")
+    axes[1].set_ylim(0.0, 1.0)
+    axes[1].set_title(f"SLO Violations (QoE < {qoe_slo_min})")
+    axes[1].grid(axis="y", alpha=0.3)
+    for bar in bars_vio:
+        h = float(bar.get_height())
+        axes[1].text(
+            bar.get_x() + bar.get_width() / 2,
+            h,
+            f"{h:.1%}",
+            ha="center",
+            va="bottom",
+            fontsize=9,
+        )
+
+    bars_dmg = axes[2].bar(x, avg_benign_col_dmg, width)
+    axes[2].set_xticks(x)
+    axes[2].set_xticklabels(methods, rotation=20, ha="right")
+    axes[2].set_ylabel("Benign Collateral Damage")
+    axes[2].set_title("Average Benign Collateral Damage")
+    axes[2].grid(axis="y", alpha=0.3)
+    for bar, val in zip(bars_dmg, avg_benign_col_dmg):
+        if np.isfinite(val):
+            axes[2].text(
+                bar.get_x() + bar.get_width() / 2,
+                float(bar.get_height()),
+                f"{float(val):.3f}",
+                ha="center",
+                va="bottom",
+                fontsize=9,
+            )
+
+    bars_drop = axes[3].bar(x, avg_attack_drop_pct, width)
+    axes[3].set_xticks(x)
+    axes[3].set_xticklabels(methods, rotation=20, ha="right")
+    axes[3].set_ylabel("Attack Drop %")
+    axes[3].set_ylim(0.0, 1.0)
+    axes[3].set_title("Average Attack Drop Percentage")
+    axes[3].grid(axis="y", alpha=0.3)
+    for bar, val in zip(bars_drop, avg_attack_drop_pct):
+        if np.isfinite(val):
+            axes[3].text(
+                bar.get_x() + bar.get_width() / 2,
+                float(bar.get_height()),
+                f"{float(val):.1%}",
+                ha="center",
+                va="bottom",
+                fontsize=9,
+            )
+
+    plt.tight_layout()
+    plt.savefig(outpath, dpi=200)
+    plt.close()
+
 
 
 # ---------------------------------------------------------------------------
@@ -47,36 +263,89 @@ def _build_obs_flat(
     env,
     decision_interval: int,
     obs_keys: List[str],
-    transition_ticks_norm: float,
-    delta_in_flight_norm: float,
+    ids_cpu_target: np.ndarray,
+    ids_cpu_settled: np.ndarray,
+    transition_ticks_remaining: np.ndarray,
+    scaling_time_steps: List[int],
+    scale_step: float,
+    n_actions: int,
 ) -> np.ndarray:
     n_edges = len(env.edge_areas)
-    obs_dim = len(obs_keys) + 2   # +2: transition_ticks_norm, delta_in_flight_norm
+    area_ids = [e.area_id for e in env.edge_areas]
+    # obs layout: [obs_keys(5)] [neighbor_ids_util, neighbor_delta, neighbor_atk_rate(3, multi-edge only)]
+    #             [prev_slo_vio(1)] [transition_ticks_norm, delta_in_flight_norm(2)]
+    # Single-edge omits neighbor block (8 dims) to match single-agent training layout.
+    n_nbr = 3 if n_edges > 1 else 0
+    obs_dim = len(obs_keys) + n_nbr + 1 + 2
     obs = np.zeros((n_edges, obs_dim), dtype=np.float32)
 
-    if env.history:
-        records = env.history[-decision_interval * n_edges:]
-        df = pd.DataFrame([m.__dict__ for m in records])
-        for i, area_id in enumerate([e.area_id for e in env.edge_areas]):
-            g = df[df["area_id"] == area_id]
-            if g.empty:
-                continue
-            for j, k in enumerate(obs_keys):
-                if k not in g.columns:
-                    continue
-                vals = g[k].values
-                if k == "I_net":
-                    obs[i, j] = float(np.sum(vals))
-                elif k == "cpu_to_ids_ratio":
-                    obs[i, j] = float(vals[-1])
-                elif k == "ema_mom":
-                    vals_nz = vals[vals != 0.0]
-                    obs[i, j] = float(np.mean(vals_nz)) if len(vals_nz) > 0 else 0.0
-                else:
-                    obs[i, j] = float(np.mean(vals))
+    if not env.history:
+        return obs.reshape(-1).astype(np.float32)
 
-    obs[:, -2] = float(np.clip(transition_ticks_norm, 0.0, 1.0))
-    obs[:, -1] = float(np.clip(delta_in_flight_norm, -1.0, 1.0))
+    records = env.history[-decision_interval * n_edges:]
+    df = pd.DataFrame([m.__dict__ for m in records])
+
+    n_base = len(obs_keys)
+
+    # 1. Per-edge base features
+    for i, area_id in enumerate(area_ids):
+        g = df[df["area_id"] == area_id]
+        if g.empty:
+            continue
+        for j, k in enumerate(obs_keys):
+            if k == "cpu_to_ids_ratio":
+                obs[i, j] = float(g[k].values[-1])
+            else:
+                obs[i, j] = float(np.mean(g[k].values))
+
+    # 2. Neighbor state features
+    edge_ids_util: Dict[str, float] = {}
+    edge_atk_rate: Dict[str, float] = {}
+    for i, area_id in enumerate(area_ids):
+        g = df[df["area_id"] == area_id]
+        if g.empty:
+            edge_ids_util[area_id] = 0.0
+            edge_atk_rate[area_id] = 0.0
+        else:
+            edge_ids_util[area_id] = float(np.clip(np.mean(g["ids_cpu_utilization"].values), 0.0, 1.0))
+            edge_atk_rate[area_id] = float(np.mean(g["attack_in_rate"].values))
+
+    max_delta = scale_step * (n_actions - 1) / 2.0
+    if n_nbr > 0:
+        for i, area_id in enumerate(area_ids):
+            nbr_utils: List[float] = []
+            nbr_deltas: List[float] = []
+            nbr_atk: List[float] = []
+            for j in range(n_edges):
+                if j == i:
+                    continue
+                other_id = area_ids[j]
+                nbr_utils.append(edge_ids_util[other_id])
+                nbr_atk.append(edge_atk_rate[other_id])
+                delta = float(ids_cpu_target[j]) - float(ids_cpu_settled[j])
+                nbr_deltas.append(float(np.clip(delta / max(max_delta, 1e-6), -1.0, 1.0)))
+
+            obs[i, n_base]     = float(np.mean(nbr_utils))  if nbr_utils  else 0.0
+            obs[i, n_base + 1] = float(np.mean(nbr_deltas)) if nbr_deltas else 0.0
+            obs[i, n_base + 2] = float(np.mean(nbr_atk))    if nbr_atk    else 0.0
+
+    # 3. Previous SLO violation flag
+    for i, area_id in enumerate(area_ids):
+        g = df[df["area_id"] == area_id]
+        if g.empty:
+            obs[i, n_base + n_nbr] = 0.0
+            continue
+        last_qoe = float(g["qoe_mean"].values[-1])
+        threshold = float(env.edge_areas[i].slo_threshold)
+        obs[i, n_base + n_nbr] = 1.0 if last_qoe < threshold else 0.0
+
+    # 4. Transition state features
+    max_dur = float(scaling_time_steps[-1])
+    for i in range(n_edges):
+        obs[i, -2] = float(transition_ticks_remaining[i]) / max(max_dur, 1.0)
+        delta_in_flight = float(ids_cpu_target[i]) - float(ids_cpu_settled[i])
+        obs[i, -1] = float(np.clip(delta_in_flight / max(max_delta, 1e-6), -1.0, 1.0))
+
     return obs.reshape(-1).astype(np.float32)
 
 
@@ -123,22 +392,23 @@ def run_episode(
     policy.reset()
 
     n_edges     = len(env.edge_areas)
-    ids_cpu_max = np.array([e.budget.cpu - VA_CPU_RESERVE for e in env.edge_areas], dtype=np.float32)
-    
+    ids_cpu_max = np.array([e.budget.cpu - 0.5 for e in env.edge_areas], dtype=np.float32)
+    effective_min = float(policy.min_cpu_override) if policy.min_cpu_override is not None else ids_cpu_min
+
     if initial_ids_cpu is not None:
         ids_cpu = initial_ids_cpu.copy()
     else:
         ids_cpu = np.array([e.ids_cpu for e in env.edge_areas], dtype=np.float32)
-    
-    ids_cpu     = np.clip(ids_cpu, ids_cpu_min, ids_cpu_max)
+
+    ids_cpu = np.clip(ids_cpu, effective_min, ids_cpu_max)
 
     scaling_time_steps: List[int] = list(
         cfg["globals"].get("scaling_time_step", [300, 450, 498, 544])
     )
     ids_cpu_settled            = ids_cpu.copy()
     ids_cpu_target             = ids_cpu.copy()
-    transition_ticks_remaining = 0
-    transition_ticks_total     = 1
+    transition_ticks_remaining = np.zeros(n_edges, dtype=np.int32)
+    transition_ticks_total     = np.ones(n_edges, dtype=np.int32)
     max_scaling_duration       = float(scaling_time_steps[-1])
     max_delta                  = scale_step * (n_actions - 1) / 2.0   # largest single command
     rng = np.random.default_rng(seed)
@@ -163,83 +433,84 @@ def run_episode(
         if env.t >= env.t_max:
             break
 
-        ticks_norm      = float(transition_ticks_remaining) / max(max_scaling_duration, 1.0)
-        delta_in_flight = float(ids_cpu_target[0]) - float(ids_cpu_settled[0])
-        d_flight_norm   = float(np.clip(delta_in_flight / max(max_delta, 1e-6), -1.0, 1.0))
-        obs_flat = _build_obs_flat(env, decision_interval, obs_keys, ticks_norm, d_flight_norm)
+        ticks_norm = transition_ticks_remaining.astype(np.float32) / max(max_scaling_duration, 1.0)
+        delta_if   = ids_cpu_target - ids_cpu_settled
+        dif_norm   = np.clip(delta_if / max(max_delta, 1e-6), -1.0, 1.0)
+
+        obs_flat = _build_obs_flat(
+            env, decision_interval, obs_keys,
+            ids_cpu_target, ids_cpu_settled, transition_ticks_remaining,
+            scaling_time_steps, scale_step, n_actions
+        )
         cpu_util = _cpu_util(env, decision_interval)
 
         ctx = ActContext(
             env=env,
-            ids_cpu=ids_cpu.copy(),   # netting: policies base delta on current queue
-            ids_cpu_min=ids_cpu_min,
+            ids_cpu=ids_cpu.copy(),   # current queue position
+            ids_cpu_min=effective_min,
             ids_cpu_max=ids_cpu_max,
             cpu_util=cpu_util,
             decision_interval=decision_interval,
             rng=rng,
             transition_ticks_norm=ticks_norm,
-            delta_in_flight_norm=d_flight_norm,
+            delta_in_flight_norm=dif_norm,
             obs_flat=obs_flat,
         )
 
         ids_cpu_abs, delta = policy.act(ctx)
 
         prev_ids_cpu = ids_cpu.copy()
-        if ids_cpu_abs is not None:
-            # Abs-value policies (constant, tbsa, lstm_rl) return an absolute position;
-            # treat it as the new queue value directly.
-            ids_cpu = np.clip(ids_cpu_abs, ids_cpu_min, ids_cpu_max).astype(np.float32)
-        else:
-            # Delta policies: net delta onto current queue, not onto settled.
-            ids_cpu = np.clip(
-                ids_cpu + delta.astype(np.float32) * scale_step,
-                ids_cpu_min,
-                ids_cpu_max,
-            ).astype(np.float32)
+        _max_q = 2.0  # SCALING_QUANTA[-1]
 
-        delta_eff = float(ids_cpu[0] - prev_ids_cpu[0])
+        for i in range(n_edges):
+            if ids_cpu_abs is not None:
+                # Absolute policy (clamped to settled ± max_quantum to match netting)
+                ids_cpu[i] = np.clip(
+                    ids_cpu_abs[i],
+                    np.maximum(effective_min, ids_cpu_settled[i] - _max_q),
+                    np.minimum(ids_cpu_max[i], ids_cpu_settled[i] + _max_q),
+                )
+            else:
+                # Delta policy: net onto current queue
+                ids_cpu[i] = np.clip(
+                    ids_cpu[i] + float(delta[i]) * scale_step,
+                    np.maximum(effective_min, ids_cpu_settled[i] - _max_q),
+                    np.minimum(ids_cpu_max[i], ids_cpu_settled[i] + _max_q),
+                )
 
-        # Settled: apply delta immediately (start transition).
-        # In transition: net delta onto queue; ids_cpu_target unchanged until current
-        # transition completes, then the accumulated queue fires as the next command.
-        if transition_ticks_remaining <= 0:
-            if abs(delta_eff) > 1e-9:
-                ids_cpu_target[0] = ids_cpu[0]
-                gap = abs(float(ids_cpu_target[0]) - float(ids_cpu_settled[0]))
-                transition_ticks_total     = _lookup_scaling_duration(gap, scaling_time_steps)
-                transition_ticks_remaining = transition_ticks_total
-        # else: in transition — ids_cpu updated as queue; ids_cpu_target unchanged
-
-        # Asymmetric effective allocation for the transition in progress
-        delta_to_settled = float(ids_cpu_target[0]) - float(ids_cpu_settled[0])
-        ids_cpu_eff = ids_cpu_settled.copy()
-        if transition_ticks_remaining > 0:
-            if delta_to_settled > 1e-9:   # scale-up: IDS holds at settled
-                ids_cpu_eff[0] = ids_cpu_settled[0]
-            else:                          # scale-down: IDS drops immediately
-                ids_cpu_eff[0] = ids_cpu_target[0]
-        step_overhead = -abs(delta_to_settled) if transition_ticks_remaining > 0 else 0.0
+            # Start transition if settled and desired allocation changed
+            delta_eff = float(ids_cpu[i] - prev_ids_cpu[i])
+            if transition_ticks_remaining[i] <= 0 and abs(delta_eff) > 1e-9:
+                ids_cpu_target[i] = ids_cpu[i]
+                gap = abs(float(ids_cpu_target[i]) - float(ids_cpu_settled[i]))
+                transition_ticks_total[i]     = _lookup_scaling_duration(gap, scaling_time_steps)
+                transition_ticks_remaining[i] = transition_ticks_total[i]
 
         for _ in range(decision_interval):
-            if transition_ticks_remaining > 0:
-                transition_ticks_remaining -= 1
-                if transition_ticks_remaining == 0:
-                    ids_cpu_settled[0] = ids_cpu_target[0]
-                    queued_delta = float(ids_cpu[0]) - float(ids_cpu_settled[0])
-                    if abs(queued_delta) > 1e-9:
-                        ids_cpu_target[0] = ids_cpu[0]
-                        gap = abs(queued_delta)
-                        transition_ticks_total     = _lookup_scaling_duration(gap, scaling_time_steps)
-                        transition_ticks_remaining = transition_ticks_total
-                        new_d = float(ids_cpu_target[0]) - float(ids_cpu_settled[0])
-                        step_overhead = -abs(new_d)
-                        if new_d > 1e-9:
-                            ids_cpu_eff[0] = ids_cpu_settled[0]
+            ids_cpu_eff = ids_cpu_settled.copy()
+            step_overhead = np.zeros(n_edges, dtype=np.float32)
+            for i in range(n_edges):
+                if transition_ticks_remaining[i] > 0:
+                    delta_to_settled = float(ids_cpu_target[i]) - float(ids_cpu_settled[i])
+                    if abs(delta_to_settled) > 1e-9:
+                        step_overhead[i] = -delta_to_settled
+
+                    transition_ticks_remaining[i] -= 1
+                    if transition_ticks_remaining[i] == 0:
+                        ids_cpu_settled[i] = ids_cpu_target[i]
+                        queued_delta = float(ids_cpu[i]) - float(ids_cpu_settled[i])
+                        if abs(queued_delta) > 1e-9:
+                            ids_cpu_target[i] = ids_cpu[i]
+                            gap = abs(queued_delta)
+                            transition_ticks_total[i]     = _lookup_scaling_duration(gap, scaling_time_steps)
+                            transition_ticks_remaining[i] = transition_ticks_total[i]
+                            new_d = float(ids_cpu_target[i]) - float(ids_cpu_settled[i])
+                            step_overhead[i] = -new_d if abs(new_d) > 1e-9 else 0.0
+                            ids_cpu_eff[i] = ids_cpu_settled[i]
                         else:
-                            ids_cpu_eff[0] = ids_cpu_target[0]
-                    else:
-                        ids_cpu_eff[0] = ids_cpu_settled[0]
-                        step_overhead = 0.0
+                            ids_cpu_eff[i] = ids_cpu_settled[i]
+                            step_overhead[i] = 0.0
+            
             env.step(ids_cpu_eff, step_overhead)
             if env.t >= env.t_max:
                 break
@@ -285,9 +556,8 @@ def run_episode(
             sf       = np.maximum(0.0, reward_q_th - qoes) / max(reward_q_th, 1e-6)
             bcd_vals = df["benign_col_dmg"].values.astype(np.float32) if "benign_col_dmg" in df.columns else np.zeros(len(atk_in))
 
-            # Mean over ALL ticks (quiet ticks contribute 0) — matches training's
-            # per-tick accumulation where each quiet tick yields r_lambda_res=0.
-            r_lres_scalar = float(np.mean(lres))
+            attack_mask   = atk_in > 1e-6
+            r_lres_scalar = float(np.mean(lres[attack_mask])) if attack_mask.any() else 0.0
             r_bcd  = float(np.mean(bcd_vals))
             r_sf   = float(np.mean(sf))
             reward_lambda_res_ts.append(r_lres_scalar)
@@ -325,7 +595,7 @@ def run_episode(
 
 def main():
     ap = argparse.ArgumentParser(description="Evaluate baseline policies and plot results")
-    ap.add_argument("--cfg",               default="./configs/simulation_0.yaml")
+    ap.add_argument("--cfg",               default="./configs/simulation_ma_0.yaml")
     ap.add_argument("--outdir",            default="eval_out")
     ap.add_argument("--episodes",          type=int,   default=10)
     ap.add_argument("--decision_interval", type=int,   default=None,
@@ -336,9 +606,9 @@ def main():
                     help="Methods to evaluate. Defaults: random constant_0.5 constant_4.0 reactive")
     ap.add_argument("--tbsa_table",        default="tbsa_table.npz",
                     help="TBSA lookup-table path (needed when 'tbsa' is in --methods)")
-    ap.add_argument("--ckpt",              default="checkpoints/tdsc_so_u_rew_32/ckpt_iter_000450.pt",
+    # ap.add_argument("--ckpt",              default="checkpoints/rew_32_netting_a4_rew/ckpt_iter_000600.pt",
     # ap.add_argument("--ckpt",              default="checkpoints/tdsc/ckpt_iter_000500.pt",
-    # ap.add_argument("--ckpt",              default="checkpoints/tdsc_so_u_rew_32/ckpt_best.pt",
+    ap.add_argument("--ckpt",              default="checkpoints/singleedge/rew_32_netting_a4_rew/ckpt_best.pt",
                     help="Checkpoint path (needed when 'lstm_rl' is in --methods)")
     ap.add_argument("--device",            default="cpu")
     args = ap.parse_args()
@@ -374,7 +644,7 @@ def main():
     tbsa_table_path = Path(args.tbsa_table)
     policies: Dict[str, BaselinePolicy] = {}
     for name in methods:
-        tbsa_path = str(tbsa_table_path) if name == "tbsa" else None
+        tbsa_path = str(tbsa_table_path) if name in ("tbsa", "offline_optimal") else None
         ckpt      = args.ckpt             if name == "lstm_rl" else None
         ok_keys   = obs_keys              if name == "lstm_rl" else None
         try:
@@ -414,8 +684,8 @@ def main():
                 reward_beta=reward_beta,
                 reward_gamma=reward_gamma,
                 reward_q_th=reward_q_th,
-                # initial_ids_cpu=last_ids_cpu[mname],
-                initial_ids_cpu=None,
+                initial_ids_cpu=last_ids_cpu[mname],
+                # initial_ids_cpu=None,
             )
             last_ids_cpu[mname] = final_ids
             for k, v in ep_result.items():
@@ -423,23 +693,28 @@ def main():
                     [results[mname].get(k, np.array([], dtype=np.float32)), v]
                 )
 
+    # Remap to display names for plots and summary
+    display_results = {DISPLAY_NAMES.get(m, m): results[m] for m in methods}
+
     # Plot — reuse the plotting functions from old_policy.py
     ts_path      = outdir / "qoe_ts.png"
     summary_path = outdir / "summary.png"
-    plot_ts_continuous(results, ts_path,      slo_qoe_min=reward_q_th, beta=3)
-    plot_qoe_vio_bars( results, summary_path, qoe_slo_min=reward_q_th, beta=3)
+    plot_ts_continuous(display_results, ts_path,      slo_qoe_min=reward_q_th, beta=3)
+    plot_qoe_vio_bars( display_results, summary_path, qoe_slo_min=reward_q_th, beta=3)
 
     print(f"Plots saved to {outdir}/")
 
     # Summary table — comparable to wandb training metrics
-    header = f"{'Method':<20} {'qoe_vio_rate':>12} {'reward/mean':>12} {'qoe_penalty':>12} {'atk_drop_pct':>12} {'lambda_res':>12}"
+    col_w = 26
+    header = f"{'Method':<{col_w}} {'qoe_vio_rate':>12} {'reward/mean':>12} {'qoe_penalty':>12} {'atk_drop_pct':>12} {'lambda_res':>12}"
     print("\n" + header)
     print("-" * len(header))
     for mname in methods:
         r = results[mname]
-        lres = float(np.mean(r['reward_lambda_res']))
+        lres  = float(np.mean(r['reward_lambda_res']))
+        label = DISPLAY_NAMES.get(mname, mname)
         print(
-            f"{mname:<20} "
+            f"{label:<{col_w}} "
             f"{float(np.mean(r['qoe_vio_rate'])):>12.1%} "
             f"{float(np.mean(r['reward'])):>12.4f} "
             f"{float(np.mean(r['reward_qoe_penalty'])):>12.4f} "

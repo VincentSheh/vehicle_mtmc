@@ -1,4 +1,3 @@
-# --- add near imports ---
 import os
 import json
 import wandb
@@ -26,40 +25,33 @@ def wandb_init(env_cfg: dict, train_cfg: dict):
 
     run = wandb.init(
         entity=logger_cfg.get("entity", "asture123-national-taiwan-university"),
-        project=logger_cfg.get("project_name", "edgeids"),
+        project=logger_cfg.get("project_name", "multiedgeids"),
         name=exp_name,
         config={
-            # ---- environment ----
-            # ---- full env config (simulation_0.yaml) as JSON string ----
             "env_cfg": json.dumps(env_cfg),
 
-            # ---- key env scalars for quick filtering in wandb UI ----
             "env/t_max":             env_cfg.get("run", {}).get("t_max", None),
             "env/seed":              env_cfg.get("run", {}).get("seed", None),
             "env/decision_interval": globals_cfg.get("decision_interval", None),
             "env/num_envs":          int(collector_cfg.get("num_envs", 1)),
 
-            # ---- reward weights (most-swept params, kept flat for easy comparison) ----
             "reward/alpha_inv": reward_cfg.get("alpha_inv", 0.10),
             "reward/beta_inv":  reward_cfg.get("beta_inv",  0.20),
             "reward/gamma_inv": reward_cfg.get("gamma_inv", 0.12),
             "reward/q_th":      reward_cfg.get("q_th",      0.20),
 
-            # ---- attack sampler (most-swept params) ----
             "attack/pattern_types": str(sampler_cfg.get("pattern_types", None)),
             "attack/lambda_base":   str(sampler_cfg.get("lambda_base",   None)),
             "attack/noise_std":     str(sampler_cfg.get("noise_std",     None)),
             "attack/t_cycle_min":   str(sampler_cfg.get("t_cycle_min",   None)),
             "attack/t_cycle_delta": str(sampler_cfg.get("t_cycle_delta", None)),
 
-            # ---- optimizer ----
-            "optim/lr":             optim_cfg.get("lr", None),
-            "optim/eps":            optim_cfg.get("eps", None),
-            "optim/weight_decay":   optim_cfg.get("weight_decay", None),
-            "optim/max_grad_norm":  optim_cfg.get("max_grad_norm", None),
-            "optim/anneal_lr":      optim_cfg.get("anneal_lr", None),
+            "optim/lr":            optim_cfg.get("lr", None),
+            "optim/eps":           optim_cfg.get("eps", None),
+            "optim/weight_decay":  optim_cfg.get("weight_decay", None),
+            "optim/max_grad_norm": optim_cfg.get("max_grad_norm", None),
+            "optim/anneal_lr":     optim_cfg.get("anneal_lr", None),
 
-            # ---- PPO loss ----
             "loss/gamma":               loss_cfg.get("gamma", None),
             "loss/gae_lambda":          loss_cfg.get("gae_lambda", None),
             "loss/ppo_epochs":          loss_cfg.get("ppo_epochs", None),
@@ -72,77 +64,62 @@ def wandb_init(env_cfg: dict, train_cfg: dict):
             "loss/seq_len":             loss_cfg.get("seq_len", None),
             "loss/normalize_advantage": loss_cfg.get("normalize_advantage", None),
 
-            # ---- collector ----
             "collector/frames_per_batch": collector_cfg.get("frames_per_batch", None),
             "collector/total_frames":     collector_cfg.get("total_frames", None),
             "collector/trust_policy":     collector_cfg.get("trust_policy", None),
 
-            # ---- model ----
             "model/hidden_dim": model_cfg.get("hidden_dim", None),
             "model/n_actions":  model_cfg.get("n_actions", None),
-            # obs split info logged via wandb.config.update() after base_env is built
 
-            # ---- observation normalization ----
             "obs_norm/standard_normal": obs_norm_cfg.get("standard_normal", None),
         },
     )
 
     wandb.define_metric("iter")
-    wandb.define_metric("loss/*",          step_metric="iter")
-    wandb.define_metric("reward/*",        step_metric="iter")
-    wandb.define_metric("qoe/*",           step_metric="iter")
-    wandb.define_metric("attack/*",        step_metric="iter")
+    wandb.define_metric("loss/*",   step_metric="iter")
+    wandb.define_metric("reward/*", step_metric="iter")
+    wandb.define_metric("qoe/*",    step_metric="iter")
+    wandb.define_metric("attack/*", step_metric="iter")
     wandb.define_metric("decision_step")
-    wandb.define_metric("obs/*",           step_metric="decision_step")
+    wandb.define_metric("obs/*",    step_metric="decision_step")
     wandb.define_metric("ts_step")
     wandb.define_metric("ts/*",     step_metric="ts_step")
     return run
 
 
-def wandb_log_env_block(env, step: int, decision_interval: int):
-    # log last decision block metrics aggregated per edge
-    if not getattr(env, "history", None):
-        return
+def wandb_log_obs_steps(
+    obs,
+    obs_keys: list,
+    keep_keys,
+    global_step_start: int,
+) -> int:
+    """
+    Log per-decision-step observations filtered to keep_keys.
 
-    records = env.history[-decision_interval * len(env.edge_areas):]
-    if not records:
-        return
+    obs: Tensor or ndarray [B,T,E,D] or [T,E,D].
+         B (env) dimension is averaged before logging.
+    Returns the updated global_step (caller should assign back).
+    """
+    if torch.is_tensor(obs):
+        obs = obs.detach().cpu().numpy()
+    if obs.ndim == 4:
+        obs = obs.mean(axis=0)   # [T, E, D]
+    if obs.ndim != 3:
+        raise ValueError(f"Expected obs [T,E,D] after averaging, got {obs.shape}")
 
-    df = pd.DataFrame([m.__dict__ for m in records])
+    keep = set(keep_keys) if not isinstance(keep_keys, set) else keep_keys
+    key_indices = [(j, name) for j, name in enumerate(obs_keys) if name in keep]
 
-    # global rollups
-    wandb.log(
-        {
-            "qoe/mean": float(df["qoe_mean"].mean()),
-            "qoe/min": float(df["qoe_min"].min()),
-            "ids/coverage_mean": float(df["ids_coverage"].mean()),
-            "attack/in_rate_mean": float(df["attack_in_rate"].mean()),
-            "attack/drop_rate_mean": float(df["attack_drop_rate"].mean()),
-            "user/drop_rate_mean": float(df["user_drop_rate"].mean()),
-            "cpu/ids_util_mean": float(df["ids_cpu_utilization"].mean()),
-            "cpu/va_util_mean": float(df["va_cpu_utilization"].mean()),
-            "bw/util_mean": float(df["bw_utilization"].mean()),
-            "offload/I_net_mean": float(df["I_net"].mean()),
-        },
-        step=step,
-    )
+    T, E, _ = obs.shape
+    for t in range(T):
+        step_log = {"decision_step": global_step_start + t}
+        for j, name in key_indices:
+            for e in range(E):
+                step_log[f"obs/edge_{e}/{name}"] = float(obs[t, e, j])
+            step_log[f"obs/{name}"] = float(obs[t, :, j].mean())
+        wandb.log(step_log)
 
-    # per-edge rollups
-    for area_id, g in df.groupby("area_id"):
-        wandb.log(
-            {
-                f"{area_id}/qoe_mean": float(g["qoe_mean"].mean()),
-                f"{area_id}/ids_coverage": float(g["ids_coverage"].mean()),
-                f"{area_id}/attack_in_rate": float(g["attack_in_rate"].mean()),
-                f"{area_id}/cpu_to_ids_ratio": float(g["cpu_to_ids_ratio"].iloc[-1]),
-                f"{area_id}/va_cpu_util": float(g["va_cpu_utilization"].mean()),
-                f"{area_id}/ids_cpu_util": float(g["ids_cpu_utilization"].mean()),
-                f"{area_id}/bw_util": float(g["bw_utilization"].mean()),
-                f"{area_id}/I_net": float(g["I_net"].mean()),
-                f"{area_id}/num_objects": float(g["num_objects"].mean()),
-            },
-            step=step,
-        )
+    return global_step_start + T
 
 
 def wandb_save_plots_from_history(env, out_dir="logs/wandb_plots"):
@@ -166,13 +143,12 @@ def wandb_save_plots_from_history(env, out_dir="logs/wandb_plots"):
         fig.savefig(p, bbox_inches="tight")
         paths.append(p)
 
-    save_pivot("QoE over time", "qoe_mean", "qoe_over_time.png")
-    save_pivot("IDS coverage", "ids_coverage", "ids_coverage.png")
-    save_pivot("Attack In Rate", "attack_in_rate", "attack_in_rate.png")
-    save_pivot("Post-offload tracking load", "num_objects", "num_objects.png")
-    save_pivot("Available uplink", "uplink_available", "uplink_available.png")
+    save_pivot("QoE over time",              "qoe_mean",         "qoe_over_time.png")
+    save_pivot("IDS coverage",               "ids_coverage",     "ids_coverage.png")
+    save_pivot("Attack In Rate",             "attack_in_rate",   "attack_in_rate.png")
+    save_pivot("Post-offload tracking load", "num_objects",      "num_objects.png")
+    save_pivot("Available uplink",           "uplink_available", "uplink_available.png")
 
-    # log as images + artifact
     for p in paths:
         wandb.log({os.path.basename(p): wandb.Image(p)})
 
@@ -180,95 +156,3 @@ def wandb_save_plots_from_history(env, out_dir="logs/wandb_plots"):
     for p in paths:
         art.add_file(p)
     wandb.log_artifact(art)
-
-
-def wandb_log_iteration_timeseries(it: int, batch, obs_ts: dict):
-    """
-    obs_ts: dict of numpy or torch arrays shaped [T] or [T, n_edges]
-      keys like:
-        "local_num_objects", "attack_drop_rate", "cpu_to_ids_ratio",
-        "va_cpu_utilization", "ids_cpu_utilization", "bw_utilization", "I_net"
-    """
-    T = batch.batch_size[0]  # decision timesteps in this iteration
-    actions = batch["action"].detach().cpu().numpy()  # shape [T] or [T, n_edges]
-
-    table = wandb.Table(columns=[
-        "iter", "t", "global_step", "edge",
-        "action",
-        "local_num_objects",
-        "attack_drop_rate",
-        "cpu_to_ids_ratio",
-        "va_cpu_utilization",
-        "ids_cpu_utilization",
-        "bw_utilization",
-        "I_net",
-    ])
-
-    n_edges = actions.shape[1] if actions.ndim == 2 else 1
-
-    for t in range(T):
-        for e in range(n_edges):
-            a = actions[t, e] if actions.ndim == 2 else actions[t]
-
-            def pick(x):
-                if x is None:
-                    return None
-                x = x.detach().cpu().numpy() if torch.is_tensor(x) else x
-                return float(x[t, e]) if (np.ndim(x) == 2) else float(x[t])
-
-            row = [
-                it,
-                t,
-                it * T + t,
-                e,
-                float(a),
-                pick(obs_ts.get("local_num_objects")),
-                pick(obs_ts.get("attack_drop_rate")),
-                pick(obs_ts.get("cpu_to_ids_ratio")),
-                pick(obs_ts.get("va_cpu_utilization")),
-                pick(obs_ts.get("ids_cpu_utilization")),
-                pick(obs_ts.get("bw_utilization")),
-                pick(obs_ts.get("I_net")),
-            ]
-            table.add_data(*row)
-
-    wandb.log({"timeseries/step_table": table}, step=it)
-
-
-def wandb_log_batch_transitions(batch, obs_keys, step, tag="batch"):
-    # batch keys typically: "observation", "action", ("next","reward"), ("next","done"), ...
-    obs = batch["observation"].detach().cpu()          # [T, n_edges, obs_dim] or [T, B, n_edges, obs_dim]
-    act = batch["action"].detach().cpu()               # [T] or [T, B]
-    rew = batch["next", "reward"].detach().cpu()       # [T, 1] or [T, B, 1]
-    done = batch["next", "done"].detach().cpu()        # [T, 1] or [T, B, 1]
-    term = batch["next", "terminated"].detach().cpu()  # [T, 1] or [T, B, 1]
-
-    # Squeeze batch dim if B=1, keep code robust
-    if obs.ndim == 4:  # [T, B, E, D]
-        obs = obs[:, 0]
-    if act.ndim == 2:
-        act = act[:, 0]
-    if rew.ndim == 3:
-        rew = rew[:, 0]
-    if done.ndim == 3:
-        done = done[:, 0]
-    if term.ndim == 3:
-        term = term[:, 0]
-
-    T, E, D = obs.shape
-
-    columns = ["iter", "t", "edge", "action", "reward", "done", "terminated"] + obs_keys
-    table = wandb.Table(columns=columns)
-
-    for t in range(T):
-        a = int(act[t].item())
-        r = float(rew[t].squeeze(-1).item())
-        d = bool(done[t].squeeze(-1).item())
-        te = bool(term[t].squeeze(-1).item())
-
-        for e in range(E):
-            row = [int(step), int(t), int(e), a, r, d, te]
-            row += [float(obs[t, e, j].item()) for j in range(D)]
-            table.add_data(*row)
-
-    wandb.log({f"{tag}/transitions": table}, step=step)

@@ -124,7 +124,7 @@ class Attacker:
 
         self.base_seed = seed
         self.rng = np.random.default_rng(seed)
-        self.active_len = self.t_max // 5
+        self.active_len = self.t_max // 4
         self._init_start()
 
     def _generate_patterned_trace(self):

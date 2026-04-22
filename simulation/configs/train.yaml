@@ -17,8 +17,8 @@ collector:
 logger:
   backend: wandb
   entity: asture123-national-taiwan-university
-  project_name: edgeids
-  exp_name: tdsc_so_u_rew_32_netting
+  project_name: multiedgeids
+  exp_name: base_cma
   plots:
     enabled: true
     out_dir: logs/wandb_plots
@@ -43,9 +43,9 @@ loss:
   ppo_epochs: 10           # matches ppo_epochs = 20
   mini_batch_size: 128     # matches minibatch_size = 128
   clip_epsilon: 0.2        # matches ClipPPOLoss(clip_epsilon=0.2)
-  anneal_clip_epsilon: false
+  anneal_clip_epsilon: true
   critic_coeff: 1.0
-  entropy_coeff: 2.0e-3    # matches entropy_coef=1e-3
+  entropy_coeff: 1.0e-2
   loss_critic_type: smooth_l1
   normalize_advantage: false  # you normalize manually
   seq_len: 32
@@ -55,7 +55,7 @@ loss:
 # =========================
 model:
   hidden_dim: 64           # ActorNet / CriticNet hidden size
-  n_actions: 9             # discrete {scale down, hold, scale up}
+  n_actions: 3             # discrete {scale down, hold, scale up}
 
 # =========================
 # Observation normalization
