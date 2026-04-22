@@ -35,7 +35,7 @@ globals:
     gamma_inv: 15    # Benign collateral normalizer     (gamma = 1/gamma_inv ≈ 8.33)
     q_th:      0.20  # QoE shortfall threshold
 
-  offload_mode: "cto"  # "none" | "balance" | "cto" | "cto_acc" | "full"
+  offload_mode: "cto"  # "none" | "cto" | "cto_acc" | "delay_workload" | "full"
   max_prop_delay_ms: 50.0        # hard delay cutoff for modes delay_workload / full
 
   # Score-based offload weights (modes delay_workload / full)
@@ -46,8 +46,7 @@ globals:
   offload_weights:
     w1: 1.0   # FNR accuracy improvement
     w2: 0.0   # FPR accuracy improvement
-    w3: 0.000  # propagation delay penalty
-    w4: 0.5   # IDS utilization balancing
+    w3: 1.000  # propagation delay penalty
 
   # Accuracy-by-region matrix: [src_edge_idx][exec_edge_idx] = [FPR, FNR]
   # Row = traffic source edge, Col = inspecting/executing edge.

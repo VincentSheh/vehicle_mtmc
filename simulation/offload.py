@@ -81,10 +81,10 @@ def balance_workload(
     if cap_dst is not None:
         N_star = {e: min(N_star[e], float(cap_dst[e])) for e in area_ids}
 
-    supply     = {e: max(0.0, W[e] - N_star[e]) for e in area_ids}
-    demand     = {e: max(0.0, N_star[e] - W[e]) for e in area_ids}
-    senders    = [e for e in area_ids if supply[e] > EPS]
-    receivers  = [e for e in area_ids if demand[e] > EPS]
+    supply    = {e: max(0.0, W[e] - N_star[e]) for e in area_ids}
+    demand    = {e: max(0.0, N_star[e] - W[e]) for e in area_ids}
+    senders   = [e for e in area_ids if supply[e] > EPS]
+    receivers = [e for e in area_ids if demand[e] > EPS]
 
     flow_float: Dict[Any, Dict[Any, float]] = {e: {e: W[e]} for e in area_ids}
     rem_supply = {e: supply[e] for e in senders}
@@ -255,117 +255,98 @@ def balance_workload_cto_acc(
 # ---------------------------------------------------------------------------
 # Modes c & d — score-based routing
 # ---------------------------------------------------------------------------
-# Score for routing src's traffic to dst:
+# Identical to balance_workload_cto_acc except traffic is distributed
+# proportionally to link scores instead of greedy winner-takes-all sorting.
 #
-#   score(src, dst) = load_benefit(dst)           [always]
-#                   - d_prop(src,dst) * w3         [modes c & d]
-#                   + acc_improvement(src,dst)     [mode d only, via w1/w2]
-#                   + util_benefit(src,dst) * w4   [mode d only]
+# Link score (src → dst):
+#   score = acc_improvement(src, dst)   [mode d, via w1/w2]
+#         - d_prop(src, dst) * w3       [modes c & d]
 #
-# where:
-#   load_benefit(dst) = (N*_dst - W_dst) / W_tot
-#     positive when dst is under-target → route there
+#   acc_improvement = (FNR[si,si] - FNR[si,di]) * w1
+#                   + (FPR[si,si] - FPR[si,di]) * w2
 #
-#   acc_improvement(src,dst) = (FNR[si,si] - FNR[si,di]) * w1
-#                             + (FPR[si,si] - FPR[si,di]) * w2
-#     positive when dst inspects src's traffic more accurately than src itself
-#
-# Traffic is split proportionally to max(0, score); if all scores ≤ 0, keep local.
+# For each sender, supply is split across eligible receivers proportional to
+# max(0, score). If all scores ≤ 0 the sender keeps all traffic locally.
 # ---------------------------------------------------------------------------
 
 def score_based_offload(
     area_ids: List[Any],
     W_src: Dict[Any, float],
     c_dst: Dict[Any, float],
-    prop_delay: Optional[Dict[Tuple[Any, Any], float]] = None,
-    max_prop_delay_ms: Optional[float] = None,
+    propagation_delays: Dict[Any, Dict[Any, float]],
+    weights: Tuple[float, float, float] = (1.0, 1.0, 0.01),
     fnr_matrix: Optional[np.ndarray] = None,
     fpr_matrix: Optional[np.ndarray] = None,
-    ids_util: Optional[Dict[Any, float]] = None,
-    weights: Tuple[float, float, float, float] = (1.0, 1.0, 0.01, 1.0),
     id_to_idx: Optional[Dict[Any, int]] = None,
     cap_dst: Optional[Dict[Any, float]] = None,
 ) -> OffloadPlan:
     """
-    Modes c (delay_workload) and d (full):
-      - Pass fnr_matrix / fpr_matrix for mode d accuracy terms; leave None for mode c.
-      - max_prop_delay_ms hard-blocks receivers beyond that propagation delay.
-      - cap_dst[e] hard-limits total tasks edge e can accept (local + received).
+    Score-based offload (modes c / d): same redistribution target and link
+    scoring as balance_workload_cto_acc, but each sender splits its supply
+    proportionally to receiver scores rather than greedily in sorted order.
     """
-    prop_delay = prop_delay or {}
-    ids_util   = ids_util   or {}
-    w1, w2, w3, w4 = weights
+    w1, w2, w3 = weights
 
     W_tot = float(sum(W_src[e] for e in area_ids))
-    C_tot = float(sum(c_dst[e] for e in area_ids))
     W     = {e: float(W_src[e]) for e in area_ids}
 
-    if W_tot <= EPS or C_tot <= EPS:
+    if W_tot <= EPS:
         flow = {e: {e: int(round(W[e]))} for e in area_ids}
         return _build_plan(flow, area_ids)
 
-    N_star = {e: float(c_dst[e]) * (W_tot / C_tot) for e in area_ids}
+    N_star = {e: float(c_dst[e]) for e in area_ids}
     if cap_dst is not None:
         N_star = {e: min(N_star[e], float(cap_dst[e])) for e in area_ids}
 
+    supply    = {e: max(0.0, W[e] - N_star[e]) for e in area_ids}
+    demand    = {e: max(0.0, N_star[e] - W[e]) for e in area_ids}
+    senders   = [e for e in area_ids if supply[e] > EPS]
+    receivers = [e for e in area_ids if demand[e] > EPS]
+
     flow_float: Dict[Any, Dict[Any, float]] = {e: {e: W[e]} for e in area_ids}
+    rem_supply = {e: supply[e] for e in senders}
+    rem_demand = {e: demand[e] for e in receivers}
 
-    surplus    = {e: max(0.0, W[e] - N_star[e]) for e in area_ids}
-    rem_demand = {e: max(0.0, N_star[e] - W[e]) for e in area_ids}
-
-    for src in area_ids:
-        to_move = surplus[src]
+    for src in senders:
+        si      = id_to_idx[src] if id_to_idx is not None else None
+        to_move = rem_supply[src]
         if to_move <= EPS:
             continue
 
-        si = id_to_idx[src] if id_to_idx is not None else None
-
-        scores: Dict[Any, float] = {}
-        for dst in area_ids:
-            if dst == src:
+        raw: Dict[Any, float] = {}
+        for r in receivers:
+            if r == src or rem_demand.get(r, 0.0) <= EPS:
                 continue
-
-            if rem_demand.get(dst, 0.0) <= EPS:
-                continue
-
-            d_prop = float(prop_delay.get((src, dst), 0.0))
-            if max_prop_delay_ms is not None and d_prop > max_prop_delay_ms:
-                continue
-
-            load = (N_star[dst] - W[dst]) / W_tot
-            delay_ref     = float(max_prop_delay_ms) if max_prop_delay_ms else max(d_prop, 1.0)
-            delay_penalty = (d_prop / delay_ref) * w3
-
+            d_prop        = float(propagation_delays[src][r])
+            delay_penalty = d_prop * w3
             acc = 0.0
-            if fnr_matrix is not None and fpr_matrix is not None and si is not None and id_to_idx is not None:
-                di  = id_to_idx[dst]
+            if (fnr_matrix is not None and fpr_matrix is not None
+                    and si is not None and id_to_idx is not None):
+                ri  = id_to_idx[r]
                 acc = (
-                    (fnr_matrix[si, si] - fnr_matrix[si, di]) * w1
-                    + (fpr_matrix[si, si] - fpr_matrix[si, di]) * w2
+                    (float(fnr_matrix[si, si]) - float(fnr_matrix[si, ri])) * w1
+                    + (float(fpr_matrix[si, si]) - float(fpr_matrix[si, ri])) * w2
                 )
+            raw[r] = acc - delay_penalty
 
-            util = (ids_util.get(src, 0.0) - ids_util.get(dst, 0.0)) * w4
-
-            scores[dst] = load + acc - delay_penalty + util
-
-        pos   = {d: max(0.0, s) for d, s in scores.items()}
-        total = sum(pos.values())
-
+        if not raw:
+            continue
+        min_sc = min(raw.values())
+        pos    = {r: (sc - min_sc + EPS) for r, sc in raw.items()}
+        total  = sum(pos.values())
         if total <= EPS:
             continue
 
-        remaining = to_move
-        for d, p in sorted(pos.items(), key=lambda kv: -kv[1]):
-            if p <= EPS or remaining <= EPS:
+        for r, p in sorted(pos.items(), key=lambda kv: -kv[1]):
+            if p <= EPS or to_move <= EPS:
                 break
-            demand_d = rem_demand.get(d, 0.0)
-            share = min((p / total) * to_move, demand_d, remaining)
+            share = min((p / total) * rem_supply[src], rem_demand.get(r, 0.0), to_move)
             if share <= EPS:
                 continue
             flow_float[src][src] -= share
-            flow_float[src][d]    = flow_float[src].get(d, 0.0) + share
-            remaining            -= share
-            rem_demand[d]        -= share
+            flow_float[src][r]    = flow_float[src].get(r, 0.0) + share
+            to_move              -= share
+            rem_demand[r]        -= share
 
     return _build_plan(_round_and_conserve(flow_float, W), area_ids)
 

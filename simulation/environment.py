@@ -145,7 +145,7 @@ class Environment:
         self.active_attack = None
         self.acc_by_region: Optional[np.ndarray] = None  # shape (n_edges, n_edges, 2): [src, exec, fpr/fnr]
         self._max_prop_delay_ms: float = 1e9
-        self._offload_weights: Tuple[float, float, float, float] = (1.0, 1.0, 0.01, 1.0)
+        self._offload_weights: Tuple[float, float, float] = (1.0, 1.0, 0.01)
 
         np.random.seed(seed)
 
@@ -307,7 +307,7 @@ class Environment:
             if self.acc_by_region is not None and stage == "ids":
                 fpr_mat = self.acc_by_region[:, :, 0]
                 fnr_mat = self.acc_by_region[:, :, 1]
-            w1, w2, w3, _ = self._offload_weights
+            w1, w2, w3 = self._offload_weights
             return balance_workload_cto_acc(
                 area_ids=self.area_ids,
                 W_src=W_src,
@@ -320,27 +320,22 @@ class Environment:
             )
 
         # modes "delay_workload" and "full" use score_based_offload
-        max_d = float(getattr(self, "_max_prop_delay_ms", 1e9))
+        nested = {
+            s: {r: float(self.prop_delay.get((s, r), 0.0)) for r in self.area_ids}
+            for s in self.area_ids
+        }
         fnr_matrix = fpr_matrix = None
         if mode == "full" and self.acc_by_region is not None and stage == "ids":
             fpr_matrix = self.acc_by_region[:, :, 0]
             fnr_matrix = self.acc_by_region[:, :, 1]
 
-        ids_util = {
-            aid: float(getattr(self._edges_by_id.get(aid, object()), "ids_cpu", 0.0))
-                 / max(float(getattr(self._edges_by_id.get(aid, object()), "budget", type("B", (), {"cpu": 1.0})()).cpu), 1e-9)
-            for aid in self.area_ids
-        } if mode == "full" else {}
-
         return score_based_offload(
             area_ids=self.area_ids,
             W_src=W_src,
             c_dst=c_dst,
-            prop_delay=self.prop_delay,
-            max_prop_delay_ms=max_d,
+            propagation_delays=nested,
             fnr_matrix=fnr_matrix,
             fpr_matrix=fpr_matrix,
-            ids_util=ids_util,
             weights=self._offload_weights,
             id_to_idx=self.id_to_idx,
         )
@@ -392,7 +387,10 @@ class Environment:
                 for aid in self.area_ids
             }
         else:
-            c_ids = {aid: float(edges[aid].ids_cpu) for aid in self.area_ids}
+            c_ids = {
+                aid: float(edges[aid].ids.effective_speed_pkt_per_step(edges[aid].ids_cpu))
+                for aid in self.area_ids
+            }
         plan_ids = self._make_offload_plan(W_ids, c_ids, stage="ids")
 
         exec_user_in: Dict[str, int] = {aid: 0 for aid in self.area_ids}
@@ -490,8 +488,9 @@ class Environment:
             exec_atk_bw_mb[aid]  = exec_atk_bw_mb_pre[aid] * ids_atk_pass
             exec_atk_cycles[aid] = exec_atk_cycles_pre[aid] * ids_atk_pass
 
-        # Stage C: VA offload plan (VA has no accuracy benefit; delay/load only)
-        W_va = {aid: float(admitted_user[aid] + admitted_atk[aid]) for aid in self.area_ids}
+        # Stage C: VA offload plan — only benign users are offloaded.
+        # Admitted attacks already consume local resources and are not forwarded.
+        W_va = {aid: float(admitted_user[aid]) for aid in self.area_ids}
         # Deduct admitted-attack CPU from VA capacity (uses corrected cross-edge attack cycles)
         c_va: Dict[str, float] = {}
         for aid in self.area_ids:
@@ -515,31 +514,21 @@ class Environment:
         va_original_user_in: Dict[str, int] = {aid: 0 for aid in self.area_ids}
         va_remote_d_num: Dict[str, float] = {aid: 0.0 for aid in self.area_ids}
         va_remote_n:     Dict[str, float] = {aid: 0.0 for aid in self.area_ids}
-        # Propagate attack bw/cycles through VA offloading (per-flow from each IDS-executor)
-        va_atk_bw_mb:  Dict[str, float] = {aid: 0.0 for aid in self.area_ids}
-        va_atk_cycles: Dict[str, float] = {aid: 0.0 for aid in self.area_ids}
+        # Admitted attacks stay local — accumulate their bw/cycles at their own edge only
+        va_atk_bw_mb:  Dict[str, float] = {aid: float(exec_atk_bw_mb[aid])  for aid in self.area_ids}
+        va_atk_cycles: Dict[str, float] = {aid: float(exec_atk_cycles[aid]) for aid in self.area_ids}
         for src in self.area_ids:
             u = float(admitted_user[src])
-            a = float(admitted_atk[src])
-            tot = max(u + a, 1.0)
-            u_share = u / tot
-            a_share = a / tot
             local_frac    = float(admitted_local_user[src]) / max(u, 1.0)
             ids_pass_rate = u / max(float(exec_user_in[src]), 1.0)
-            # Per-flow attack resource rates at this IDS-executor
-            bw_per_atk  = exec_atk_bw_mb[src]  / max(a, 1e-9)
-            cyc_per_atk = exec_atk_cycles[src] / max(a, 1e-9)
+            # Admitted attacks stay at src; also record their count locally
+            va_atk_in[src] += int(admitted_atk[src])
             for dst, n_sent in plan_va.flow.get(src, {}).items():
                 n_sent_f = float(n_sent)
-                nu = int(round(n_sent_f * u_share))
-                na_f = n_sent_f * a_share
-                va_user_in[dst] += nu
-                va_atk_in[dst]  += int(round(na_f))
-                va_original_user_in[dst] += int(round(nu / max(ids_pass_rate, 1e-9)))
-                va_atk_bw_mb[dst]  += na_f * bw_per_atk
-                va_atk_cycles[dst] += na_f * cyc_per_atk
+                va_user_in[dst] += n_sent
+                va_original_user_in[dst] += int(round(n_sent_f / max(ids_pass_rate, 1e-9)))
                 if src == dst:
-                    va_local_user_in[dst] += int(round(nu * local_frac))
+                    va_local_user_in[dst] += int(round(n_sent_f * local_frac))
                 else:
                     d = float(self.prop_delay.get((src, dst), 0.0))
                     va_remote_d_num[dst] += d * n_sent_f
@@ -702,7 +691,6 @@ def build_env_from_cfg(cfg: dict):
         float(w.get("w1", 1.0)),
         float(w.get("w2", 1.0)),
         float(w.get("w3", 0.01)),
-        float(w.get("w4", 1.0)),
     )
     if acc_by_region is not None:
         env.acc_by_region = acc_by_region
