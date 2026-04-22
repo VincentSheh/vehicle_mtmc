@@ -64,12 +64,12 @@ globals:
     # - [[0.0, 0.00], [0.1, 0.00], [0.1, 0.00]]   # traffic from E1: inspected at [E1, E2, E3]
     # - [[0.1, 0.00], [0.0, 0.00], [0.1, 0.00]]   # traffic from E2: inspected at [E1, E2, E3]
     # - [[0.1, 0.00], [0.1, 0.00], [0.0, 0.00]]   # traffic from E3: inspected at [E1, E2, E3]
-    - [[0.0, 0.00], [0.0, 0.1], [0.0, 0.1]]   # traffic from E1: inspected at [E1, E2, E3]
-    - [[0.0, 0.1], [0.0, 0.00], [0.0, 0.1]]   # traffic from E2: inspected at [E1, E2, E3]
-    - [[0.0, 0.1], [0.0, 0.1], [0.0, 0.00]]   # traffic from E3: inspected at [E1, E2, E3]
-    # - [[0.0, 0.00], [0.0, 0.00], [0.0, 0.00]]   # traffic from E1: inspected at [E1, E2, E3]
-    # - [[0.0, 0.00], [0.0, 0.00], [0.0, 0.00]]   # traffic from E2: inspected at [E1, E2, E3]
-    # - [[0.0, 0.00], [0.0, 0.00], [0.0, 0.00]]   # traffic from E3: inspected at [E1, E2, E3]
+    # - [[0.0, 0.00], [0.0, 0.1], [0.0, 0.1]]   # traffic from E1: inspected at [E1, E2, E3]
+    # - [[0.0, 0.1], [0.0, 0.00], [0.0, 0.1]]   # traffic from E2: inspected at [E1, E2, E3]
+    # - [[0.0, 0.1], [0.0, 0.1], [0.0, 0.00]]   # traffic from E3: inspected at [E1, E2, E3]
+    - [[0.0, 0.00], [0.0, 0.00], [0.0, 0.00]]   # traffic from E1: inspected at [E1, E2, E3]
+    - [[0.0, 0.00], [0.0, 0.00], [0.0, 0.00]]   # traffic from E2: inspected at [E1, E2, E3]
+    - [[0.0, 0.00], [0.0, 0.00], [0.0, 0.00]]   # traffic from E3: inspected at [E1, E2, E3]
 
 
   # Propagation delay matrix in ms: row=source edge index, col=target edge index.

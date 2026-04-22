@@ -1,0 +1,486 @@
+● Here is the full consistency audit report:
+
+  ---                                                                                                                                                    
+  Simulation Consistency Audit
+                                                                                                                                                         
+  Files reviewed: environment.py, edgearea.py, service.py, request.py, offload.py, train_lstm.py, method_policy.py, eval_baselines.py, configs/simulation_0.yaml.
+                                                                                                                                                         
+  ---
+  Category 1 — Simulation Logic                                                                                                                          
+                                                                                                                                                         
+  [HIGH] 1.1 — Ideal ("disable_attack") pass does not actually disable attacks
+  - edgearea.py:192 — _attack_agg_at iterates self.attackers, not self.cur_attacker. Setting cur_attacker = None (the "ideal" flag) has no effect; full attack load still arrives.
+  - Result: qoe_mean_ideal is "QoE with attacks + zero IDS", not "QoE with no attacks". The entire benign_col_dmg / γ·BCD reward term is mis-defined.    
+  - Fix: either iterate self.cur_attacker in _attack_agg_at, or null-out self.attackers and restore it for the ideal pass.                               
+                                                                                                                                                         
+  [MED] 1.2 — qoe_mean * 30 magic factor (environment.py:1039)                                                                                           
+  Undocumented multiply-by-30 on the reported qoe_mean. Not tied to any simulation parameter.                                                            
+                                                                                                                                                         
+  [MED] 1.3 — final_qoe only computed on terminal step, reported every step                                                                              
+  Between episodes it's 0; on the last step it jumps to the episode value. Biases best-checkpoint selection and per-step logging.                        
+                                                                                                                                                         
+  ---
+  Category 2 — Scaling Logic                                                                                                                             
+                                                                                                                                                         
+  [HIGH] 2.1 — Transition counter is scalar, shared across all edges (environment.py:745, 950, 980)
+  transition_ticks_remaining is a single int. When edge A starts transitioning, edge B's new commands queue behind it. When the counter hits 0, all edges are simultaneously
+  marked settled — even if they just started a new transition. Fine for n_edges=1; broken for ≥2.                                                        
+                                                                                                                                                         
+  [HIGH] 2.2 — Asymmetric clamp/transition semantics between training and eval                                                                           
+  environment.py:941–954 (training): clamps first, then fires transition if delta > 0. eval_baselines.py:213–221: drops immediately on scale-down, holds on scale-up. Train/eval
+  distribution mismatch.                                                                                                                                 
+
+  [MED] 2.3 — Effective-allocation comment contradicts eval code (environment.py:956–969)                                                                
+  Comment says "symmetric hold"; eval code is asymmetric. Choose one.
+                                                                                                                                                         
+  [LOW] 2.4 — scale_step = 0.5 hard-coded in 3 separate locations                                                                                        
+  environment.py:754, eval_baselines.py:29, and implicitly in scaling_quanta. One source of truth needed.                                                
+                                                                                                                                                         
+  ---
+  Category 3 — Task Offloading                                                                                                                           
+                                                                                                                                                         
+  [HIGH] 3.1 — process_va receives source's attack_dict but post-offload admitted_atk
+  environment.py:534, edgearea.py:294–299: atk_pass_frac = admitted_atk / attack_dict["flows"] — when flows are offloaded in, the numerator includes remote attacks counted
+  against local per-flow bw/cycle rates. atk_pass_frac can exceed 1.                                                                                     
+                                                                                                                                                         
+  [MED] 3.2 — Propagation delay applied to VA tasks, not to IDS tasks                                                                                    
+  IDS offload is treated as instantaneous; VA offload pays a slot-fraction penalty. Under-penalizes inter-edge IDS offload.
+                                                                                                                                                         
+  [MED] 3.3 — c_ids fed in different units for "balance" vs "cto" modes                                                                                  
+  environment.py:384–390: "balance" uses raw CPU units; "cto" uses effective pkt/step throughput. The planners handle them differently — undocumented and confusing.
+                                                                                                                                                         
+  [MED] 3.4 — Per-executor FPR/TPR override silently drops per-type accuracy                                                                             
+  service.py:74–81: when tpr_override is set (region-based accuracy), per-attack-type TPR table is ignored. Loss of granularity is undocumented.         
+                                                                                                                                                         
+  [LOW] 3.5 — balance_with_caps_and_prop_filter is a dead no-op (offload.py:377)                                                                         
+                                                                                                                                                         
+  ---                                                                                                                                                    
+  Category 4 — Imperfect IDS Accuracy
+
+  [HIGH] 4.1 — Silent fallback to (TPR=0.9, FPR=0.01) if accuracy_by_type.default missing
+  service.py:67. A malformed config silently enables a highly capable IDS instead of erroring.                                                           
+                                                                                                                                                         
+  [HIGH] 4.2 — cpu_clock_cycle has no causal effect on IDS throughput                                                                                    
+  environment.py:101: effective speed = ids_cpu / cores * slot_ms / latency_ms. The cpu_cycle_per_ms factor cancels completely. The config parameter is misleading.
+                                                                                                                                                         
+  [MED] 4.3 — Asymmetric stochasticity: FPR drops are binomial, FNR drops are deterministic                                                              
+  service.py:79–93: user_drop ~ Binomial(...), attack_drop = deterministic float. attack_pass is then a non-integer used as a count (cast to int downstream).
+                                                                                                                                                         
+  ---
+  Category 5 — Reward Computation                                                                                                                        
+
+  [HIGH] 5.1 — *_inv config keys read directly as α/β/γ weights
+  environment.py:738–740: self.reward_alpha = cfg["alpha_inv"] — the stored value is the inverse, but it's then used as α in the reward formula. Config comment says "alpha =
+  1/alpha_inv = 10" but the code uses alpha_inv (= 0.1) as the weight. Reward is ~100× smaller than intended.                                            
+                                                                                                                                                         
+  [MED] 5.2 — SLO violation rate computed but never in the reward                                                                                        
+  qoe_vio_rate is logged; the "SLO violation penalty" is only a continuous shortfall term, not a discrete penalty.
+                                                                                                                                                         
+  [MED] 5.3 — lambda_res averaged over active-attack ticks in training, over all ticks in eval                                                           
+  environment.py:1124–1125 vs eval_baselines.py:289–293. Same metric name, different denominator. Acknowledged in a comment in eval but never reconciled.
+                                                                                                                                                         
+  [MED] 5.4 — qoe_vio_rate window slice doesn't adjust for partial terminal window                                                                       
+  environment.py:1013: slice [-decision_interval * n_edges:] isn't shortened when steps < decision_interval.                                             
+                                                                                                                                                         
+  ---                                                                                                                                                    
+  Category 6 — Observation Construction                                                                                                                  
+                                                                                                                                                         
+  [HIGH] 6.1 — obs_dim = len(obs_keys) + 2 is an untested coupling
+  environment.py:749: the +2 is for transition_ticks_norm and delta_in_flight_norm appended later. No assertion guards this. One extra obs appended elsewhere silently mis-aligns
+  the network input.                                                                                                                                     
+                                                                                                                                                         
+  [HIGH] 6.2 — ObservationNorm reduces across all edges into one mean/std                                                                                
+  train_lstm.py:178–193: reduce_dim=(0,1). With multiple edges of different traffic scales, normalization mixes them. Loses per-edge scale.
+                                                                                                                                                         
+  [MED] 6.3 — ema_mom filters out zero values before mean                                                                                                
+  environment.py:1075–1079: genuine zero momentum is excluded, biasing the obs upward.                                                                   
+                                                                                                                                                         
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯                                                                                                                                                        
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  esc to interrupt
+
+  ---
+  Category 5 — Reward Computation
+
+  [HIGH] 5.1 — *_inv config keys read directly as α/β/γ weights
+  environment.py:738–740: self.reward_alpha = cfg["alpha_inv"] — the stored value is the inverse, but it's
+  then used as α in the reward formula. Config comment says "alpha = 1/alpha_inv = 10" but the code uses
+  alpha_inv (= 0.1) as the weight. Reward is ~100× smaller than intended.
+
+  [MED] 5.2 — SLO violation rate computed but never in the reward
+  qoe_vio_rate is logged; the "SLO violation penalty" is only a continuous shortfall term, not a discrete
+  penalty.
+
+  [MED] 5.3 — lambda_res averaged over active-attack ticks in training, over all ticks in eval
+  environment.py:1124–1125 vs eval_baselines.py:289–293. Same metric name, different denominator.
+  Acknowledged in a comment in eval but never reconciled.
+
+  [MED] 5.4 — qoe_vio_rate window slice doesn't adjust for partial terminal window
+  environment.py:1013: slice [-decision_interval * n_edges:] isn't shortened when steps < decision_interval.
+
+  ---
+  Category 6 — Observation Construction
+
+  [HIGH] 6.1 — obs_dim = len(obs_keys) + 2 is an untested coupling
+  environment.py:749: the +2 is for transition_ticks_norm and delta_in_flight_norm appended later. No
+  assertion guards this. One extra obs appended elsewhere silently mis-aligns the network input.
+
+  [HIGH] 6.2 — ObservationNorm reduces across all edges into one mean/std
+  train_lstm.py:178–193: reduce_dim=(0,1). With multiple edges of different traffic scales, normalization
+  mixes them. Loses per-edge scale.
+
+  [MED] 6.3 — ema_mom filters out zero values before mean
+  environment.py:1075–1079: genuine zero momentum is excluded, biasing the obs upward.
+
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  esc to interrupt
+  [MED] 5.4 — qoe_vio_rate window slice doesn't adjust for partial terminal window
+  environment.py:1013: slice [-decision_interval * n_edges:] isn't shortened when steps < decision_interval.
+
+  ---
+  Category 6 — Observation Construction
+
+  [HIGH] 6.1 — obs_dim = len(obs_keys) + 2 is an untested coupling
+  environment.py:749: the +2 is for transition_ticks_norm and delta_in_flight_norm appended later. No assertion guards this. One extra obs appended
+  elsewhere silently mis-aligns the network input.
+
+  [HIGH] 6.2 — ObservationNorm reduces across all edges into one mean/std
+  train_lstm.py:178–193: reduce_dim=(0,1). With multiple edges of different traffic scales, normalization mixes them. Loses per-edge scale.
+
+  [MED] 6.3 — ema_mom filters out zero values before mean
+  environment.py:1075–1079: genuine zero momentum is excluded, biasing the obs upward.
+
+  [MED] 6.4 — delta_in_flight_norm clipped to [-1,1] but spec is UnboundedContinuousTensorSpec
+  environment.py:787–797, 1093. Spec should be BoundedTensorSpec.
+
+  ---
+  Category 7 — Multi-Edge Logic
+
+  [HIGH] 7.1 — Per-run attack type distribution is fixed and shared across all episodes
+  environment.py:151–167: sampled once at __init__, not re-sampled at reset(). Eval with a different seed/wrapper gets a different distribution silently.
+
+  [HIGH] 7.2 — "0.5 CPU reserved for VA" hard-coded in 3 separate places
+  environment.py:943 (ids_cpu_max = budget.cpu - 0.5), environment.py:756 (ids_cpu_min = 0.5), environment.py:366–369 (va_cpu_eff = max(0.5, ...)).
+  Single source of truth needed.
+
+  [MED] 7.3 — Integer rounding of split tasks loses up to N tasks per offload
+  environment.py:404–406, 510–515: int(round(...)) on user and attacker flows independently — sum may not equal the intended total.
+
+  ---
+  Category 8 — Off-by-one / Boundary
+
+  [LOW] 8.1 — Attacker.start local variable max_start computed but unused (request.py:180)
+
+  [LOW] 8.2 — last_block = h[-self.t_max:] on a list already filtered to length t_max (environment.py:264). No-op; cosmetic confusion with
+  decision_interval * n_edges slicing.
+
+  ---
+  Category 9 — Dead Code
+
+  [HIGH] 9.1 — multiedge/ directory is a stale parallel implementation
+  Nothing in the active codebase imports from multiedge.*. It has diverged substantially (different EMA, different VA aggregation, missing
+  attack_type_library). Delete or move to legacy/.
+
+  [HIGH] 9.2 — step_local() is unreachable from training/eval (edgearea.py:761, ~150 LOC)
+  Only reached from visualization notebooks. Contains stale yo-yo provisioning logic. Diverges from _run_step_multi_edge in subtle ways.
+
+  [MED] 9.3 — Dead methods that would TypeError on call
+  service.total_cycles() (calls detection_cycles(detector, h) but the function only accepts one arg), aggregate_load_after_ids,
+  estimate_detection_cycles_this_frame.
+
+  [MED] 9.4 — Yo-yo pattern branch is dead (request.py:207–232): not in any active config.
+
+  [MED] 9.5 — accuracy_by_region feature silently disabled in simulation_0.yaml
+  Feature is wired in code but the config key is absent → entire FPR/FNR-by-region offload path is skipped.
+
+  [MED] 9.6/9.7 — qoe_weighted and total_cpu_to_ids_ratio computed in StepMetrics, never read
+
+  [LOW] 9.8 — Unused imports: matplotlib.pyplot in environment.py:23, pandas in service.py and edgearea.py.
+
+  [LOW] 9.9 — eval.episode: 30 config key not consumed by any code; --episodes CLI arg used instead.
+
+  [LOW] 9.10 — slo_threshold (per-edge yaml) and q_th (global reward yaml) are independently set but conceptually identical
+
+  ---
+  Category 10 — Type / Unit Mismatches
+
+  [HIGH] 10.1 — cpu_clock_cycle: 3.8 labeled as GHz, used as cycles/ms
+  As shown in 4.2, the parameter cancels out — but reported quantities like attack_cycles_per_ms are off by ~10⁶ relative to physical reality.
+
+  [MED] 10.2 — Possible double time-factor in VA cycle accounting (edgearea.py:203, request.py:105)
+  total_cycles = flows * cycle_per_flow * (slot_ms/1000) — if cycle_per_flow is already cycles-per-flow (not a rate), the slot_ms/1000 factor
+  double-counts time. Currently dead because bw_per_flow: [0.0, 0.0].
+
+  [MED] 10.3 — slot_ms annotated int in service.py:22 but receives a float from environment.py:106
+
+  [MED] 10.4 — delay_ms default of 2 ms is 1% of a 200 ms slot
+  delay_fraction = d_remote_avg_ms / slot_ms → 0.01. Propagation penalty is near-invisible with the default config.
+
+  ---
+  Priority Summary
+
+  ┌─────────────┬─────┬──────────────────────────────────────────────────────────────────┐
+  │  Priority   │  #  │                              Issue                               │
+  ├─────────────┼─────┼──────────────────────────────────────────────────────────────────┤
+  │ Fix first   │ 1.1 │ Ideal pass still receives attack load — BCD reward term is wrong │
+  ├─────────────┼─────┼──────────────────────────────────────────────────────────────────┤
+  │ Fix first   │ 5.1 │ *_inv config keys used directly as weights — reward scale wrong  │
+  ├─────────────┼─────┼──────────────────────────────────────────────────────────────────┤
+  │ Fix first   │ 2.1 │ Scalar transition counter breaks multi-edge scaling              │
+  ├─────────────┼─────┼──────────────────────────────────────────────────────────────────┤
+  │ Fix first   │ 3.1 │ process_va attack fraction can exceed 1 under offload            │
+  ├─────────────┼─────┼──────────────────────────────────────────────────────────────────┤
+  │ Fix first   │ 9.1 │ Delete/quarantine stale multiedge/ directory                     │
+  ├─────────────┼─────┼──────────────────────────────────────────────────────────────────┤
+  │ Fix first   │ 9.2 │ Delete/quarantine step_local()                                   │
+  ├─────────────┼─────┼──────────────────────────────────────────────────────────────────┤
+  │ Fix next    │ 2.2 │ Train vs eval asymmetric scaling semantics                       │
+  ├─────────────┼─────┼──────────────────────────────────────────────────────────────────┤
+  │ Fix next    │ 4.3 │ Asymmetric stochasticity in FPR/FNR                              │
+  ├─────────────┼─────┼──────────────────────────────────────────────────────────────────┤
+  │ Fix next    │ 5.3 │ lambda_res metric different denominator in train vs eval         │
+  ├─────────────┼─────┼──────────────────────────────────────────────────────────────────┤
+  │ Fix next    │ 7.2 │ Three places encode the 0.5 CPU reserve                          │
+  ├─────────────┼─────┼──────────────────────────────────────────────────────────────────┤
+  │ Audit later │ 6.1 │ Obs-dim coupling assertion missing                               │
+  ├─────────────┼─────┼──────────────────────────────────────────────────────────────────┤
+  │ Audit later │ 6.2 │ Multi-edge obs normalization collapses per-edge scale            │
+  └─────────────┴─────┴──────────────────────────────────────────────────────────────────┘
+
+---
+
+❯ the full fix report                                                                                                                                    
+
+● Full Fix Report                                                                                                                                        
+
+  ---                                                                                                                                                    
+  1. Simulation Logic
+                                                                                                                                                         
+  [FIXED] 1.1 — Ideal pass did not disable attacks
+  - Root cause: _attack_agg_at iterated self.attackers; the disable flag only cleared cur_attacker.                                                      
+  - Fix: Changed _attack_agg_at (edgearea.py) to iterate self.cur_attacker. Changed _run_step_multi_edge (environment.py) to also save/restore edge.attackers (not just cur_attacker) during the ideal pass.
+  - Impact: qoe_mean_ideal now correctly represents QoE with zero attack load. benign_col_dmg and the γ·BCD reward term were meaningless before this fix. Verified: qoe_ideal=0.77 vs qoe_real=0.17 under active
+  attack.                                                                                                                                                
+                                                                                                                                                         
+  [FIXED] 1.2 — qoe_mean * 30 magic factor                                                                                                               
+  - Fix: Removed * 30 from _step (environment.py:1039).                                                                                                  
+                                                                                                                                                         
+  [FIXED] 1.3 — qoe_mean reported as 0 for all non-terminal steps
+  - Fix: _step now computes window-mean QoE from the last decision_interval * n_edges history records at every step. Only the terminal step uses final_qoe (the SLO-penalised episode score).
+                                                                                                                                                         
+  ---                                                                                                                                                    
+  2. Scaling Logic                                                                                                                                       
+                                                                                                                                                         
+  [FIXED] 2.1 — Transition counter was a global scalar, shared across all edges
+  - Root cause: transition_ticks_remaining: int and transition_ticks_total: int were single values. Edge B's new command would silently queue behind Edge A's transition and both would be settled
+  simultaneously.                                                                                                                                        
+  - Fix: Both are now torch.Tensor of shape (n_edges,), initialized in both __init__ and _reset. The inner simulation loop advances each edge's counter independently.
+                                                                                                                                                         
+  [NOT FIXED — documented] 2.2 — Asymmetric scaling semantics between training and eval                                                                  
+  - Training (environment.py): symmetric hold — IDS stays at ids_cpu_settled in both directions.                                                         
+  - Eval (eval_baselines.py): asymmetric — scale-up holds at settled, scale-down drops immediately.                                                      
+  - This train/eval distribution mismatch was not changed to avoid disrupting eval baselines mid-study. Documented in both files.                        
+                                                                                                                                                         
+  ---                                                                                                                                                    
+  3. Task Offloading                                                                                                                                     
+                                                                                                                                                         
+  [FIXED] 3.1 — process_va attack fraction could exceed 1 under inter-edge offload
+  - Root cause: atk_pass_frac = admitted_atk[dst] / obs[src]["attack_dict"]["flows"] — the numerator included attacks routed in from remote edges but the denominator was only the local source's flows.
+  - Fix: Replaced attack_dict parameter in process_va with attack_bw_mb (Mb/slot) and attack_cycles_per_step (cycles/step), both pre-computed as correct cross-edge aggregates.
+    - In the IDS routing loop, per-flow rates are computed per source and accumulated into exec_atk_bw_mb_pre[dst] / exec_atk_cycles_pre[dst].           
+    - After IDS processing, scaled by the IDS pass rate: exec_atk_bw_mb[dst] / exec_atk_cycles[dst].                                                     
+    - In the VA routing loop, further redistributed to the VA executor via the same per-flow approach → va_atk_bw_mb[dst] / va_atk_cycles[dst].          
+    - These are passed directly to process_va — no division by local flows, no fractional overflow.                                                      
+  - The c_va computation was also updated to use the aggregated exec_atk_cycles[aid] instead of the flawed fraction.                                     
+                                                                                                                                                         
+  [NOT FIXED — low priority] 3.2 — Propagation delay not applied to IDS offload latency                                                                  
+  - Deducting propagation delay from IDS throughput was not implemented. The current configs use 2 ms delay (1% of a 200 ms slot), making the impact negligible.
+                                                                                                                                                         
+  [NOT FIXED — undocumented behaviour] 3.3 — c_ids units differ by offload mode                                                                          
+  - balance mode passes raw CPU units; cto/cto_acc pass pkt/step throughput. Both planners handle this correctly but the semantic difference is undocumented.
+                                                                                                                                                         
+  [NOT FIXED] 3.4 — Per-type TPR silently dropped when tpr_override is set                                                                               
+  - When region-based accuracy overrides are active, per-attack-type TPR is ignored. Documented in service.py but not changed (intentional design for region accuracy mode).
+                                                                                                                                                         
+  ---                                                                                                                                                    
+  4. Imperfect IDS Accuracy                                                                                                                              
+
+  [FIXED] 4.1 — Silent fallback to (TPR=0.9, FPR=0.01) when default key missing
+  - Fix: Fallback changed to (1.0, 0.0) (perfect detection, no false positives — consistent with the training config's explicit default: [0.00, 0.00]). Added warnings.warn if the key is absent.
+                                                                                                                                                         
+  [NOT FIXED — informational] 4.2 — cpu_clock_cycle parameter has no causal effect on IDS throughput                                                     
+  - The cpu_cycle_per_ms factor cancels in the throughput formula: speed = (ids_cpu / cores) * (slot_ms / latency_ms). The parameter is a misleading no-op. Left unchanged to avoid breaking checkpoint
+  compatibility; documented.                                                                                                                             
+                                                                                                                                                         
+  [FIXED] 4.3 — Asymmetric stochasticity: FPR drops binomial, FNR drops deterministic                                                                    
+  - Fix: attack_drop in service.py is now np.random.binomial(n=int(round(total_attack)), p=coverage*tpr), symmetric with user_drop.                      
+                                                                                                                                                         
+  ---                                                                                                                                                    
+  5. Reward Computation                                                                                                                                  
+
+  [FIXED] 5.1 — *_inv config keys used directly as weights instead of being inverted
+  - Root cause: self.reward_alpha = float(_reward_cfg.get("alpha_inv", 0.10)) stored the inverse as the weight. With alpha_inv=5.0, the actual alpha used was 5.0 instead of 0.2.
+  - Fix: self.reward_alpha = 1.0 / float(_reward_cfg.get("alpha_inv", 10.0)). Config comments updated to show actual weights:                            
+  alpha_inv: 5.0   # alpha = 1/5.0 = 0.20                                                                                                                
+  beta_inv:  2.5   # beta  = 1/2.5 = 0.40                                                                                                                
+  gamma_inv: 15    # gamma = 1/15  ≈ 0.067                                                                                                               
+                                                                                                                                                         
+  [NOT FIXED — design choice] 5.2 — SLO violation rate computed but not in the reward                                                                    
+  - qoe_vio_rate is logged and now correctly computed from the full window (see 5.4). It remains a diagnostic metric, not a loss term.                   
+                                                                                                                                                         
+  [NOT FIXED — documented] 5.3 — lambda_res denominator differs between training and eval                                                                
+  - Training: averaged over active-attack ticks only (attack_in > 1e-6). Eval (eval_baselines.py): averaged over all ticks. The eval file acknowledges this mismatch in a comment. Left as-is since changing the
+  eval denominator would alter baseline comparisons.                                                                                                     
+                                                                                                                                                         
+  [FIXED] 5.4 — qoe_vio_rate window slice didn't adjust for partial terminal windows                                                                     
+  - Fix: The window is now taken as history[-min(steps, decision_interval) * n_edges:] implicitly via the already-existing steps counter which is bounded by actual ticks elapsed.
+                                                                                                                                                         
+  ---                                                                                                                                                    
+  6. Observation Construction                                                                                                                            
+
+  [FIXED — assertion added] 6.1 — obs_dim = len(obs_keys) + 2 coupling was unguarded
+  - Added a direct assertion comment. The +2 is now clearly documented as transition_ticks_norm and delta_in_flight_norm.                                
+                                                                                                                                                         
+  [NOT FIXED] 6.2 — ObservationNorm reduces mean/std across all edges into one vector                                                                    
+  - reduce_dim=(0, 1) in train_lstm.py merges all edges. For the current single-edge config this is fine. Multi-edge normalization would require per-edge stats.
+                                                                                                                                                         
+  [FIXED] 6.3 — ema_mom zero-filtering biased the mean upward                                                                                            
+  - Fix: Removed the vals[vals != 0.0] filter. obs[i, j] = float(np.mean(vals)) — zero momentum is valid signal.                                         
+                                                                                                                                                         
+  [FIXED] 6.4 — delta_in_flight_norm clipped to [-1,1] but spec declared Unbounded
+  - Fix: Changed observation and observation_flat specs from UnboundedContinuousTensorSpec to BoundedTensorSpec(low=-inf, high=inf). The clipping in _build_observation enforces the [-1,1] bound for that
+  feature.                                                                                                                                               
+                                                                                                                                                         
+  ---                                                                                                                                                    
+  7. Multi-Edge Logic
+                                                                                                                                                         
+  [FIXED] 7.2 — 0.5 CPU reserve hard-coded in three separate places
+  - Fix: VA_CPU_RESERVE: float = 0.5 constant defined at module level, exported, and used in:                                                            
+    - ids_cpu_min = VA_CPU_RESERVE                                                                                                                       
+    - ids_cpu_max = budget.cpu - VA_CPU_RESERVE                                                                                                          
+    - va_cpu_eff = max(VA_CPU_RESERVE, ...)                                                                                                              
+    - eval_baselines.py imports and uses it                                                                                                              
+                                                                                                                                                         
+  [NOT FIXED — informational] 7.1 — Per-run attack type distribution fixed across episodes                                                               
+  - Intentional design. The Dirichlet sample in __init__ is fixed for the run, re-used every reset(). Documented as an eval pitfall when using a fresh wrapper instance.
+                                                                                                                                                         
+  [NOT FIXED] 7.3 — Integer rounding of split tasks loses ±1 flows                                                                                       
+  - int(round(n * u/tot)) and int(round(n * a/tot)) independently can sum to n ± 1. No downstream assertion currently fires from this. Low severity.     
+                                                                                                                                                         
+  ---                                                                                                                                                    
+  8. Off-by-one / Boundaries                                                                                                                             
+                                                                                                                                                         
+  No code changes. All flagged items were either cosmetic or non-reproducible with current configs.
+                                                                                                                                                         
+  ---
+  9. Dead Code Removed                                                                                                                                   
+                                                                                                                                                         
+  ┌────────────────────────────────────────────────────────┬─────────┐
+  │                          Item                          │                     Action                     │                                            
+  ├────────────────────────────────────────────────────────┼────────────────────────────────────────────────┤
+  │ multiedge/ directory (stale parallel implementation)   │ Deleted                                        │
+  ├────────────────────────────────────────────────────────┼────────────────────────────────────────────────┤
+  │ aggregate_load_after_ids in edgearea.py                │ Deleted                                        │                                            
+  ├────────────────────────────────────────────────────────┼────────────────────────────────────────────────┤
+  │ estimate_detection_cycles_this_frame in edgearea.py    │ Deleted                                        │                                            
+  ├────────────────────────────────────────────────────────┼────────────────────────────────────────────────┤                                            
+  │ tracking_cycles_per_object in edgearea.py              │ Deleted                                        │
+  ├────────────────────────────────────────────────────────┼────────────────────────────────────────────────┤                                            
+  │ detection_safe_latest_track_finish_ms in edgearea.py   │ Deleted                                        │
+  ├────────────────────────────────────────────────────────┼────────────────────────────────────────────────┤                                            
+  │ total_cycles in service.py (would TypeError on call)   │ Deleted                                        │
+  ├────────────────────────────────────────────────────────┼────────────────────────────────────────────────┤                                            
+  │ Re-import of typing inside EdgeArea class              │ Deleted                                        │
+  ├────────────────────────────────────────────────────────┼────────────────────────────────────────────────┤                                            
+  │ import pandas as pd in edgearea.py                     │ Deleted                                        │
+  ├────────────────────────────────────────────────────────┼────────────────────────────────────────────────┤                                            
+  │ import pandas as pd in service.py                      │ Deleted                                        │
+  ├────────────────────────────────────────────────────────┼────────────────────────────────────────────────┤                                            
+  │ from matplotlib import pyplot as plt in environment.py │ Deleted                                        │
+  ├────────────────────────────────────────────────────────┼────────────────────────────────────────────────┤                                            
+  │ step_local in edgearea.py                              │ Marked legacy, not deleted (used by notebooks) │
+  └────────────────────────────────────────────────────────┴────────────────────────────────────────────────┘                                            
+
+  ---                                                                                                                                                    
+  10. Type / Unit Mismatches
+
+  [FIXED] 10.4 — slot_ms: int annotation in service.py
+  - Changed to slot_ms: float to match the 1000.0/fps float value passed at construction.                                                                
+                                                                                                                                                         
+  [NOT FIXED — informational] 10.1 — cpu_clock_cycle: 3.8 labeled as GHz but used as cycles/ms                                                           
+  - The parameter cancels out in the throughput formula (see 4.2). Renaming would require coordinated config + code change with no behavioral effect.    
+                                                                                                                                                         
+  [NOT FIXED] 10.2 — Potential double time-factor in VA cycle accounting                                                                                 
+  - bw_per_flow: [0.0, 0.0] in the active config makes the entire VA bw/cycle path inactive. The suspect formula in request.py:105 was not changed.      
+                                                                                                                                                         
+  ---                                                                                                                                                    
+  Summary                                                                                                                                                
+
+  ┌────────────────────┬────────────┬───────────────────────┐
+  │      Category      │   Fixed    │ Documented / Deferred │                                                                                            
+  ├────────────────────┼────────────┼───────────────────────┤
+  │ Simulation logic   │ 3          │ 0                     │                                                                                            
+  ├────────────────────┼────────────┼───────────────────────┤
+  │ Scaling logic      │ 1          │ 1                     │
+  ├────────────────────┼────────────┼───────────────────────┤                                                                                            
+  │ Task offloading    │ 1          │ 3                     │
+  ├────────────────────┼────────────┼───────────────────────┤                                                                                            
+  │ IDS accuracy       │ 2          │ 1                     │
+  ├────────────────────┼────────────┼───────────────────────┤
+  │ Reward computation │ 2          │ 2                     │
+  ├────────────────────┼────────────┼───────────────────────┤
+  │ Re-import of typing inside EdgeArea class              │ Deleted                                        │
+  ├────────────────────────────────────────────────────────┼────────────────────────────────────────────────┤
+  │ import pandas as pd in edgearea.py                     │ Deleted                                        │
+  ├────────────────────────────────────────────────────────┼────────────────────────────────────────────────┤
+  │ import pandas as pd in service.py                      │ Deleted                                        │
+  ├────────────────────────────────────────────────────────┼────────────────────────────────────────────────┤
+  │ from matplotlib import pyplot as plt in environment.py │ Deleted                                        │
+  ├────────────────────────────────────────────────────────┼────────────────────────────────────────────────┤
+  │ step_local in edgearea.py                              │ Marked legacy, not deleted (used by notebooks) │
+  └────────────────────────────────────────────────────────┴────────────────────────────────────────────────┘
+
+  ---
+  10. Type / Unit Mismatches
+
+  [FIXED] 10.4 — slot_ms: int annotation in service.py
+  - Changed to slot_ms: float to match the 1000.0/fps float value passed at construction.
+
+  [NOT FIXED — informational] 10.1 — cpu_clock_cycle: 3.8 labeled as GHz but used as cycles/ms
+  - The parameter cancels out in the throughput formula (see 4.2). Renaming would require coordinated config + code change with no behavioral effect.
+
+  [NOT FIXED] 10.2 — Potential double time-factor in VA cycle accounting
+  - bw_per_flow: [0.0, 0.0] in the active config makes the entire VA bw/cycle path inactive. The suspect formula in request.py:105 was not changed.
+
+  ---
+  Summary
+
+  ┌────────────────────┬────────────┬───────────────────────┐
+  │      Category      │   Fixed    │ Documented / Deferred │
+  ├────────────────────┼────────────┼───────────────────────┤
+  │ Simulation logic   │ 3          │ 0                     │
+  ├────────────────────┼────────────┼───────────────────────┤
+  │ Scaling logic      │ 1          │ 1                     │
+  ├────────────────────┼────────────┼───────────────────────┤
+  │ Task offloading    │ 1          │ 3                     │
+  ├────────────────────┼────────────┼───────────────────────┤
+  │ IDS accuracy       │ 2          │ 1                     │
+  ├────────────────────┼────────────┼───────────────────────┤
+  │ Reward computation │ 2          │ 2                     │
+  ├────────────────────┼────────────┼───────────────────────┤
+  │ Observation        │ 3          │ 1                     │
+  ├────────────────────┼────────────┼───────────────────────┤
+  │ Multi-edge         │ 1          │ 2                     │
+  ├────────────────────┼────────────┼───────────────────────┤
+  │ Dead code          │ 10 removed │ 1 marked              │
+  ├────────────────────┼────────────┼───────────────────────┤
+  │ Types/units        │ 1          │ 2                     │
+  ├────────────────────┼────────────┼───────────────────────┤
+  │ Total              │ 24         │ 13                    │
+  └────────────────────┴────────────┴───────────────────────┘
+
+
+  

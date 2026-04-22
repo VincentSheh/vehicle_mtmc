@@ -1,5 +1,4 @@
 import numpy as np
-import pandas as pd
 
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Any
@@ -189,7 +188,7 @@ class EdgeArea:
         ema = 0.0
         mom = 0.0
 
-        for atk in self.attackers:
+        for atk in self.cur_attacker:  # only active attacker (respects disable_attack toggle)
 
             if not getattr(atk, "episode_active", True):
                 continue
@@ -212,14 +211,6 @@ class EdgeArea:
             "ema": ema,
             "mom": mom,
         }
-
-    def aggregate_load_after_ids(self, t: int, attack_dict = Dict[str, Any]) -> Dict[str, float]:
-        user_rate = float(sum(u.num_requests_at(t) for u in self.users))
-        return self.ids.classify_rates(
-            attack_dict=attack_dict,
-            user_rate=user_rate,
-            ids_cpu=self.ids_cpu,
-        )
 
     # ------------------------------------------------------------------
     # Multi-edge interface: split step_local into three stages so that
@@ -277,26 +268,25 @@ class EdgeArea:
         t: int,
         admitted_user_req_in: int,
         admitted_atk_req_in: int,
-        attack_dict: Dict,
+        attack_bw_mb: float,
+        attack_cycles_per_step: float,
         ids_out: Dict,
         d_remote_avg_ms: float = 0.0,
         n_local_user: Optional[int] = None,
         original_user_in: Optional[int] = None,
     ) -> Dict:
         """Stage 3 — VA pipeline on post-IDS, post-offload counts.
-        Preserves single-edge resource accounting and QoE normalisation.
+
+        attack_bw_mb: Mb/slot consumed by admitted attacks (aggregated across all senders).
+        attack_cycles_per_step: cycles/step consumed by admitted attacks (aggregated across all senders).
+        Both are pre-divided by slot_ms/flows so they represent the actual admitted load, not
+        the source edge's local rate — avoids the atk_pass_frac > 1 bug under inter-edge offload.
         """
         benign_req_in = int(admitted_user_req_in)
-        attack_req_in = int(admitted_atk_req_in)
         local_num_request = benign_req_in
 
-        # Attack resource usage: scale bw_in/cycles_per_step by admitted pass fraction
-        total_attack = float(attack_dict.get("flows", 0.0))
-        atk_pass_frac = (attack_req_in / total_attack) if total_attack > 0 else 0.0
-        attack_uplink_in = attack_dict.get("bw_in", 0.0) * atk_pass_frac       # Mb/slot
-        attack_cycles_per_ms = (
-            attack_dict.get("cycles_per_step", 0.0) * atk_pass_frac / self.slot_ms
-        )
+        attack_uplink_in   = float(attack_bw_mb)                          # Mb/slot
+        attack_cycles_per_ms = float(attack_cycles_per_step) / self.slot_ms
 
         # EMA tracking on admitted attack signal (same as step_local)
         atk_signal = float(ids_out.get("attack_in_rate", 0.0))
@@ -425,33 +415,6 @@ class EdgeArea:
             "mean_latency_ms": float(mean_latency_ms),
             "qoe": float(qoe),
         }
-
-    def estimate_detection_cycles_this_frame(
-        self,
-        detector: str,
-        num_cameras: int,
-    ) -> float:
-        return (
-            self.pipeline.detection_cycles(detector)
-            * int(num_cameras)
-        )
-
-    def tracking_cycles_per_object(self) -> float:
-        return self.pipeline.tracking_cycles_per_object()
-
-    def detection_safe_latest_track_finish_ms(self) -> float:
-        """
-        Constraint: do not accept OT that would interfere with next OD.
-        For synchronized OD, the simplest framing is:
-          OT must finish before next frame OD begins.
-
-        You can set slot_ms in policy, default 1000ms.
-        You can also reserve a margin.
-        """
-        return max(0.0, self.slot_ms)
-
-    from typing import Dict, Tuple, List
-
 
     def select_resolution(
         self,
@@ -759,10 +722,9 @@ class EdgeArea:
         return float(qoe), assign
 
     def step_local(self, t: int):
-        """
-        Request-based, OD-only, one fixed upload resolution.
-        If uplink bandwidth is not enough, drop user requests to fit uplink,
-        then allocate detector mix under compute, QoE computed inside allocate_detectors().
+        """Legacy single-edge step — not used by the multi-edge training/eval pipeline.
+        Kept for visualization notebooks. Has diverged from _run_step_multi_edge; do not
+        add new features here.
         """
 
         # 0) total user requests arriving this step

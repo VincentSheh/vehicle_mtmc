@@ -22,7 +22,7 @@ import pandas as pd
 import yaml
 from tqdm import tqdm
 
-from environment import build_env_base, TorchRLEnvWrapper
+from environment import build_env_base, TorchRLEnvWrapper, VA_CPU_RESERVE
 from method_policy import ActContext, BaselinePolicy, make_baseline_policy
 from old_policy import plot_ts_continuous, plot_qoe_vio_bars
 
@@ -123,7 +123,7 @@ def run_episode(
     policy.reset()
 
     n_edges     = len(env.edge_areas)
-    ids_cpu_max = np.array([e.budget.cpu - 0.5 for e in env.edge_areas], dtype=np.float32)
+    ids_cpu_max = np.array([e.budget.cpu - VA_CPU_RESERVE for e in env.edge_areas], dtype=np.float32)
     
     if initial_ids_cpu is not None:
         ids_cpu = initial_ids_cpu.copy()

@@ -20,7 +20,6 @@ import os
 import copy
 import numpy as np
 import pandas as pd
-from matplotlib import pyplot as plt
 
 from service import IDS, VideoPipeline
 
@@ -39,6 +38,9 @@ from offload import (
 )
 
 N_ACTION = 9
+
+# CPU cores reserved for VA — must be consistent across IDS min, IDS max, and VA floor.
+VA_CPU_RESERVE: float = 0.5
 
 @dataclass(frozen=True)
 class GlobalConfig:
@@ -363,18 +365,21 @@ class Environment:
             overhead_ids = oh if oh > 0.0 else 0.0
             overhead_va  = abs(oh) if oh < 0.0 else 0.0
             ids_cpu_eff = float(np.clip(float(ids_cpus[i]) - overhead_ids, 0.0, edge.budget.cpu))
-            va_cpu_eff  = float(np.clip(edge.budget.cpu - float(ids_cpus[i]) - overhead_va, 0.5, edge.budget.cpu))
+            va_cpu_eff  = float(np.clip(edge.budget.cpu - float(ids_cpus[i]) - overhead_va, VA_CPU_RESERVE, edge.budget.cpu))
             total = ids_cpu_eff + va_cpu_eff
             if total > edge.budget.cpu:
-                va_cpu_eff = max(0.5, va_cpu_eff - (total - edge.budget.cpu))
+                va_cpu_eff = max(VA_CPU_RESERVE, va_cpu_eff - (total - edge.budget.cpu))
             edge.ids_cpu = ids_cpu_eff
             edge.va_cpu  = va_cpu_eff
 
-        # Temporarily disable attacks for ideal pass
+        # Temporarily disable attacks for ideal pass.
+        # _attack_agg_at iterates cur_attacker, so clearing it suppresses all attack load.
         if disable_attack:
             for edge in self.edge_areas:
                 edge._tmp_cur_attacker = edge.cur_attacker
                 edge.cur_attacker = []
+                edge._tmp_attackers = edge.attackers
+                edge.attackers = []
 
         # Stage A: observe arrivals at each edge
         obs = {aid: edges[aid].observe_arrivals(self.t) for aid in self.area_ids}
@@ -395,10 +400,18 @@ class Environment:
         exec_local_user_in: Dict[str, int] = {aid: 0 for aid in self.area_ids}
         ids_remote_d_num: Dict[str, float] = {aid: 0.0 for aid in self.area_ids}
         ids_remote_n:     Dict[str, float] = {aid: 0.0 for aid in self.area_ids}
+        # Per-flow attack resource usage aggregated per IDS-executor (pre-IDS, cross-edge safe)
+        exec_atk_bw_mb_pre:  Dict[str, float] = {aid: 0.0 for aid in self.area_ids}
+        exec_atk_cycles_pre: Dict[str, float] = {aid: 0.0 for aid in self.area_ids}
         for src in self.area_ids:
             u = float(obs[src]["user_req_in"])
             a = float(obs[src]["atk_req_in"])
             tot = max(u + a, 1.0)
+            a_share = a / tot
+            # Per-flow rates at this source (safe even when a == 0)
+            src_flows = max(float(obs[src]["attack_dict"]["flows"]), 1e-9)
+            bw_per_atk_flow  = float(obs[src]["attack_dict"].get("bw_in", 0.0)) / src_flows
+            cyc_per_atk_flow = float(obs[src]["attack_dict"].get("cycles_per_step", 0.0)) / src_flows
             for dst, n_sent in plan_ids.flow.get(src, {}).items():
                 n_sent_f = float(n_sent)
                 nu = int(round(n_sent_f * u / tot))
@@ -411,6 +424,9 @@ class Environment:
                     d = float(self.prop_delay.get((src, dst), 0.0))
                     ids_remote_d_num[dst] += d * n_sent_f
                     ids_remote_n[dst]     += n_sent_f
+                # Accumulate attack bw/cycles by per-flow rate × routed attack count
+                exec_atk_bw_mb_pre[dst]  += n_sent_f * a_share * bw_per_atk_flow
+                exec_atk_cycles_pre[dst] += n_sent_f * a_share * cyc_per_atk_flow
         ids_d_remote_avg: Dict[str, float] = {
             aid: ids_remote_d_num[aid] / ids_remote_n[aid] if ids_remote_n[aid] > 0 else 0.0
             for aid in self.area_ids
@@ -466,24 +482,26 @@ class Environment:
             for aid in self.area_ids
         }
 
+        # Post-IDS attack bw/cycles at each executor (scale pre-IDS values by IDS pass rate)
+        exec_atk_bw_mb:  Dict[str, float] = {}
+        exec_atk_cycles: Dict[str, float] = {}
+        for aid in self.area_ids:
+            ids_atk_pass = float(admitted_atk[aid]) / max(float(exec_atk_in[aid]), 1.0)
+            exec_atk_bw_mb[aid]  = exec_atk_bw_mb_pre[aid] * ids_atk_pass
+            exec_atk_cycles[aid] = exec_atk_cycles_pre[aid] * ids_atk_pass
+
         # Stage C: VA offload plan (VA has no accuracy benefit; delay/load only)
         W_va = {aid: float(admitted_user[aid] + admitted_atk[aid]) for aid in self.area_ids}
-        # Deduct admitted-attack CPU consumption from VA capacity so the planner
-        # routes work away from attack-saturated edges (mirrors edgearea.process_va).
+        # Deduct admitted-attack CPU from VA capacity (uses corrected cross-edge attack cycles)
         c_va: Dict[str, float] = {}
         for aid in self.area_ids:
             edge = edges[aid]
-            total_atk = float(obs[aid]["attack_dict"].get("flows", 0.0))
-            atk_pass_frac = (float(admitted_atk[aid]) / total_atk) if total_atk > 0 else 0.0
-            atk_cycles_per_ms = (
-                float(obs[aid]["attack_dict"].get("cycles_per_step", 0.0))
-                * atk_pass_frac / edge.slot_ms
-            )
+            atk_cycles_per_ms = exec_atk_cycles[aid] / edge.slot_ms
             if self.offload_mode in ("cto", "cto_acc"):
                 avail_cycles = max(
                     0.0,
                     float(edge.va_cpu) * edge.cpu_cycle_per_ms * edge.slot_ms
-                    - atk_cycles_per_ms * edge.slot_ms,
+                    - exec_atk_cycles[aid],
                 )
                 min_det_cycles = min(edge.pipeline.det_cycles.values())
                 c_va[aid] = avail_cycles / min_det_cycles if min_det_cycles > 0 else 0.0
@@ -497,6 +515,9 @@ class Environment:
         va_original_user_in: Dict[str, int] = {aid: 0 for aid in self.area_ids}
         va_remote_d_num: Dict[str, float] = {aid: 0.0 for aid in self.area_ids}
         va_remote_n:     Dict[str, float] = {aid: 0.0 for aid in self.area_ids}
+        # Propagate attack bw/cycles through VA offloading (per-flow from each IDS-executor)
+        va_atk_bw_mb:  Dict[str, float] = {aid: 0.0 for aid in self.area_ids}
+        va_atk_cycles: Dict[str, float] = {aid: 0.0 for aid in self.area_ids}
         for src in self.area_ids:
             u = float(admitted_user[src])
             a = float(admitted_atk[src])
@@ -505,12 +526,18 @@ class Environment:
             a_share = a / tot
             local_frac    = float(admitted_local_user[src]) / max(u, 1.0)
             ids_pass_rate = u / max(float(exec_user_in[src]), 1.0)
+            # Per-flow attack resource rates at this IDS-executor
+            bw_per_atk  = exec_atk_bw_mb[src]  / max(a, 1e-9)
+            cyc_per_atk = exec_atk_cycles[src] / max(a, 1e-9)
             for dst, n_sent in plan_va.flow.get(src, {}).items():
                 n_sent_f = float(n_sent)
                 nu = int(round(n_sent_f * u_share))
+                na_f = n_sent_f * a_share
                 va_user_in[dst] += nu
-                va_atk_in[dst]  += int(round(n_sent_f * a_share))
+                va_atk_in[dst]  += int(round(na_f))
                 va_original_user_in[dst] += int(round(nu / max(ids_pass_rate, 1e-9)))
+                va_atk_bw_mb[dst]  += na_f * bw_per_atk
+                va_atk_cycles[dst] += na_f * cyc_per_atk
                 if src == dst:
                     va_local_user_in[dst] += int(round(nu * local_frac))
                 else:
@@ -528,10 +555,11 @@ class Environment:
                 t=self.t,
                 admitted_user_req_in=va_user_in[aid],
                 admitted_atk_req_in=va_atk_in[aid],
+                attack_bw_mb=va_atk_bw_mb[aid],
+                attack_cycles_per_step=va_atk_cycles[aid],
                 n_local_user=va_local_user_in[aid],
                 original_user_in=va_original_user_in[aid],
                 d_remote_avg_ms=ids_d_remote_avg[aid] + va_d_remote_avg[aid],
-                attack_dict=obs[aid]["attack_dict"],
                 ids_out=ids_out_exec[aid],
             )
             for aid in self.area_ids
@@ -540,12 +568,15 @@ class Environment:
         for aid in self.area_ids:
             local_cache[aid]["original_user_in"] = va_original_user_in[aid]
 
-        # Restore attack active flags
+        # Restore attack state
         if disable_attack:
             for edge in self.edge_areas:
                 if hasattr(edge, "_tmp_cur_attacker"):
                     edge.cur_attacker = edge._tmp_cur_attacker
                     del edge._tmp_cur_attacker
+                if hasattr(edge, "_tmp_attackers"):
+                    edge.attackers = edge._tmp_attackers
+                    del edge._tmp_attackers
 
         for edge in self.edge_areas:
             assert edge.ids_cpu >= 0.0
@@ -733,34 +764,38 @@ class TorchRLEnvWrapper(EnvBase):
             _cfg["globals"].get("scaling_time_step", [300, 450, 498, 544])
         )
 
-        # Reward weights — read from config so they're tracked and reproducible
+        # Reward weights — config keys are *_inv (the denominator), so invert to get the weight.
+        # alpha = 1/alpha_inv (e.g. alpha_inv=5.0 → alpha=0.2)
         _reward_cfg = _cfg["globals"].get("reward", {})
-        self.reward_alpha = float(_reward_cfg.get("alpha_inv", 0.10))
-        self.reward_beta  = float(_reward_cfg.get("beta_inv",  0.20))
-        self.reward_gamma = float(_reward_cfg.get("gamma_inv", 0.12))
+        self.reward_alpha = 1.0 / float(_reward_cfg.get("alpha_inv", 10.0))
+        self.reward_beta  = 1.0 / float(_reward_cfg.get("beta_inv",  5.0))
+        self.reward_gamma = 1.0 / float(_reward_cfg.get("gamma_inv", 8.33))
         self.reward_q_th  = float(_reward_cfg.get("q_th", 0.20))
         self.scaling_quanta: List[float] = [0.5, 1.0, 1.5, 2.0]
 
-        # Method 2 serialised-scaling state
+        # Per-edge serialised-scaling state (tensors of shape (n_edges,))
         self.ids_cpu_target: torch.Tensor      # current transition target (= settled when not transitioning)
-        self.transition_ticks_remaining: int = 0   # 0 = settled
-        self.transition_ticks_total:     int = 1   # avoid div-by-zero
+        self.transition_ticks_remaining: torch.Tensor   # 0 = settled for that edge
+        self.transition_ticks_total:     torch.Tensor   # total ticks for current transition
 
-        self.obs_dim = len(self.obs_keys) + 2   # +2: ticks_remaining_norm, delta_in_flight_norm
+        assert len(self.obs_keys) + 2 == len(self.obs_keys) + 2, "obs_dim sentinel"
+        self.obs_dim = len(self.obs_keys) + 2   # +2: transition_ticks_norm, delta_in_flight_norm
         self.obs_size = self.n_edges * self.obs_dim
 
         self.action_dim = self.n_edges
         self._last_action = torch.zeros(self.action_dim, device=self.device, dtype=torch.float32)
-        self.scale_step = 0.5  # CPU units per scale
-        self.ids_cpu_min = 0.5
+        self.scale_step = 0.5  # CPU units per scale action
+        self.ids_cpu_min = VA_CPU_RESERVE  # minimum IDS allocation = VA reserve
 
         self.ids_cpu = torch.tensor(
             [e.ids_cpu for e in self.env.edge_areas],
             device=self.device,
             dtype=torch.float32,
         )
-        self.ids_cpu_settled = self.ids_cpu.clone()
-        self.ids_cpu_target  = self.ids_cpu.clone()
+        self.ids_cpu_settled            = self.ids_cpu.clone()
+        self.ids_cpu_target             = self.ids_cpu.clone()
+        self.transition_ticks_remaining = torch.zeros(self.n_edges, dtype=torch.int32, device=self.device)
+        self.transition_ticks_total     = torch.ones(self.n_edges, dtype=torch.int32, device=self.device)
 
         self._set_seed(seed)
         self._make_specs()
@@ -785,12 +820,16 @@ class TorchRLEnvWrapper(EnvBase):
 
     def _make_specs(self):
         self.observation_spec = CompositeSpec(
-            observation=UnboundedContinuousTensorSpec(
+            observation=BoundedTensorSpec(
+                low=float("-inf"),
+                high=float("inf"),
                 shape=(self.n_edges, self.obs_dim),
                 dtype=torch.float32,
                 device=self.device,
             ),
-            observation_flat=UnboundedContinuousTensorSpec(
+            observation_flat=BoundedTensorSpec(
+                low=float("-inf"),
+                high=float("inf"),
                 shape=(self.obs_size,),
                 dtype=torch.float32,
                 device=self.device,
@@ -876,11 +915,11 @@ class TorchRLEnvWrapper(EnvBase):
         # Reset env with explicit seeds
         self.env.reset(episode_seed)
 
-        # Clear scaling state
-        self.ids_cpu_settled             = self.ids_cpu.clone()
-        self.ids_cpu_target              = self.ids_cpu.clone()
-        self.transition_ticks_remaining  = 0
-        self.transition_ticks_total      = 1
+        # Clear scaling state (per-edge)
+        self.ids_cpu_settled            = self.ids_cpu.clone()
+        self.ids_cpu_target             = self.ids_cpu.clone()
+        self.transition_ticks_remaining = torch.zeros(self.n_edges, dtype=torch.int32, device=self.device)
+        self.transition_ticks_total     = torch.ones(self.n_edges, dtype=torch.int32, device=self.device)
 
 
         obs = self._build_observation().to(self.device)
@@ -937,34 +976,32 @@ class TorchRLEnvWrapper(EnvBase):
         elif action.dim() == 1 and action.shape[0] == 1 and self.n_edges > 1:
             action = action.expand(self.n_edges)
 
-        # Apply per-edge delta commands
+        # Apply per-edge delta commands and start per-edge transitions independently
         for i in range(self.n_edges):
             delta_cmd = (action[i].float() - ((self.n_actions - 1) / 2.0)) * self.scale_step
-            ids_cpu_max = float(self.env.edge_areas[i].budget.cpu - 0.5)
+            ids_cpu_max = float(self.env.edge_areas[i].budget.cpu - VA_CPU_RESERVE)
             prev = self.ids_cpu[i].clone()
             self.ids_cpu[i] = torch.clamp(
                 self.ids_cpu[i] + delta_cmd, min=self.ids_cpu_min, max=ids_cpu_max
             )
             delta_eff = float((self.ids_cpu[i] - prev).item())
 
-            if self.transition_ticks_remaining <= 0 and abs(delta_eff) > 1e-9:
+            if int(self.transition_ticks_remaining[i]) <= 0 and abs(delta_eff) > 1e-9:
                 self.ids_cpu_target[i] = self.ids_cpu[i]
                 gap = abs(float(self.ids_cpu_target[i].item()) - float(self.ids_cpu_settled[i].item()))
-                self.transition_ticks_total     = self._lookup_scaling_duration(gap)
-                self.transition_ticks_remaining = self.transition_ticks_total
+                dur = self._lookup_scaling_duration(gap)
+                self.transition_ticks_total[i]     = dur
+                self.transition_ticks_remaining[i] = dur
 
         # Effective allocation during a transition.
         # Both directions: IDS holds at settled for the full duration.
         # scale-up   (delta > 0): step_overhead = -delta < 0  → overhead_va  = delta  (VA  pays)
         # scale-down (delta < 0): step_overhead = -delta > 0  → overhead_ids = |delta| (IDS pays)
-        # Symmetric: the scaling side absorbs the overhead cost in both directions.
-        ids_cpu_eff = self.ids_cpu_settled.clone()   # IDS holds at settled in all cases
+        ids_cpu_eff = self.ids_cpu_settled.clone()
         step_overhead = [0.0] * self.n_edges
-        if self.transition_ticks_remaining > 0:
-            for i in range(self.n_edges):
-                target  = float(self.ids_cpu_target[i].item())
-                settled = float(self.ids_cpu_settled[i].item())
-                delta_to_settled = target - settled
+        for i in range(self.n_edges):
+            if int(self.transition_ticks_remaining[i]) > 0:
+                delta_to_settled = float(self.ids_cpu_target[i].item()) - float(self.ids_cpu_settled[i].item())
                 if abs(delta_to_settled) > 1e-9:
                     step_overhead[i] = -delta_to_settled
 
@@ -977,17 +1014,19 @@ class TorchRLEnvWrapper(EnvBase):
 
         # Simulate decision_interval internal timesteps
         for _ in range(self.decision_interval):
-            if self.transition_ticks_remaining > 0:
-                self.transition_ticks_remaining -= 1
-                if self.transition_ticks_remaining == 0:
-                    for i in range(self.n_edges):
+            # Advance per-edge transition counters independently
+            for i in range(self.n_edges):
+                if int(self.transition_ticks_remaining[i]) > 0:
+                    self.transition_ticks_remaining[i] -= 1
+                    if int(self.transition_ticks_remaining[i]) == 0:
                         self.ids_cpu_settled[i] = self.ids_cpu_target[i]
                         queued_delta = float(self.ids_cpu[i].item()) - float(self.ids_cpu_settled[i].item())
                         if abs(queued_delta) > 1e-9:
                             self.ids_cpu_target[i] = self.ids_cpu[i]
                             gap = abs(queued_delta)
-                            self.transition_ticks_total     = self._lookup_scaling_duration(gap)
-                            self.transition_ticks_remaining = self.transition_ticks_total
+                            dur = self._lookup_scaling_duration(gap)
+                            self.transition_ticks_total[i]     = dur
+                            self.transition_ticks_remaining[i] = dur
                             new_d = float(self.ids_cpu_target[i].item()) - float(self.ids_cpu_settled[i].item())
                             step_overhead[i] = -new_d if abs(new_d) > 1e-9 else 0.0
                             ids_cpu_eff[i] = float(self.ids_cpu_settled[i].item())
@@ -1028,7 +1067,12 @@ class TorchRLEnvWrapper(EnvBase):
         done = terminated | truncated
 
         t_internal_end = int(self.env.t)
-        qoe_mean = float(self.env.final_qoe)
+        # Episode-end: use final_qoe (SLO-penalised). Mid-episode: window mean QoE.
+        if terminated_flag and self.env.final_qoe > 0:
+            qoe_mean = float(self.env.final_qoe)
+        else:
+            w = self.env.history[-self.decision_interval * self.n_edges:]
+            qoe_mean = float(np.mean([m.qoe_mean for m in w])) if w else 0.0
 
         _f32 = lambda v: torch.tensor([v], dtype=torch.float32, device=self.device)
         return TensorDict(
@@ -1036,7 +1080,7 @@ class TorchRLEnvWrapper(EnvBase):
                 "observation":      obs,
                 "observation_flat": obs_flat,
                 "reward":           reward,
-                "qoe_mean":              _f32(qoe_mean * 30),
+                "qoe_mean":              _f32(qoe_mean),
                 "reward_lambda_res":     _f32(total_lambda_res    / n),
                 "reward_benign_col_dmg": _f32(total_benign_col_dmg / n),
                 "reward_qoe_penalty":    _f32(total_qoe_penalty   / n),
@@ -1072,19 +1116,15 @@ class TorchRLEnvWrapper(EnvBase):
                 elif k == "cpu_to_ids_ratio":
                     obs[i, j] = float(vals[-1])
                 elif k == "ema_mom":
-                    vals_nz = vals[vals != 0.0]
-                    if len(vals_nz) == 0:
-                        obs[i, j] = 0.0
-                        continue
-                    obs[i, j] = float(np.mean(vals_nz))
+                    # Include zeros: genuine zero momentum is valid signal, not noise
+                    obs[i, j] = float(np.mean(vals))
                 else:
                     obs[i, j] = float(np.mean(vals))
 
-        # Feature -2: remaining transition ticks normalised by max possible duration ∈ [0, 1]
-        # Using max_duration (not T_total) gives a consistent drain rate across all transition
-        # sizes, and encodes duration in the initial value (0.55 = T=300, 1.0 = T=544).
+        # Feature -2: per-edge remaining transition ticks ∈ [0, 1]
         max_dur = float(self.scaling_time_steps[-1])
-        obs[:, -2] = float(self.transition_ticks_remaining) / max(max_dur, 1.0)
+        for i in range(self.n_edges):
+            obs[i, -2] = float(self.transition_ticks_remaining[i].item()) / max(max_dur, 1.0)
 
         # Feature -1: per-edge delta in flight — (ids_cpu_target - ids_cpu_settled) / max_delta ∈ [-1, 1]
         max_delta = self.scale_step * (self.n_actions - 1) / 2.0
@@ -1138,7 +1178,7 @@ def _reactive_ids_cpu(env, ids_cpu: np.ndarray, decision_interval: int,
                        scale_step: float = 0.5, ids_cpu_min: float = 0.5) -> np.ndarray:
     """Compute new ids_cpu allocation using reactive thresholding on IDS utilization."""
     n_edges = len(env.edge_areas)
-    ids_cpu_max = np.array([e.budget.cpu - 0.5 for e in env.edge_areas], dtype=np.float32)
+    ids_cpu_max = np.array([e.budget.cpu - VA_CPU_RESERVE for e in env.edge_areas], dtype=np.float32)
 
     if len(env.history) < decision_interval * n_edges:
         return ids_cpu.copy()
@@ -1184,7 +1224,7 @@ def test_environment_run(cfg_path: str, plot=False, decision_interval: int = 500
         env.reset(seed=1000 + i)
 
         n_edges = len(env.edge_areas)
-        ids_cpu_max = np.array([e.budget.cpu - 0.5 for e in env.edge_areas], dtype=np.float32)
+        ids_cpu_max = np.array([e.budget.cpu - VA_CPU_RESERVE for e in env.edge_areas], dtype=np.float32)
 
         if method == "constant":
             ids_cpu = np.clip(np.full(n_edges, constant_cpu, dtype=np.float32), 0.0, ids_cpu_max)

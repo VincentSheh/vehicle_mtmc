@@ -1,4 +1,4 @@
-import pandas as pd
+import warnings
 import numpy as np
 from typing import Dict, List, Optional, Tuple, Any
 
@@ -28,7 +28,7 @@ class IDS:
 
         # cycles/packet at full CPU
         self.cycles_per_packet: float = cycles_per_packet
-        self.slot_ms: int = slot_ms
+        self.slot_ms: float = slot_ms
 
         # store (TPR, FPR) per attack type
         self.acc_tpr_fpr: Dict[str, Tuple[float, float]] = {}
@@ -37,6 +37,13 @@ class IDS:
             fnr = float(fnr)
             tpr = 1.0 - fnr
             self.acc_tpr_fpr[str(atk_type)] = (tpr, fpr)
+
+        if "default" not in self.acc_tpr_fpr:
+            warnings.warn(
+                "IDS accuracy_by_type missing 'default' entry; using TPR=1.0, FPR=0.0. "
+                "Add 'default: [FPR, FNR]' to ids_config.accuracy_by_type in your config.",
+                stacklevel=2,
+            )
 
     def effective_cycles_per_step(self, ids_cpu: float) -> float:
         return ids_cpu * self.total_cycles_per_ms_per_core * self.slot_ms
@@ -61,24 +68,26 @@ class IDS:
         speed = self.effective_speed_pkt_per_step(ids_cpu)
         coverage = float(min(1.0, speed / total_attack)) if total_attack > 0 else 1.0
 
-        # attacks: expected dropped = coverage * TPR * rate
-        attack_drop = 0.0
+        # attacks: stochastic drop = Binomial(n, coverage * TPR) — symmetric with user drops
         by_type = attack_dict.get("by_type", {})
-        default_entry = self.acc_tpr_fpr.get("default", (0.9, 0.01))
+        default_entry = self.acc_tpr_fpr.get("default", (1.0, 0.0))
         default_tpr, default_fpr = default_entry
 
         # Apply region-based accuracy overrides when provided
         eff_tpr = float(tpr_override) if tpr_override is not None else default_tpr
         eff_fpr = float(fpr_override) if fpr_override is not None else default_fpr
 
+        attack_drop = 0.0
         if by_type:
             for atk_type, lam in by_type.items():
                 type_tpr, _ = self.acc_tpr_fpr.get(str(atk_type), default_entry)
-                # blend: use override TPR if provided, else per-type TPR
                 used_tpr = eff_tpr if tpr_override is not None else type_tpr
-                attack_drop += coverage * used_tpr * float(lam)
+                p = min(1.0, max(0.0, coverage * used_tpr))
+                n_type = int(round(float(lam)))
+                attack_drop += float(np.random.binomial(n=n_type, p=p))
         else:
-            attack_drop = coverage * eff_tpr * total_attack
+            p = min(1.0, max(0.0, coverage * eff_tpr))
+            attack_drop = float(np.random.binomial(n=int(round(total_attack)), p=p))
 
         attack_pass = max(0.0, total_attack - attack_drop)
 
@@ -194,21 +203,6 @@ class VideoPipeline:
         ReID cost per object in cycles.
         """
         return self.reid_cycles_per_object
-
-    def total_cycles(
-        self,
-        detector: str,
-        base_resolution_h: int,
-        num_objects: float,
-    ) -> float:
-        """
-        Total VA cost in cycles:
-          detection + tracking
-        """
-        return (
-            self.detection_cycles(detector, base_resolution_h)
-            + float(num_objects) * self.reid_cycles_per_object
-        )
 
     def all_actions(self) -> List[Tuple[str, int]]:
         """
