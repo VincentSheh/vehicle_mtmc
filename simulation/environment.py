@@ -89,6 +89,9 @@ class StepMetrics:
     # Optional network impact metric
     I_net: float = 0.0
 
+    # Users routed to this edge's IDS after offloading (exec_user_in)
+    ids_user_in_rate: float = 0.0
+
     
 def load_globals(cfg: dict) -> GlobalConfig:
     g = cfg["globals"]
@@ -254,6 +257,7 @@ class Environment:
                     bw_utilization=float(cache["uplink_util"]),
 
                     overhead=float(overheads[i]),
+                    ids_user_in_rate=float(cache.get("exec_user_in", 0.0)),
                 )
             )
 
@@ -556,6 +560,7 @@ class Environment:
         # Annotate each cache entry with the original user count for weighting in step()
         for aid in self.area_ids:
             local_cache[aid]["original_user_in"] = va_original_user_in[aid]
+            local_cache[aid]["exec_user_in"] = exec_user_in[aid]
 
         # Restore attack state
         if disable_attack:
@@ -735,15 +740,11 @@ class TorchRLEnvWrapper(EnvBase):
         # self._step_count = 0
 
         self.obs_keys = [
-            "local_num_req",
-            # "attack_drop_rate",
-            "attack_in_rate",
+            "ids_user_in_rate",   # user requests routed to this edge's IDS after offloading
+            "attack_in_rate",     # attack requests routed to this edge's IDS after offloading
             "ema_mom",
             "cpu_to_ids_ratio",
-            # "va_cpu_utilization",
             "ids_cpu_utilization",
-            # "bw_utilization",
-            # "I_net",
         ]
 
         # Scaling state: pending signed CPU units of overhead remaining
@@ -766,8 +767,9 @@ class TorchRLEnvWrapper(EnvBase):
         self.transition_ticks_remaining: torch.Tensor   # 0 = settled for that edge
         self.transition_ticks_total:     torch.Tensor   # total ticks for current transition
 
-        assert len(self.obs_keys) + 2 == len(self.obs_keys) + 2, "obs_dim sentinel"
-        self.obs_dim = len(self.obs_keys) + 2   # +2: transition_ticks_norm, delta_in_flight_norm
+        # obs layout: [obs_keys(5)] [neighbor_ids_util, neighbor_delta, neighbor_atk_rate(3)]
+        #             [prev_slo_vio(1)] [transition_ticks_norm, delta_in_flight_norm(2)]
+        self.obs_dim = len(self.obs_keys) + 3 + 1 + 2  # 5+3+1+2 = 11
         self.obs_size = self.n_edges * self.obs_dim
 
         self.action_dim = self.n_edges
@@ -1090,32 +1092,68 @@ class TorchRLEnvWrapper(EnvBase):
             return obs
 
         records = self.env.history[-self.decision_interval * self.n_edges:]
-
         df = pd.DataFrame([m.__dict__ for m in records])
 
+        n_base = len(self.obs_keys)  # = 5
+
+        # ---- per-edge base features (obs_keys, indices 0..n_base-1) ----
         for i, area_id in enumerate(self.area_ids):
             g = df[df["area_id"] == area_id]
             if g.empty:
                 continue
             for j, k in enumerate(self.obs_keys):
                 vals = g[k].values
-                if k == "I_net":
-                    obs[i, j] = float(np.sum(vals))
-                elif k == "cpu_to_ids_ratio":
+                if k == "cpu_to_ids_ratio":
                     obs[i, j] = float(vals[-1])
-                elif k == "ema_mom":
-                    # Include zeros: genuine zero momentum is valid signal, not noise
-                    obs[i, j] = float(np.mean(vals))
                 else:
                     obs[i, j] = float(np.mean(vals))
 
-        # Feature -2: per-edge remaining transition ticks ∈ [0, 1]
+        # ---- neighbor state features (indices n_base, n_base+1, n_base+2) ----
+        # Precompute per-edge window means for efficient neighbor aggregation
+        edge_ids_util: Dict[str, float] = {}
+        edge_atk_rate: Dict[str, float] = {}
+        for area_id in self.area_ids:
+            g = df[df["area_id"] == area_id]
+            if g.empty:
+                edge_ids_util[area_id] = 0.0
+                edge_atk_rate[area_id] = 0.0
+            else:
+                edge_ids_util[area_id] = float(np.clip(np.mean(g["ids_cpu_utilization"].values), 0.0, 1.0))
+                edge_atk_rate[area_id] = float(np.mean(g["attack_in_rate"].values))
+
+        max_delta = self.scale_step * (self.n_actions - 1) / 2.0
+        for i, area_id in enumerate(self.area_ids):
+            nbr_utils: List[float] = []
+            nbr_deltas: List[float] = []
+            nbr_atk: List[float] = []
+            for j in range(self.n_edges):
+                if j == i:
+                    continue
+                other_id = self.area_ids[j]
+                nbr_utils.append(edge_ids_util[other_id])
+                nbr_atk.append(edge_atk_rate[other_id])
+                delta = float(self.ids_cpu_target[j].item()) - float(self.ids_cpu_settled[j].item())
+                nbr_deltas.append(float(np.clip(delta / max(max_delta, 1e-6), -1.0, 1.0)))
+
+            obs[i, n_base]     = float(np.mean(nbr_utils))  if nbr_utils  else 0.0
+            obs[i, n_base + 1] = float(np.mean(nbr_deltas)) if nbr_deltas else 0.0
+            obs[i, n_base + 2] = float(np.mean(nbr_atk))    if nbr_atk    else 0.0
+
+        # ---- previous-timestep SLO violation flag (index n_base+3) ----
+        for i, area_id in enumerate(self.area_ids):
+            g = df[df["area_id"] == area_id]
+            if g.empty:
+                obs[i, n_base + 3] = 0.0
+                continue
+            last_qoe = float(g["qoe_mean"].values[-1])
+            threshold = float(self.env.edge_areas[i].slo_threshold)
+            obs[i, n_base + 3] = 1.0 if last_qoe < threshold else 0.0
+
+        # ---- transition state features (indices -2, -1) ----
         max_dur = float(self.scaling_time_steps[-1])
         for i in range(self.n_edges):
             obs[i, -2] = float(self.transition_ticks_remaining[i].item()) / max(max_dur, 1.0)
 
-        # Feature -1: per-edge delta in flight — (ids_cpu_target - ids_cpu_settled) / max_delta ∈ [-1, 1]
-        max_delta = self.scale_step * (self.n_actions - 1) / 2.0
         for i in range(self.n_edges):
             delta_in_flight = float(self.ids_cpu_target[i].item()) - float(self.ids_cpu_settled[i].item())
             obs[i, -1] = float(np.clip(delta_in_flight / max(max_delta, 1e-6), -1.0, 1.0))
