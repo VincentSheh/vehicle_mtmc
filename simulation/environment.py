@@ -120,10 +120,12 @@ class Environment:
         t_max: int,
         seed: int = 0,
         offload_mode: str = "balance",
+        va_attack_offload: bool = False,
     ):
         self.edge_areas = edge_areas
         self.delay_ms = np.asarray(delay_ms, dtype=np.float32)
         self.offload_mode = str(offload_mode)  # "none" | "balance" | "delay_workload" | "full"
+        self.va_attack_offload = bool(va_attack_offload)
         self.t_max = int(t_max)
         self.t = 0
         self.history: List[StepMetrics] = []
@@ -492,51 +494,96 @@ class Environment:
             exec_atk_bw_mb[aid]  = exec_atk_bw_mb_pre[aid] * ids_atk_pass
             exec_atk_cycles[aid] = exec_atk_cycles_pre[aid] * ids_atk_pass
 
-        # Stage C: VA offload plan — only benign users are offloaded.
-        # Admitted attacks already consume local resources and are not forwarded.
-        W_va = {aid: float(admitted_user[aid]) for aid in self.area_ids}
-        # Deduct admitted-attack CPU from VA capacity (uses corrected cross-edge attack cycles)
-        c_va: Dict[str, float] = {}
-        for aid in self.area_ids:
-            edge = edges[aid]
-            atk_cycles_per_ms = exec_atk_cycles[aid] / edge.slot_ms
-            if self.offload_mode in ("cto", "cto_acc"):
-                avail_cycles = max(
-                    0.0,
-                    float(edge.va_cpu) * edge.cpu_cycle_per_ms * edge.slot_ms
-                    - exec_atk_cycles[aid],
-                )
-                min_det_cycles = min(edge.pipeline.det_cycles.values())
-                c_va[aid] = avail_cycles / min_det_cycles if min_det_cycles > 0 else 0.0
-            else:
-                c_va[aid] = max(0.0, float(edge.va_cpu) - atk_cycles_per_ms / edge.cpu_cycle_per_ms)
-        plan_va = self._make_offload_plan(W_va, c_va, stage="va")
-
+        # Stage C: VA offload plan.
+        # Mode 1 (va_attack_offload=False): only benign users are offloaded; admitted attacks
+        #   consume local VA capacity before the offload plan is built.
+        # Mode 2 (va_attack_offload=True): attacks are offloaded together with benign users;
+        #   VA capacity is offered at full value and attack resource consumption is distributed
+        #   across VA executors after routing.
         va_user_in: Dict[str, int] = {aid: 0 for aid in self.area_ids}
         va_atk_in:  Dict[str, int] = {aid: 0 for aid in self.area_ids}
         va_local_user_in: Dict[str, int] = {aid: 0 for aid in self.area_ids}
         va_original_user_in: Dict[str, int] = {aid: 0 for aid in self.area_ids}
         va_remote_d_num: Dict[str, float] = {aid: 0.0 for aid in self.area_ids}
         va_remote_n:     Dict[str, float] = {aid: 0.0 for aid in self.area_ids}
-        # Admitted attacks stay local — accumulate their bw/cycles at their own edge only
-        va_atk_bw_mb:  Dict[str, float] = {aid: float(exec_atk_bw_mb[aid])  for aid in self.area_ids}
-        va_atk_cycles: Dict[str, float] = {aid: float(exec_atk_cycles[aid]) for aid in self.area_ids}
-        for src in self.area_ids:
-            u = float(admitted_user[src])
-            local_frac    = float(admitted_local_user[src]) / max(u, 1.0)
-            ids_pass_rate = u / max(float(exec_user_in[src]), 1.0)
-            # Admitted attacks stay at src; also record their count locally
-            va_atk_in[src] += int(admitted_atk[src])
-            for dst, n_sent in plan_va.flow.get(src, {}).items():
-                n_sent_f = float(n_sent)
-                va_user_in[dst] += n_sent
-                va_original_user_in[dst] += int(round(n_sent_f / max(ids_pass_rate, 1e-9)))
-                if src == dst:
-                    va_local_user_in[dst] += int(round(n_sent_f * local_frac))
+
+        if not self.va_attack_offload:
+            # Mode 1: attacks stay at their IDS executor; capacity pre-reduced by attack load.
+            W_va = {aid: float(admitted_user[aid]) for aid in self.area_ids}
+            c_va: Dict[str, float] = {}
+            for aid in self.area_ids:
+                edge = edges[aid]
+                atk_cycles_per_ms = exec_atk_cycles[aid] / edge.slot_ms
+                if self.offload_mode in ("cto", "cto_acc"):
+                    avail_cycles = max(
+                        0.0,
+                        float(edge.va_cpu) * edge.cpu_cycle_per_ms * edge.slot_ms
+                        - exec_atk_cycles[aid],
+                    )
+                    min_det_cycles = min(edge.pipeline.det_cycles.values())
+                    c_va[aid] = avail_cycles / min_det_cycles if min_det_cycles > 0 else 0.0
                 else:
-                    d = float(self.prop_delay.get((src, dst), 0.0))
-                    va_remote_d_num[dst] += d * n_sent_f
-                    va_remote_n[dst]     += n_sent_f
+                    c_va[aid] = max(0.0, float(edge.va_cpu) - atk_cycles_per_ms / edge.cpu_cycle_per_ms)
+            plan_va = self._make_offload_plan(W_va, c_va, stage="va")
+
+            # Admitted attacks stay local — seed bw/cycles at their IDS executor
+            va_atk_bw_mb:  Dict[str, float] = {aid: float(exec_atk_bw_mb[aid])  for aid in self.area_ids}
+            va_atk_cycles: Dict[str, float] = {aid: float(exec_atk_cycles[aid]) for aid in self.area_ids}
+            for src in self.area_ids:
+                u = float(admitted_user[src])
+                local_frac    = float(admitted_local_user[src]) / max(u, 1.0)
+                ids_pass_rate = u / max(float(exec_user_in[src]), 1.0)
+                va_atk_in[src] += int(admitted_atk[src])
+                for dst, n_sent in plan_va.flow.get(src, {}).items():
+                    n_sent_f = float(n_sent)
+                    va_user_in[dst] += n_sent
+                    va_original_user_in[dst] += int(round(n_sent_f / max(ids_pass_rate, 1e-9)))
+                    if src == dst:
+                        va_local_user_in[dst] += int(round(n_sent_f * local_frac))
+                    else:
+                        d = float(self.prop_delay.get((src, dst), 0.0))
+                        va_remote_d_num[dst] += d * n_sent_f
+                        va_remote_n[dst]     += n_sent_f
+        else:
+            # Mode 2: attacks offloaded with benign users; full VA capacity offered.
+            W_va = {aid: float(admitted_user[aid] + admitted_atk[aid]) for aid in self.area_ids}
+            c_va = {}
+            for aid in self.area_ids:
+                edge = edges[aid]
+                if self.offload_mode in ("cto", "cto_acc"):
+                    avail_cycles = float(edge.va_cpu) * edge.cpu_cycle_per_ms * edge.slot_ms
+                    min_det_cycles = min(edge.pipeline.det_cycles.values())
+                    c_va[aid] = avail_cycles / min_det_cycles if min_det_cycles > 0 else 0.0
+                else:
+                    c_va[aid] = float(edge.va_cpu)
+            plan_va = self._make_offload_plan(W_va, c_va, stage="va")
+
+            # Attack bw/cycles distributed to VA executors proportional to routed attack count
+            va_atk_bw_mb  = {aid: 0.0 for aid in self.area_ids}
+            va_atk_cycles = {aid: 0.0 for aid in self.area_ids}
+            for src in self.area_ids:
+                u = float(admitted_user[src])
+                a = float(admitted_atk[src])
+                tot = max(u + a, 1.0)
+                local_frac    = float(admitted_local_user[src]) / max(u, 1.0)
+                ids_pass_rate = u / max(float(exec_user_in[src]), 1.0)
+                for dst, n_sent in plan_va.flow.get(src, {}).items():
+                    n_sent_f = float(n_sent)
+                    nu = int(round(n_sent_f * u / tot))
+                    na = int(round(n_sent_f * a / tot))
+                    va_user_in[dst] += nu
+                    va_atk_in[dst]  += na
+                    va_original_user_in[dst] += int(round(float(nu) / max(ids_pass_rate, 1e-9)))
+                    if src == dst:
+                        va_local_user_in[dst] += int(round(float(nu) * local_frac))
+                    else:
+                        d = float(self.prop_delay.get((src, dst), 0.0))
+                        va_remote_d_num[dst] += d * n_sent_f
+                        va_remote_n[dst]     += n_sent_f
+                    # Distribute attack bw/cycles proportional to attack fraction routed
+                    atk_frac = float(na) / max(a, 1.0)
+                    va_atk_bw_mb[dst]  += exec_atk_bw_mb[src]  * atk_frac
+                    va_atk_cycles[dst] += exec_atk_cycles[src] * atk_frac
         va_d_remote_avg: Dict[str, float] = {
             aid: va_remote_d_num[aid] / va_remote_n[aid] if va_remote_n[aid] > 0 else 0.0
             for aid in self.area_ids
@@ -689,6 +736,7 @@ def build_env_from_cfg(cfg: dict):
         t_max=cfg["run"]["t_max"],
         seed=cfg["run"]["seed"],
         offload_mode=_resolve_offload_mode(cfg["globals"]),
+        va_attack_offload=bool(cfg["globals"].get("va_attack_offload", False)),
     )
     env._max_prop_delay_ms = float(cfg["globals"].get("max_prop_delay_ms", 1e9))
     w = cfg["globals"].get("offload_weights", {})
@@ -996,7 +1044,6 @@ class TorchRLEnvWrapper(EnvBase):
                     step_overhead[i] = -delta_to_settled
 
         total_reward = 0.0
-        total_lambda_res = 0.0
         total_benign_col_dmg = 0.0
         total_qoe_penalty = 0.0
         terminated_flag = False
@@ -1026,9 +1073,8 @@ class TorchRLEnvWrapper(EnvBase):
 
             self.env.step(ids_cpu_eff, step_overhead)
             r = self._build_reward()
-            total_reward           += float(r["reward"].item())
-            total_lambda_res       += r["lambda_res"]
-            total_benign_col_dmg   += r["benign_col_dmg"]
+            total_reward         += float(r["reward"].item())
+            total_benign_col_dmg += r["benign_col_dmg"]
             total_qoe_penalty      += r["qoe_penalty"]
             steps += 1
             if self.env.t >= self.env.t_max:
@@ -1038,13 +1084,20 @@ class TorchRLEnvWrapper(EnvBase):
         n = max(1, steps)
         reward = torch.tensor([total_reward / n], dtype=torch.float32, device=self.device)
 
-        # QoE violation rate over the decision window
+        # Aggregate metrics over the completed decision window from history
         window = self.env.history[-self.decision_interval * self.n_edges:]
         if window:
-            qoes = np.asarray([m.qoe_mean for m in window], dtype=np.float32)
+            qoes     = np.asarray([m.qoe_mean       for m in window], dtype=np.float32)
+            atk_in   = np.asarray([m.attack_in_rate  for m in window], dtype=np.float32)
+            atk_drop = np.asarray([m.attack_drop_rate for m in window], dtype=np.float32)
             qoe_vio_rate = float(np.mean(qoes < self.reward_q_th))
+            # lambda_res: fraction of attacks that pass through, computed over attack-present
+            # ticks only so no-attack windows don't dilute the metric toward zero.
+            atk_in_sum = float(atk_in.sum())
+            lambda_res_metric = float((atk_in - atk_drop).clip(0).sum() / atk_in_sum) if atk_in_sum > 1e-6 else 0.0
         else:
             qoe_vio_rate = 0.0
+            lambda_res_metric = 0.0
 
         # 3) Build aggregated outputs
         obs = self._build_observation().to(self.device)
@@ -1071,7 +1124,7 @@ class TorchRLEnvWrapper(EnvBase):
                 "observation_flat": obs_flat,
                 "reward":           reward,
                 "qoe_mean":              _f32(qoe_mean),
-                "reward_lambda_res":     _f32(total_lambda_res    / n),
+                "reward_lambda_res":     _f32(lambda_res_metric),
                 "reward_benign_col_dmg": _f32(total_benign_col_dmg / n),
                 "reward_qoe_penalty":    _f32(total_qoe_penalty   / n),
                 "qoe_vio_rate":          _f32(qoe_vio_rate),
@@ -1246,7 +1299,7 @@ def test_environment_run(cfg_path: str, plot=False, decision_interval: int = 500
     env = build_env_base(cfg_path)
 
     dfs = []
-    for i in range(5):
+    for i in range(10):
         env.reset(seed=1000 + i)
 
         n_edges = len(env.edge_areas)

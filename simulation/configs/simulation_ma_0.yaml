@@ -30,13 +30,19 @@ globals:
     non_defendable_bw_const: 0.0
 
   reward:
-    alpha_inv: 5.0   # QoE shortfall normalizer        (alpha = 1/alpha_inv = 10)
-    beta_inv:  2.5   # Attack residual normalizer       (beta  = 1/beta_inv  =  5)
-    gamma_inv: 15    # Benign collateral normalizer     (gamma = 1/gamma_inv ≈ 8.33)
-    q_th:      0.35  # QoE shortfall threshold
+    alpha_inv: 9.0   # QoE shortfall normalizer   
+    beta_inv:  5.0   # Attack residual normalizer  
+    gamma_inv: 8.0   # Benign collateral normalizer
+    q_th:      0.35   # QoE shortfall threshold
 
   offload_mode: "cto"  # "none" | "cto" | "cto_acc" | "delay_workload" | "full"
-  offload_atk: true  
+  # VA-stage attack offload mode:
+  #   false (default) — admitted attacks stay at their IDS executor; VA capacity is
+  #                     pre-reduced by attack load before the benign-user offload plan.
+  #   true            — attacks are offloaded together with benign users; VA capacity
+  #                     is offered at full value and attack resource consumption is
+  #                     distributed across VA executors after routing.
+  va_attack_offload: false
   max_prop_delay_ms: 50.0        # hard delay cutoff for modes delay_workload / full
 
   # Score-based offload weights (modes delay_workload / full)

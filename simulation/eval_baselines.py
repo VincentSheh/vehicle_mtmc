@@ -57,66 +57,72 @@ DISPLAY_NAMES: Dict[str, str] = {
     # legacy / custom names fall through to raw name
 }
 
-def plot_ts_continuous(results: Dict[str, Dict[str, np.ndarray]], outpath: Path, slo_qoe_min: float = 0.2, beta=3):
-    fig, axes = plt.subplots(12, 1, figsize=(15, 22), sharex=True)
-
-    panels = [
-        ("qoe", "QoE"),
+def plot_ts_continuous(
+    results: Dict[str, Dict[str, np.ndarray]],
+    outpath: Path,
+    area_ids: List[str],
+    slo_qoe_min: float = 0.2,
+    beta: int = 3,
+):
+    static_panels = [
         ("benign_col_dmg", "Benign Collateral Damage"),
-        ("local_num_req", "Local #Req"),
+        ("local_num_req",  "Local #Req"),
         ("attack_in_rate", "Attack in rate"),
         ("attack_drop_rate", "Attack drop rate"),
-        ("cpu_util", "CPU Utilization"),
+        ("cpu_util",       "CPU Utilization"),
         ("cpu_to_ids_ratio", "CPU→IDS Ratio"),
-        ("ema_mom", "EMA Momentum"),
-        ("reward_lambda_res", "Raw Factor: λ_res (leakage)"),
-        ("reward_benign_col_dmg", "Raw Factor: Benign Collateral Dmg"),
-        ("reward_qoe_penalty", "Raw Factor: QoE Shortfall"),
     ]
 
-    for ax, (k, ylabel) in zip(axes, panels):
+    n_edges  = len(area_ids)
+    n_panels = n_edges + len(static_panels)
+    fig, axes = plt.subplots(n_panels, 1, figsize=(15, 3 * n_panels), sharex=True)
+
+    # --- per-edge QoE panels ---
+    for ei, area_id in enumerate(area_ids):
+        ax = axes[ei]
+        for method, series in results.items():
+            qoe_pe = series.get("qoe_per_edge", None)
+            if qoe_pe is not None and qoe_pe.ndim == 2 and qoe_pe.shape[1] > ei:
+                y = qoe_pe[:, ei]
+            else:
+                y = series.get("qoe", None)
+            if y is None or y.size == 0:
+                continue
+
+            x = np.arange(len(y))
+            y_valid = y[np.isfinite(y)]
+            avg_qoe  = float(np.nanmean(y_valid)) if y_valid.size else 0.0
+            vio_rate = float(np.nanmean((y_valid < slo_qoe_min).astype(np.float32))) if y_valid.size else 0.0
+            ax.plot(x, y, label=f"{method} (avg={avg_qoe:.3f}, vio={vio_rate:.2%})")
+
+        ax.axhline(slo_qoe_min, color="red", linestyle="--", alpha=0.4, linewidth=1)
+        ax.set_ylabel(f"QoE [{area_id}]")
+        ax.grid(True, alpha=0.3)
+        if ei == 0:
+            ax.legend(loc="upper right")
+
+    # --- static panels ---
+    for ax, (k, ylabel) in zip(axes[n_edges:], static_panels):
         for method, series in results.items():
             y_raw = series.get(k, None)
             if y_raw is None or y_raw.size == 0:
                 continue
-
-            # y_raw shape: (T,) or (T, E)
             if y_raw.ndim == 2:
-                y = np.mean(y_raw, axis=1)  # Mean across edges
-                y_min = np.min(y_raw, axis=1)
-                y_max = np.max(y_raw, axis=1)
+                y     = np.mean(y_raw, axis=1)
+                y_min = np.min(y_raw,  axis=1)
+                y_max = np.max(y_raw,  axis=1)
             else:
                 y = y_raw
                 y_min = y_max = None
-
-            x = np.arange(len(y))
-
-            if k == "qoe":
-                y_valid = y[np.isfinite(y)]
-                avg_qoe = float(np.nanmean(y_valid)) if y_valid.size else 0.0
-                
-                # Prefer pre-calculated per-step violation rate if available
-                vio_series = series.get("qoe_vio_rate", None)
-                if vio_series is not None and vio_series.size > 0:
-                    vio_rate = float(np.mean(vio_series))
-                elif y_raw.ndim == 2:
-                    vio_rate = float(np.mean(y_raw < float(slo_qoe_min)))
-                else:
-                    vio_rate = float(np.nanmean((y_valid < float(slo_qoe_min)).astype(np.float32))) if y_valid.size else 0.0
-                
-                label = f"{method} (avg={avg_qoe:.3f}, vio={vio_rate:.2%})"
-            else:
-                label = method
-
-            line = ax.plot(x, y, label=label)[0]
-            if y_min is not None and y_max is not None:
+            x    = np.arange(len(y))
+            line = ax.plot(x, y, label=method)[0]
+            if y_min is not None:
                 ax.fill_between(x, y_min, y_max, color=line.get_color(), alpha=0.15)
 
         ax.set_ylabel(ylabel)
         ax.grid(True, alpha=0.3)
 
     axes[-1].set_xlabel("decision step")
-    axes[0].legend(loc="upper right")
     plt.tight_layout()
     plt.savefig(outpath, dpi=200)
     plt.close()
@@ -159,11 +165,14 @@ def plot_qoe_vio_bars(results: Dict[str, Dict[str, np.ndarray]],
         else:
             avg_benign_col_dmg.append(float(np.mean(bcd_raw)))
 
-        # Attack Drop %
-        # 1 - lambda_res (leakage)
-        lres_raw = series.get("reward_lambda_res", None)
-        if lres_raw is not None and lres_raw.size > 0:
-            avg_attack_drop_pct.append(float(1.0 - np.mean(lres_raw)))
+        # Attack Drop % — computed from raw rates so no-attack windows don't inflate the bar
+        # (reward_lambda_res = 0 on no-attack windows, which reads as "100% dropped" when inverted)
+        atk_in_raw  = series.get("attack_in_rate",  None)
+        atk_drp_raw = series.get("attack_drop_rate", None)
+        if atk_in_raw is not None and atk_drp_raw is not None:
+            total_in  = float(atk_in_raw.sum())
+            total_drp = float(atk_drp_raw.sum())
+            avg_attack_drop_pct.append(total_drp / total_in if total_in > 1e-6 else 0.0)
         else:
             avg_attack_drop_pct.append(np.nan)
 
@@ -391,8 +400,9 @@ def run_episode(
     env.reset(seed)
     policy.reset()
 
-    n_edges     = len(env.edge_areas)
-    ids_cpu_max = np.array([e.budget.cpu - 0.5 for e in env.edge_areas], dtype=np.float32)
+    n_edges      = len(env.edge_areas)
+    area_ids_run = [e.area_id for e in env.edge_areas]
+    ids_cpu_max  = np.array([e.budget.cpu - 0.5 for e in env.edge_areas], dtype=np.float32)
     effective_min = float(policy.min_cpu_override) if policy.min_cpu_override is not None else ids_cpu_min
 
     if initial_ids_cpu is not None:
@@ -416,6 +426,7 @@ def run_episode(
     decisions = math.ceil(int(cfg["run"]["t_max"]) / decision_interval)
 
     qoe_ts                = []
+    qoe_per_edge_ts       = []
     benign_col_dmg_ts     = []
     cpu_util_ts           = []
     local_num_req_ts      = []
@@ -534,6 +545,11 @@ def run_episode(
 
         qoe_ts.append(qoe_mean)
         qoe_vio_rate_ts.append(v_rate)
+        per_edge_qoes = []
+        for aid in area_ids_run:
+            g = df[df["area_id"] == aid] if "area_id" in df.columns else pd.DataFrame()
+            per_edge_qoes.append(float(np.mean(g["qoe_mean"].values)) if not g.empty and "qoe_mean" in g.columns else 0.0)
+        qoe_per_edge_ts.append(per_edge_qoes)
         benign_col_dmg_ts.append(bcd_mean)
         cpu_util_ts.append(cpu_util)
         local_num_req_ts.append(_col_mean("local_num_req"))
@@ -572,6 +588,7 @@ def run_episode(
 
     res = {
         "qoe":                  np.asarray(qoe_ts,                dtype=np.float32),
+        "qoe_per_edge":         np.asarray(qoe_per_edge_ts,       dtype=np.float32),
         "qoe_vio_rate":         np.asarray(qoe_vio_rate_ts,       dtype=np.float32),
         "benign_col_dmg":       np.asarray(benign_col_dmg_ts,     dtype=np.float32),
         "cpu_util":             np.asarray(cpu_util_ts,           dtype=np.float32),
@@ -689,17 +706,20 @@ def main():
             )
             last_ids_cpu[mname] = final_ids
             for k, v in ep_result.items():
-                results[mname][k] = np.concatenate(
-                    [results[mname].get(k, np.array([], dtype=np.float32)), v]
-                )
+                existing = results[mname].get(k)
+                if existing is None or existing.size == 0:
+                    results[mname][k] = v
+                else:
+                    results[mname][k] = np.concatenate([existing, v], axis=0)
 
     # Remap to display names for plots and summary
     display_results = {DISPLAY_NAMES.get(m, m): results[m] for m in methods}
 
-    # Plot — reuse the plotting functions from old_policy.py
+    area_ids = [e.area_id for e in env.edge_areas]
+
     ts_path      = outdir / "qoe_ts.png"
     summary_path = outdir / "summary.png"
-    plot_ts_continuous(display_results, ts_path,      slo_qoe_min=reward_q_th, beta=3)
+    plot_ts_continuous(display_results, ts_path, area_ids=area_ids, slo_qoe_min=reward_q_th, beta=3)
     plot_qoe_vio_bars( display_results, summary_path, qoe_slo_min=reward_q_th, beta=3)
 
     print(f"Plots saved to {outdir}/")
@@ -711,15 +731,17 @@ def main():
     print("-" * len(header))
     for mname in methods:
         r = results[mname]
-        lres  = float(np.mean(r['reward_lambda_res']))
+        atk_in_sum  = float(r['attack_in_rate'].sum())
+        atk_drp_sum = float(r['attack_drop_rate'].sum())
+        atk_drop_pct = atk_drp_sum / atk_in_sum if atk_in_sum > 1e-6 else 0.0
         label = DISPLAY_NAMES.get(mname, mname)
         print(
             f"{label:<{col_w}} "
             f"{float(np.mean(r['qoe_vio_rate'])):>12.1%} "
             f"{float(np.mean(r['reward'])):>12.4f} "
             f"{float(np.mean(r['reward_qoe_penalty'])):>12.4f} "
-            f"{1.0 - lres:>12.1%} "   # attack drop % — matches summary.png bar
-            f"{lres:>12.4f}"           # raw pass-through fraction (all ticks, matches training)
+            f"{atk_drop_pct:>12.1%} "
+            f"{1.0 - atk_drop_pct:>12.4f}"
         )
 
 
