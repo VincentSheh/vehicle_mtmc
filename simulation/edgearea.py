@@ -120,6 +120,8 @@ class EdgeArea:
         unique attack type.
         """
 
+        # self.ids_cpu = 0.5
+        # self.va_cpu = self.budget.cpu - self.ids_cpu
         if seed is not None:
             self.rng = np.random.default_rng(seed)
         elif not hasattr(self, "rng"):

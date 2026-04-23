@@ -1,22 +1,14 @@
 """
-MAPPO-ish (CTDE) Recurrent PPO using TorchRL LSTMModule
-- No MultiAgentNetBase
-- No manual LSTMCell loops
-- Actor recurrence is shared across agents by flattening (B*E) into the batch
-- Critic recurrence is per-env (CTDE) on observation_flat
+Shared infrastructure for MAPPO-ish (CTDE) Recurrent PPO.
 
-Key invariants (so it learns)
-- At time t, stored ("agents","recurrent_state_h/c") are the INPUT states used to compute logits_t and sample a_t
-- Policy writes NEXT hidden states to ("next","agents","recurrent_state_h/c")
-- Env Transform carries next hidden back to current hidden each step
-- PPO update recomputes logits on sampled sequences using the SAME h_t at the start of the sequence
+Subclass EdgeIDSParallelEnv and implement _compute_step_reward to choose
+between independent (per-agent) and centralised (shared scalar) reward modes.
 """
 
-from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, Optional, Tuple, List, Type
 
 import yaml
 import numpy as np
@@ -41,8 +33,8 @@ from torchrl.modules import ProbabilisticActor
 from environment import build_env_base, VA_CPU_RESERVE
 from logger import wandb_init, wandb_log_obs_steps
 import wandb
+import argparse
 
-# Keys fed through the LSTM; everything else is a static bypass
 TEMPORAL_OBS_KEYS = {"ids_user_in_rate", "attack_in_rate", "neighbor_atk_rate"}
 
 
@@ -131,7 +123,6 @@ class EdgeIDSParallelEnv(PZooParallelEnv):
             "transition_ticks_norm",
             "delta_in_flight_norm",
         ]
-        # obs layout matches self.obs_keys
         self.obs_dim = len(self.obs_keys)
 
         self.scaling_time_steps = list(_cfg["globals"].get("scaling_time_step", [300, 450, 498, 544]))
@@ -154,6 +145,20 @@ class EdgeIDSParallelEnv(PZooParallelEnv):
         self.ids_cpu_target = self.ids_cpu.copy()
         self.transition_ticks_remaining = np.zeros(self.n_edges, dtype=np.int32)
         self.transition_ticks_total = np.ones(self.n_edges, dtype=np.int32)
+
+    def _compute_step_reward(
+        self,
+        lres: np.ndarray,
+        bcd: np.ndarray,
+        qsf: np.ndarray,
+        vio: np.ndarray,
+        attack_in: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Return (rew[E], lres_acc[E], bcd_acc[E], qsf_acc[E], vio_acc[E]).
+
+        Subclasses implement IMA (per-agent) or CMA (shared scalar) variants.
+        """
+        raise NotImplementedError
 
     def _lookup_scaling_duration(self, magnitude: float) -> int:
         for i, q in enumerate(self.scaling_quanta):
@@ -181,12 +186,12 @@ class EdgeIDSParallelEnv(PZooParallelEnv):
         self.transition_ticks_remaining = np.zeros(self.n_edges, dtype=np.int32)
         self.transition_ticks_total = np.ones(self.n_edges, dtype=np.int32)
 
-        obs_mat = self._build_observation()  # [E, D]
-        qoe = self._qoe_vec()                # [E]
+        obs_mat = self._build_observation()
+        qoe = self._qoe_vec()
 
         observations = {
             aid: {
-                "obs": obs_mat[i].copy(), 
+                "obs": obs_mat[i].copy(),
                 "qoe_mean": np.array([qoe[i]], dtype=np.float32),
                 "reward_lambda_res": np.zeros(1, dtype=np.float32),
                 "reward_benign_col_dmg": np.zeros(1, dtype=np.float32),
@@ -209,7 +214,6 @@ class EdgeIDSParallelEnv(PZooParallelEnv):
                 raise ValueError(f"Invalid action {a} for agent {aid}, expected 0..{self.n_actions-1}")
             act_vec[i] = a
 
-        # RL action drives allocation
         delta_cmd = (act_vec.astype(np.float32) - ((self.n_actions - 1) / 2.0)) * self.scale_step
 
         for i in range(self.n_edges):
@@ -227,7 +231,6 @@ class EdgeIDSParallelEnv(PZooParallelEnv):
                 self.transition_ticks_total[i]     = dur
                 self.transition_ticks_remaining[i] = dur
 
-        # Effective allocation during a transition.
         ids_cpu_eff = self.ids_cpu_settled.copy()
         step_overhead = np.zeros(self.n_edges, dtype=np.float32)
         for i in range(self.n_edges):
@@ -236,7 +239,7 @@ class EdgeIDSParallelEnv(PZooParallelEnv):
                 if abs(delta_to_settled) > 1e-9:
                     step_overhead[i] = -delta_to_settled
 
-        total_rew = np.zeros(self.n_edges, dtype=np.float32)
+        total_rew  = np.zeros(self.n_edges, dtype=np.float32)
         total_lres = np.zeros(self.n_edges, dtype=np.float32)
         total_bcd  = np.zeros(self.n_edges, dtype=np.float32)
         total_qsf  = np.zeros(self.n_edges, dtype=np.float32)
@@ -246,7 +249,6 @@ class EdgeIDSParallelEnv(PZooParallelEnv):
         steps = 0
 
         for _ in range(self.decision_interval):
-            # Advance per-edge transition counters independently
             for i in range(self.n_edges):
                 if self.transition_ticks_remaining[i] > 0:
                     self.transition_ticks_remaining[i] -= 1
@@ -267,56 +269,49 @@ class EdgeIDSParallelEnv(PZooParallelEnv):
                             step_overhead[i] = 0.0
 
             self.env.step(ids_cpu_eff.tolist(), step_overhead.tolist())
-            
-            # --- reward components ---
+
             if len(self.env.history) >= self.n_edges:
                 last_block = self.env.history[-self.n_edges:]
-                qoe        = np.asarray([float(m.qoe_mean)       for m in last_block], dtype=np.float32)
-                bcd        = np.asarray([float(m.benign_col_dmg)  for m in last_block], dtype=np.float32)
-                attack_in  = np.asarray([float(m.attack_in_rate)  for m in last_block], dtype=np.float32)
+                qoe        = np.asarray([float(m.qoe_mean)        for m in last_block], dtype=np.float32)
+                bcd        = np.asarray([float(m.benign_col_dmg)   for m in last_block], dtype=np.float32)
+                attack_in  = np.asarray([float(m.attack_in_rate)   for m in last_block], dtype=np.float32)
                 attack_drop = np.asarray([float(m.attack_drop_rate) for m in last_block], dtype=np.float32)
 
                 attack_pass = np.maximum(0.0, attack_in - attack_drop)
-                lres  = np.where(attack_in > 1e-6, attack_pass / attack_in, 0.0).astype(np.float32)
-                qsf = np.maximum(0.0, self.threshold - qoe) / max(self.threshold, 1e-6)
+                lres = np.where(attack_in > 1e-6, attack_pass / attack_in, 0.0).astype(np.float32)
+                qsf  = np.maximum(0.0, self.threshold - qoe) / max(self.threshold, 1e-6)
+                vio  = (qoe < self.threshold).astype(np.float32)
 
-                active = attack_in > 1e-6
-                r_lres = float(np.mean(lres[active])) if np.any(active) else 0.0
-                r_bcd = float(np.mean(bcd))
-                r_qsf = float(np.mean(qsf))
-                r_vio = float(np.mean((qoe < self.threshold).astype(np.float32)))
-
-                rew_scalar = -(self.alpha * r_qsf + self.beta * r_lres + self.gamma_r * r_bcd)
-                
-                total_rew  += rew_scalar
-                total_lres += r_lres
-                total_bcd  += r_bcd
-                total_qsf  += r_qsf
-                total_vio  += r_vio
+                rew_d, lres_d, bcd_d, qsf_d, vio_d = self._compute_step_reward(
+                    lres, bcd, qsf, vio, attack_in
+                )
+                total_rew  += rew_d
+                total_lres += lres_d
+                total_bcd  += bcd_d
+                total_qsf  += qsf_d
+                total_vio  += vio_d
 
             steps += 1
             if self.env.t >= self.env.t_max:
                 terminated_flag = True
                 break
 
-        rew_agents = (total_rew / max(1, steps)).astype(np.float32, copy=False)
-        rewards = {aid: float(rew_agents[i]) for i, aid in enumerate(self.area_ids)}
+        rew_agents = (total_rew  / max(1, steps)).astype(np.float32, copy=False)
+        info_lres  = (total_lres / max(1, steps)).astype(np.float32, copy=False)
+        info_bcd   = (total_bcd  / max(1, steps)).astype(np.float32, copy=False)
+        info_qsf   = (total_qsf  / max(1, steps)).astype(np.float32, copy=False)
+        info_vio   = (total_vio  / max(1, steps)).astype(np.float32, copy=False)
 
+        rewards      = {aid: float(rew_agents[i]) for i, aid in enumerate(self.area_ids)}
         terminations = {aid: bool(terminated_flag) for aid in self.area_ids}
-        truncations = {aid: False for aid in self.area_ids}
-        
-        info_lres = (total_lres / max(1, steps)).astype(np.float32, copy=False)
-        info_bcd  = (total_bcd  / max(1, steps)).astype(np.float32, copy=False)
-        info_qsf  = (total_qsf  / max(1, steps)).astype(np.float32, copy=False)
-        info_vio  = (total_vio  / max(1, steps)).astype(np.float32, copy=False)
-
+        truncations  = {aid: False for aid in self.area_ids}
         infos = {
             aid: {
                 "reward_lambda_res":     float(info_lres[i]),
                 "reward_benign_col_dmg": float(info_bcd[i]),
                 "reward_qoe_penalty":    float(info_qsf[i]),
                 "qoe_vio_rate":          float(info_vio[i]),
-            } 
+            }
             for i, aid in enumerate(self.area_ids)
         }
 
@@ -327,7 +322,7 @@ class EdgeIDSParallelEnv(PZooParallelEnv):
         qoe = self._qoe_vec()
         observations = {
             aid: {
-                "obs": obs_mat[i].copy(), 
+                "obs": obs_mat[i].copy(),
                 "qoe_mean": np.array([qoe[i]], dtype=np.float32),
                 "reward_lambda_res":     np.array([info_lres[i]], dtype=np.float32),
                 "reward_benign_col_dmg": np.array([info_bcd[i]], dtype=np.float32),
@@ -354,7 +349,6 @@ class EdgeIDSParallelEnv(PZooParallelEnv):
 
         n_base = 5
 
-        # ---- per-edge base features (obs_keys, indices 0..n_base-1) ----
         for i, area_id in enumerate(self.area_ids):
             g = df[df["area_id"] == area_id]
             if g.empty:
@@ -367,7 +361,6 @@ class EdgeIDSParallelEnv(PZooParallelEnv):
                 else:
                     obs[i, j] = float(np.mean(vals))
 
-        # ---- neighbor state features (indices n_base, n_base+1, n_base+2) ----
         edge_ids_util: Dict[str, float] = {}
         edge_atk_rate: Dict[str, float] = {}
         for area_id in self.area_ids:
@@ -397,7 +390,6 @@ class EdgeIDSParallelEnv(PZooParallelEnv):
             obs[i, n_base + 1] = float(np.mean(nbr_deltas)) if nbr_deltas else 0.0
             obs[i, n_base + 2] = float(np.mean(nbr_atk))    if nbr_atk    else 0.0
 
-        # ---- previous-timestep SLO violation flag (index n_base+3) ----
         for i, area_id in enumerate(self.area_ids):
             g = df[df["area_id"] == area_id]
             if g.empty:
@@ -407,7 +399,6 @@ class EdgeIDSParallelEnv(PZooParallelEnv):
             threshold = float(self.env.edge_areas[i].slo_threshold)
             obs[i, n_base + 3] = 1.0 if last_qoe < threshold else 0.0
 
-        # ---- transition state features (indices -2, -1) ----
         max_dur = float(self.scaling_time_steps[-1])
         for i in range(self.n_edges):
             obs[i, -2] = float(self.transition_ticks_remaining[i]) / max(max_dur, 1.0)
@@ -418,53 +409,6 @@ class EdgeIDSParallelEnv(PZooParallelEnv):
 
         return obs
 
-    def _build_reward_per_agent(self) -> np.ndarray:
-        if len(self.env.history) < self.n_edges:
-            return np.zeros(self.n_edges, dtype=np.float32)
-
-        last_block = self.env.history[-self.n_edges:]
-
-        qoe        = np.asarray([float(m.qoe_mean)       for m in last_block], dtype=np.float32)
-        bcd        = np.asarray([float(m.benign_col_dmg)  for m in last_block], dtype=np.float32)
-        attack_in  = np.asarray([float(m.attack_in_rate)  for m in last_block], dtype=np.float32)
-        attack_drop = np.asarray([float(m.attack_drop_rate) for m in last_block], dtype=np.float32)
-
-        # residual attack fraction: proportion of incoming attacks not stopped by IDS
-        attack_pass = np.maximum(0.0, attack_in - attack_drop)
-        lambda_res  = np.where(attack_in > 1e-6, attack_pass / attack_in, 0.0).astype(np.float32)
-
-        # SLO shortfall: normalised QoE deficit below threshold
-        qoe_shortfall = np.maximum(0.0, self.threshold - qoe) / max(self.threshold, 1e-6)
-
-        # Shared reward components (mean over agents)
-        active = attack_in > 1e-6
-        r_lambda_res = float(np.mean(lambda_res[active])) if np.any(active) else 0.0
-        r_bcd = float(np.mean(bcd))
-        r_qoe_penalty = float(np.mean(qoe_shortfall))
-
-        reward_scalar = -(self.alpha * r_qoe_penalty + self.beta * r_lambda_res + self.gamma_r * r_bcd)
-        return np.full(self.n_edges, reward_scalar, dtype=np.float32)
-
-    # def _build_reward_per_agent(self) -> np.ndarray:
-    #     if len(self.env.history) < self.n_edges:
-    #         return np.zeros(self.n_edges, dtype=np.float32)
-
-    #     last_block = self.env.history[-self.n_edges:]  # one StepMetrics per edge at current env.t
-
-    #     # target ratio for ids_cpu == 2.0
-    #     # assumes env.edge_areas order matches the order you append StepMetrics
-    #     target = np.asarray(
-    #         [2.0 / float(edge.budget.cpu) for edge in self.env.edge_areas],
-    #         dtype=np.float32,
-    #     )
-
-    #     ratio = np.asarray([float(m.cpu_to_ids_ratio) for m in last_block], dtype=np.float32)
-
-    #     # reward in [-inf, 0], best is 0 when ratio == target
-    #     r = -np.abs(ratio - target)
-
-    #     return r
-    
     def _qoe_vec(self) -> np.ndarray:
         if self.env.history:
             last_block = self.env.history[-self.n_edges:]
@@ -512,12 +456,13 @@ class BuildCentralObs(Transform):
         )
         return observation_spec
 
+
 class WriteRecurrentOutToNext(Transform):
     def __init__(self):
         super().__init__(
             in_keys=[
-                ("agents","recurrent_state_h_out"),
-                ("agents","recurrent_state_c_out"),
+                ("agents", "recurrent_state_h_out"),
+                ("agents", "recurrent_state_c_out"),
                 "recurrent_state_h_v_out",
                 "recurrent_state_c_v_out",
             ],
@@ -525,28 +470,25 @@ class WriteRecurrentOutToNext(Transform):
         )
 
     def _call(self, td: TensorDictBase) -> TensorDictBase:
-        # env.step has already created td["next"] when transforms are applied post-step
         nxt = td.get("next")
         if nxt is None:
             return td
 
-        nxt.set(("agents","recurrent_state_h"), td.get(("agents","recurrent_state_h_out")))
-        nxt.set(("agents","recurrent_state_c"), td.get(("agents","recurrent_state_c_out")))
+        nxt.set(("agents", "recurrent_state_h"), td.get(("agents", "recurrent_state_h_out")))
+        nxt.set(("agents", "recurrent_state_c"), td.get(("agents", "recurrent_state_c_out")))
         h_v_out = td.get("recurrent_state_h_v_out", default=None)
         c_v_out = td.get("recurrent_state_c_v_out", default=None)
         if h_v_out is not None:
-            # Critic was run: carry updated hidden state to next.
             nxt.set("recurrent_state_h_v", h_v_out)
             nxt.set("recurrent_state_c_v", c_v_out)
         else:
-            # Critic not run during collection: carry current (zero) state forward so
-            # the key remains present in the td at every step.
             h_v = td.get("recurrent_state_h_v", default=None)
             c_v = td.get("recurrent_state_c_v", default=None)
             if h_v is not None:
                 nxt.set("recurrent_state_h_v", h_v)
                 nxt.set("recurrent_state_c_v", c_v)
         return td
+
 
 class InitRecurrentState(Transform):
     def __init__(self, n_edges: int, actor_hidden_dim: int, critic_hidden_dim: int):
@@ -563,24 +505,22 @@ class InitRecurrentState(Transform):
         Ha = self.actor_hidden_dim
         Hc = self.critic_hidden_dim
 
-        # actor
-        td_reset.set(("agents","recurrent_state_h"), torch.zeros((B,E,1,Ha), device=dev))
-        td_reset.set(("agents","recurrent_state_c"), torch.zeros((B,E,1,Ha), device=dev))
-        td_reset.set(("agents","recurrent_state_h_out"), torch.zeros((B,E,1,Ha), device=dev))
-        td_reset.set(("agents","recurrent_state_c_out"), torch.zeros((B,E,1,Ha), device=dev))
+        td_reset.set(("agents", "recurrent_state_h"),     torch.zeros((B, E, 1, Ha), device=dev))
+        td_reset.set(("agents", "recurrent_state_c"),     torch.zeros((B, E, 1, Ha), device=dev))
+        td_reset.set(("agents", "recurrent_state_h_out"), torch.zeros((B, E, 1, Ha), device=dev))
+        td_reset.set(("agents", "recurrent_state_c_out"), torch.zeros((B, E, 1, Ha), device=dev))
 
-        # critic
-        td_reset.set("recurrent_state_h_v", torch.zeros((B,1,Hc), device=dev))
-        td_reset.set("recurrent_state_c_v", torch.zeros((B,1,Hc), device=dev))
-        td_reset.set("recurrent_state_h_v_out", torch.zeros((B,1,Hc), device=dev))
-        td_reset.set("recurrent_state_c_v_out", torch.zeros((B,1,Hc), device=dev))
+        td_reset.set("recurrent_state_h_v",     torch.zeros((B, 1, Hc), device=dev))
+        td_reset.set("recurrent_state_c_v",     torch.zeros((B, 1, Hc), device=dev))
+        td_reset.set("recurrent_state_h_v_out", torch.zeros((B, 1, Hc), device=dev))
+        td_reset.set("recurrent_state_c_v_out", torch.zeros((B, 1, Hc), device=dev))
         return td_reset
 
 
 class CarryCriticState(Transform):
     def __init__(self):
         super().__init__(
-            in_keys=[("next","recurrent_state_h_v"), ("next","recurrent_state_c_v")],
+            in_keys=[("next", "recurrent_state_h_v"), ("next", "recurrent_state_c_v")],
             out_keys=["recurrent_state_h_v", "recurrent_state_c_v"],
         )
 
@@ -591,18 +531,11 @@ class CarryCriticState(Transform):
             td.set("recurrent_state_h_v", h)
             td.set("recurrent_state_c_v", c)
         return td
-    
+
+
 class FlatToAgentsObs(Transform):
-    """
-    Reconstruct ("agents","observation","obs") from "observation_flat".
+    """Reconstruct ("agents","observation","obs") from "observation_flat"."""
 
-    Assumes observation_flat is concatenated as:
-      [agent0 D dims][agent1 D dims]...[agent(E-1) D dims]
-
-    Works for:
-      step: observation_flat [B, E*D]  -> agents obs [B, E, D]
-      rollout: observation_flat [B,T,E*D] -> agents obs [B,T,E,D]
-    """
     def __init__(self, n_edges: int, obs_dim: int,
                  in_key: str = "observation_flat",
                  out_key=("agents", "observation", "obs")):
@@ -615,11 +548,8 @@ class FlatToAgentsObs(Transform):
     def _flat_to_agents(self, x: torch.Tensor) -> torch.Tensor:
         E, D = self.n_edges, self.obs_dim
         if x.ndim == 2:
-            # [B, E*D] -> [B, E, D]
-            B = x.shape[0]
-            return x.view(B, E, D)
+            return x.view(x.shape[0], E, D)
         if x.ndim == 3:
-            # [B, T, E*D] -> [B, T, E, D]
             B, T = x.shape[:2]
             return x.view(B, T, E, D)
         raise RuntimeError(f"{self.in_key} expected 2D or 3D, got {x.shape}")
@@ -628,7 +558,6 @@ class FlatToAgentsObs(Transform):
         x = td.get(self.in_key, default=None)
         if x is not None:
             td.set(self.out_key, self._flat_to_agents(x))
-
         nxt = td.get("next", default=None)
         if nxt is not None:
             x2 = nxt.get(self.in_key, default=None)
@@ -643,18 +572,18 @@ class FlatToAgentsObs(Transform):
         return td_reset
 
     def transform_observation_spec(self, observation_spec):
-        # add / overwrite the per-agent obs spec to match reconstructed tensor
-        bs = observation_spec.shape  # typically [num_envs] or [B,T]
+        bs = observation_spec.shape
         flat_spec = observation_spec[self.in_key]
         observation_spec[self.out_key] = UnboundedContinuousTensorSpec(
             shape=(*bs, self.n_edges, self.obs_dim),
             dtype=flat_spec.dtype,
             device=flat_spec.device,
         )
-        return observation_spec 
-    
+        return observation_spec
+
+
 # =========================================================
-# Networks (Feature + LSTMModule + heads)
+# Networks
 # =========================================================
 
 class FeatureNet(nn.Module):
@@ -687,12 +616,10 @@ class AgentRecurrentCore(nn.Module):
         self._lstm = nn.LSTM(self.hidden_dim, self.hidden_dim, batch_first=True).to(device)
 
     def forward(self, td: TensorDictBase) -> TensorDictBase:
-        x = td.get("observation_flat")   # step: [B, E*D], train: [B,T,E*D]
-        is_init = td.get("is_init")      # step: [B,1],    train: [B,T,1]
+        x = td.get("observation_flat")
+        is_init = td.get("is_init")
 
-        E = self.n_edges
-        D = self.obs_dim
-        H = self.hidden_dim
+        E, D, H = self.n_edges, self.obs_dim, self.hidden_dim
 
         step_mode = (x.ndim == 2)
         if step_mode:
@@ -705,63 +632,49 @@ class AgentRecurrentCore(nn.Module):
             raise RuntimeError(f"observation_flat last dim {FD} != E*D {E*D}")
 
         obs_be = x.view(B, T, E, D).reshape(B * E, T, D)
-        temporal_be = obs_be[..., self.temporal_idx]   # [B*E, T, n_temporal]
-        static_be   = obs_be[..., self.static_idx]     # [B*E, T, n_static]
-        feats_be = self.feature(temporal_be)           # [B*E, T, H]
+        temporal_be = obs_be[..., self.temporal_idx]
+        static_be   = obs_be[..., self.static_idx]
+        feats_be = self.feature(temporal_be)
 
-        # Pull stored INPUT hidden states (h_in_t stored correctly after CarryActorRecurrentState removed)
         h = td.get(("agents", "recurrent_state_h"))
         c = td.get(("agents", "recurrent_state_c"))
-        h0 = h[:, 0] if h.ndim == 5 else h          # [B, E, 1, H]
+        h0 = h[:, 0] if h.ndim == 5 else h
         c0 = c[:, 0] if c.ndim == 5 else c
 
-        # Zero out hidden state where episode starts (is_init at t=0)
-        reset_mask = is_init[:, 0].float().unsqueeze(1).unsqueeze(-1)  # [B, 1, 1, 1]
+        reset_mask = is_init[:, 0].float().unsqueeze(1).unsqueeze(-1)
         h0 = h0 * (1.0 - reset_mask)
         c0 = c0 * (1.0 - reset_mask)
 
-        # [1, B*E, H] for nn.LSTM (num_layers, batch, hidden)
         h_lstm = h0.reshape(B * E, 1, H).transpose(0, 1).contiguous()
         c_lstm = c0.reshape(B * E, 1, H).transpose(0, 1).contiguous()
 
-        lstm_out, (h_n, c_n) = self._lstm(feats_be, (h_lstm, c_lstm))  # [B*E, T, H]
+        lstm_out, (h_n, c_n) = self._lstm(feats_be, (h_lstm, c_lstm))
 
-        # merge LSTM output with static bypass: [B*E, T, H+n_static]
         merged_be = torch.cat([lstm_out, static_be], dim=-1)
         F_out = H + self.n_static
-        feats_btEH = merged_be.reshape(B, E, T, F_out).transpose(1, 2).contiguous()  # [B, T, E, F_out]
+        feats_btEH = merged_be.reshape(B, E, T, F_out).transpose(1, 2).contiguous()
 
         if step_mode:
-            td.set(("agents", "features"), feats_btEH[:, 0])            # [B, E, F_out]
-            h_out = h_n.transpose(0, 1).reshape(B, E, 1, H)             # [B, E, 1, H]
+            td.set(("agents", "features"), feats_btEH[:, 0])
+            h_out = h_n.transpose(0, 1).reshape(B, E, 1, H)
             c_out = c_n.transpose(0, 1).reshape(B, E, 1, H)
             td.set(("agents", "recurrent_state_h_out"), h_out)
             td.set(("agents", "recurrent_state_c_out"), c_out)
         else:
-            td.set(("agents", "features"), feats_btEH)                  # [B, T, E, F_out]
+            td.set(("agents", "features"), feats_btEH)
 
         return td
-    
+
+
 class CriticRecurrentCore(nn.Module):
-    """
-    Centralized critic recurrence per environment.
+    """Centralized critic recurrence per environment (CTDE)."""
 
-    Reads:
-      - "observation_flat": step [B,E*D], train [B,T,E*D]
-      - "is_init": step [B,1], train [B,T,1]
-      - "recurrent_state_h_v"/"recurrent_state_c_v": step [B,1,H]
-
-    Writes:
-      - "vf_features": step [B,H+n_static_total], train [B,T,H+n_static_total]
-      - "recurrent_state_h_v_out"/"recurrent_state_c_v_out": step [B,1,H]
-    """
     def __init__(self, n_edges: int, obs_dim: int, hidden_dim: int, device: str,
                  temporal_local_idx: List[int], static_local_idx: List[int]):
         super().__init__()
         self.hidden_dim = int(hidden_dim)
         self.n_static_total = n_edges * len(static_local_idx)
 
-        # build flat indices across all edges
         temporal_flat = [e * obs_dim + t for e in range(n_edges) for t in temporal_local_idx]
         static_flat   = [e * obs_dim + s for e in range(n_edges) for s in static_local_idx]
         self.register_buffer("temporal_idx", torch.tensor(temporal_flat, dtype=torch.long))
@@ -771,7 +684,7 @@ class CriticRecurrentCore(nn.Module):
         self._lstm = nn.LSTM(hidden_dim, hidden_dim, batch_first=True).to(device)
 
     def forward(self, td: TensorDictBase) -> TensorDictBase:
-        x = td.get("observation_flat")     # step [B,E*D], train [B,T,E*D]
+        x = td.get("observation_flat")
         is_init = td.get("is_init")
 
         step_mode = (x.ndim == 2)
@@ -783,57 +696,60 @@ class CriticRecurrentCore(nn.Module):
         B, T, _ = x.shape
         H = self.hidden_dim
 
-        temporal = x[..., self.temporal_idx]   # [B, T, n_temporal_total]
-        static   = x[..., self.static_idx]     # [B, T, n_static_total]
-
-        vf = self.feature(temporal)            # [B, T, H]
+        temporal = x[..., self.temporal_idx]
+        static   = x[..., self.static_idx]
+        vf = self.feature(temporal)
 
         h = td.get("recurrent_state_h_v", default=None)
         c = td.get("recurrent_state_c_v", default=None)
         if h is None or c is None:
             h0 = torch.zeros(B, 1, H, device=vf.device)
             c0 = torch.zeros(B, 1, H, device=vf.device)
-        elif h.ndim == 4:   # [B,T,1,H]: take t=0
+        elif h.ndim == 4:
             h0, c0 = h[:, 0], c[:, 0]
-        else:               # [B,1,H]
+        else:
             h0, c0 = h, c
 
-        # Zero hidden state where episode starts
-        reset_mask = is_init[:, 0].float()             # [B, 1]
-        h0 = h0 * (1.0 - reset_mask.unsqueeze(-1))    # [B, 1, H]
+        reset_mask = is_init[:, 0].float()
+        h0 = h0 * (1.0 - reset_mask.unsqueeze(-1))
         c0 = c0 * (1.0 - reset_mask.unsqueeze(-1))
 
-        h_lstm = h0.transpose(0, 1).contiguous()       # [1, B, H]
+        h_lstm = h0.transpose(0, 1).contiguous()
         c_lstm = c0.transpose(0, 1).contiguous()
 
         if step_mode:
             vf2, (h_n, c_n) = self._lstm(vf, (h_lstm, c_lstm))
-            merged = torch.cat([vf2[:, 0], static[:, 0]], dim=-1)  # [B, H+n_static_total]
+            merged = torch.cat([vf2[:, 0], static[:, 0]], dim=-1)
             td.set("vf_features", merged)
-            td.set("recurrent_state_h_v_out", h_n.transpose(0, 1))  # [B, 1, H]
+            td.set("recurrent_state_h_v_out", h_n.transpose(0, 1))
             td.set("recurrent_state_c_v_out", c_n.transpose(0, 1))
         else:
-            # Step-by-step unroll: reset hidden state at mid-sequence episode starts
             h_t, c_t = h_lstm, c_lstm
-            outputs, h_ins = [], []
+            outputs, h_ins, c_ins = [], [], []
             for t in range(T):
                 if t > 0:
-                    reset = is_init[:, t, 0].float().unsqueeze(0).unsqueeze(-1)  # [1, B, 1]
+                    reset = is_init[:, t, 0].float().unsqueeze(0).unsqueeze(-1)
                     h_t = h_t * (1.0 - reset)
                     c_t = c_t * (1.0 - reset)
-                h_ins.append(h_t.transpose(0, 1))  # [B, 1, H]
+                h_ins.append(h_t.transpose(0, 1))
+                c_ins.append(c_t.transpose(0, 1))
                 out_t, (h_t, c_t) = self._lstm(vf[:, t:t+1, :], (h_t, c_t))
                 outputs.append(out_t)
-            vf2 = torch.cat(outputs, dim=1)              # [B, T, H]
-            merged = torch.cat([vf2, static], dim=-1)    # [B, T, H+n_static_total]
-            h_in_seq = torch.stack(h_ins, dim=1)         # [B, T, 1, H]
+            vf2 = torch.cat(outputs, dim=1)
+            merged = torch.cat([vf2, static], dim=-1)
+            h_in_seq = torch.stack(h_ins, dim=1)
+            c_in_seq = torch.stack(c_ins, dim=1)
             td.set("vf_features", merged)
             td.set("recurrent_state_h_v_seq", h_in_seq)
-            # Store final state as attributes — can't set [B,1,H] on a [B,T] TensorDict
-            self._h_v_final = h_t.transpose(0, 1)        # [B, 1, H]
-            self._c_v_final = c_t.transpose(0, 1)
+            td.set("recurrent_state_c_v_seq", c_in_seq)
+            # Match [B, T] batch size of trajectory TensorDict by expanding final states
+            h_v_final = h_t.transpose(0, 1).unsqueeze(1).expand(B, T, 1, H)
+            c_v_final = c_t.transpose(0, 1).unsqueeze(1).expand(B, T, 1, H)
+            td.set("recurrent_state_h_v_final", h_v_final)
+            td.set("recurrent_state_c_v_final", c_v_final)
 
         return td
+
 
 # =========================================================
 # PPO / GAE
@@ -841,14 +757,13 @@ class CriticRecurrentCore(nn.Module):
 
 @torch.no_grad()
 def compute_gae_inplace(traj: TensorDictBase, gamma: float, lmbda: float, n_edges: int):
-    reward = traj.get(("agents", "reward"))          # [B,T,E]
+    reward = traj.get(("agents", "reward"))
     done = traj.get(("agents", "done")).to(torch.bool)
     terminated = traj.get(("agents", "terminated")).to(torch.bool)
-    values = traj.get(("agents", "state_value"))     # [B,T,E]
+    values = traj.get(("agents", "state_value"))
     next_values = traj.get("next").get(("agents", "state_value"))
 
-    not_end = ~(done | terminated)
-    not_end = not_end.to(values.dtype)
+    not_end = (~(done | terminated)).to(values.dtype)
 
     B, T, E = reward.shape
     if E != n_edges:
@@ -867,31 +782,28 @@ def compute_gae_inplace(traj: TensorDictBase, gamma: float, lmbda: float, n_edge
 
 
 def valid_sequence_minibatches(traj: TensorDictBase, seq_len: int, minibatch_size: int):
-    """
-    Sample windows that do not cross episode boundary (no done-any-agent inside the window).
-    traj batch: [B,T]
-    """
+    """Sample windows that do not cross episode boundaries. traj batch: [B, T]."""
     B, T = traj.batch_size
     if T < seq_len:
         raise RuntimeError(f"T={T} < seq_len={seq_len}")
 
-    done = traj.get(("agents", "done")).to(torch.bool)           # [B,T,E]
+    done = traj.get(("agents", "done")).to(torch.bool)
     while done.ndim > 3:
         done = done.squeeze(-1)
-    done_any = done.any(dim=-1)                                  # [B,T]
+    done_any = done.any(dim=-1)
 
     max_t0 = T - seq_len
-    csum = torch.cumsum(done_any.to(torch.int32), dim=1)          # [B,T]
+    csum = torch.cumsum(done_any.to(torch.int32), dim=1)
 
-    left = csum[:, : max_t0 + 1]
+    left  = csum[:, : max_t0 + 1]
     right = csum[:, seq_len - 1 : seq_len - 1 + (max_t0 + 1)]
     prev_left = torch.cat([torch.zeros(B, 1, device=traj.device, dtype=csum.dtype), left[:, :-1]], dim=1)
     window_sum = right - prev_left
-    valid = window_sum == 0                                      # [B, max_t0+1]
+    valid = window_sum == 0
 
-    valid_idx = valid.nonzero(as_tuple=False)                    # [N,2] = (b, t0)
+    valid_idx = valid.nonzero(as_tuple=False)
     if valid_idx.numel() == 0:
-        all_b = torch.arange(B, device=traj.device).repeat_interleave(max_t0 + 1)
+        all_b  = torch.arange(B, device=traj.device).repeat_interleave(max_t0 + 1)
         all_t0 = torch.arange(max_t0 + 1, device=traj.device).repeat(B)
         valid_idx = torch.stack([all_b, all_t0], dim=1)
 
@@ -901,48 +813,56 @@ def valid_sequence_minibatches(traj: TensorDictBase, seq_len: int, minibatch_siz
     for start in range(0, valid_idx.shape[0], minibatch_size):
         idx = valid_idx[start : start + minibatch_size]
         b_idx = idx[:, 0]
-        t0 = idx[:, 1]
+        t0    = idx[:, 1]
         slices = [traj[b_idx, t0 + k] for k in range(seq_len)]
-        yield torch.stack(slices, dim=1).to_tensordict()          # [mb, seq, ...]
+        yield torch.stack(slices, dim=1).to_tensordict()
 
 
 # =========================================================
 # Builders
 # =========================================================
 
-def make_wrapped_env(cfg_path: str, seed: int, decision_interval: int, n_actions: int):
-    pz = EdgeIDSParallelEnv(cfg_path=cfg_path, seed=seed, decision_interval=decision_interval, n_actions=n_actions)
+def make_wrapped_env(cfg_path: str, seed: int, decision_interval: int, n_actions: int,
+                     env_class: Type[EdgeIDSParallelEnv] = None):
+    if env_class is None:
+        env_class = EdgeIDSParallelEnv
+    pz = env_class(cfg_path=cfg_path, seed=seed, decision_interval=decision_interval, n_actions=n_actions)
     group_map = {"agents": list(pz.possible_agents)}
     return PettingZooWrapper(pz, categorical_actions=True, group_map=group_map)
 
 
-def build_env_stack(env_cfg: dict, train_cfg: dict, cfg_path: str, num_envs: int):
+def build_env_stack(env_cfg: dict, train_cfg: dict, cfg_path: str, num_envs: int,
+                    env_class: Type[EdgeIDSParallelEnv] = None):
+    if env_class is None:
+        env_class = EdgeIDSParallelEnv
+
     decision_interval = int(env_cfg["globals"]["decision_interval"])
     n_actions = int(train_cfg["model"]["n_actions"])
 
-    base = make_wrapped_env(cfg_path=cfg_path, seed=int(env_cfg["run"]["seed"]), decision_interval=decision_interval, n_actions=n_actions)
+    base = make_wrapped_env(cfg_path=cfg_path, seed=int(env_cfg["run"]["seed"]),
+                            decision_interval=decision_interval, n_actions=n_actions,
+                            env_class=env_class)
     obs_spec = base.observation_spec[("agents", "observation", "obs")]
     n_edges = int(obs_spec.shape[-2])
     obs_dim = int(obs_spec.shape[-1])
 
     def make_one(i: int):
         def _make():
-            return make_wrapped_env(cfg_path=cfg_path, seed=1000 + i, decision_interval=decision_interval, n_actions=n_actions)
+            return make_wrapped_env(cfg_path=cfg_path, seed=1000 + i,
+                                    decision_interval=decision_interval, n_actions=n_actions,
+                                    env_class=env_class)
         return _make
 
     penv = ParallelEnv(num_envs, [make_one(i) for i in range(num_envs)], device="cpu")
 
     hidden_dim = int(train_cfg["model"]["hidden_dim"])
-    actor_h = hidden_dim
+    actor_h  = hidden_dim
     critic_h = hidden_dim * 2
     transforms: List[Transform] = [
         InitTracker(),
         BuildCentralObs(n_edges=n_edges, obs_dim=obs_dim, out_key="observation_flat"),
-        ObservationNorm(
-            in_keys=["observation_flat"],
-            standard_normal=True,
-        ),        
-        FlatToAgentsObs(n_edges=n_edges, obs_dim=obs_dim),   
+        ObservationNorm(in_keys=["observation_flat"], standard_normal=True),
+        FlatToAgentsObs(n_edges=n_edges, obs_dim=obs_dim),
         InitRecurrentState(n_edges=n_edges, actor_hidden_dim=actor_h, critic_hidden_dim=critic_h),
         WriteRecurrentOutToNext(),
         CarryCriticState(),
@@ -961,8 +881,8 @@ def build_env_stack(env_cfg: dict, train_cfg: dict, cfg_path: str, num_envs: int
 
     td0 = env.reset()
     print("env.batch_size:", env.batch_size)
-    print("obs step shape:", td0.get(("agents","observation","obs")).shape)
-    print("actor h shape:", td0.get(("agents","recurrent_state_h")).shape)
+    print("obs step shape:", td0.get(("agents", "observation", "obs")).shape)
+    print("actor h shape:", td0.get(("agents", "recurrent_state_h")).shape)
     print("critic h shape:", td0.get("recurrent_state_h_v").shape)
 
     return env, n_edges, obs_dim
@@ -977,7 +897,11 @@ def train(
     train_cfg_path: str = "./configs/train.yaml",
     resume_ckpt: Optional[str] = None,
     device: str = "cuda",
+    env_class: Type[EdgeIDSParallelEnv] = None,
 ):
+    if env_class is None:
+        env_class = EdgeIDSParallelEnv
+
     with open(env_cfg_path, "r") as f:
         env_cfg = yaml.safe_load(f)
     with open(train_cfg_path, "r") as f:
@@ -994,15 +918,14 @@ def train(
     num_envs = int(train_cfg["collector"]["num_envs"])
     decisions_per_episode = int(math.ceil(t_max / decision_interval))
 
-    env, n_edges, obs_dim = build_env_stack(env_cfg, train_cfg, env_cfg_path, num_envs)
+    env, n_edges, obs_dim = build_env_stack(env_cfg, train_cfg, env_cfg_path, num_envs, env_class=env_class)
 
     set_composite_lp_aggregate(False).set()
 
-    n_actions = int(train_cfg["model"]["n_actions"])
+    n_actions  = int(train_cfg["model"]["n_actions"])
     hidden_dim = int(train_cfg["model"]["hidden_dim"])
 
-    # --- temporal / static split ---
-    _tmp_env = EdgeIDSParallelEnv(cfg_path=env_cfg_path, seed=0, decision_interval=decision_interval)
+    _tmp_env = env_class(cfg_path=env_cfg_path, seed=0, decision_interval=decision_interval)
     temporal_local_idx = [i for i, k in enumerate(_tmp_env.obs_keys) if k in TEMPORAL_OBS_KEYS]
     static_local_idx   = [i for i, k in enumerate(_tmp_env.obs_keys) if k not in TEMPORAL_OBS_KEYS]
     n_static_per_edge  = len(static_local_idx)
@@ -1010,14 +933,9 @@ def train(
     critic_hidden_dim  = hidden_dim * 2
     critic_feat_dim    = critic_hidden_dim + n_edges * n_static_per_edge
 
-    # --- actor ---
     actor_core = AgentRecurrentCore(
-        n_edges=n_edges,
-        obs_dim=obs_dim,
-        hidden_dim=hidden_dim,
-        device=device,
-        temporal_local_idx=temporal_local_idx,
-        static_local_idx=static_local_idx,
+        n_edges=n_edges, obs_dim=obs_dim, hidden_dim=hidden_dim, device=device,
+        temporal_local_idx=temporal_local_idx, static_local_idx=static_local_idx,
     )
     actor_head = TensorDictModule(
         nn.Linear(actor_feat_dim, n_actions).to(device),
@@ -1034,17 +952,12 @@ def train(
         default_interaction_type=InteractionType.RANDOM,
     )
 
-    # --- critic (CTDE) ---
     critic_core = CriticRecurrentCore(
-        n_edges=n_edges,
-        obs_dim=obs_dim,
-        hidden_dim=critic_hidden_dim,
-        device=device,
-        temporal_local_idx=temporal_local_idx,
-        static_local_idx=static_local_idx,
+        n_edges=n_edges, obs_dim=obs_dim, hidden_dim=critic_hidden_dim, device=device,
+        temporal_local_idx=temporal_local_idx, static_local_idx=static_local_idx,
     )
     critic_head = TensorDictModule(
-        nn.Linear(critic_feat_dim, n_edges).to(device),   # outputs per-agent values
+        nn.Linear(critic_feat_dim, n_edges).to(device),
         in_keys=["vf_features"],
         out_keys=[("agents", "state_value")],
     )
@@ -1083,71 +996,68 @@ def train(
         split_trajs=False,
     )
 
-    minibatch_size = int(train_cfg["loss"]["mini_batch_size"])
-    ppo_epochs = int(train_cfg["loss"]["ppo_epochs"])
-    max_grad_norm = float(train_cfg["optim"]["max_grad_norm"])
-
-    entropy_coeff = float(train_cfg["loss"]["entropy_coeff"])
-    critic_coeff = float(train_cfg["loss"]["critic_coeff"])
-    gamma = float(train_cfg["loss"]["gamma"])
-    gae_lambda = float(train_cfg["loss"]["gae_lambda"])
-    base_lr = float(train_cfg["optim"]["lr"])
-    base_clip_eps = float(train_cfg["loss"]["clip_epsilon"])
+    minibatch_size  = int(train_cfg["loss"]["mini_batch_size"])
+    ppo_epochs      = int(train_cfg["loss"]["ppo_epochs"])
+    max_grad_norm   = float(train_cfg["optim"]["max_grad_norm"])
+    entropy_coeff   = float(train_cfg["loss"]["entropy_coeff"])
+    critic_coeff    = float(train_cfg["loss"]["critic_coeff"])
+    gamma           = float(train_cfg["loss"]["gamma"])
+    gae_lambda      = float(train_cfg["loss"]["gae_lambda"])
+    base_lr         = float(train_cfg["optim"]["lr"])
+    base_clip_eps   = float(train_cfg["loss"]["clip_epsilon"])
     loss_critic_type = train_cfg["loss"].get("loss_critic_type", "mse")
 
-    ckpt_dir = Path("checkpoints") / run.name
+    ckpt_dir   = Path("checkpoints") / run.name
     ckpt_every = 50
-    best_qoe = -1e9
+    best_qoe   = -1e9
+    obs_keys   = _tmp_env.obs_keys
 
-    obs_keys = _tmp_env.obs_keys
-
-    total_updates_est = max(1, (total_frames // frames_per_batch) * ppo_epochs * math.ceil(frames_per_batch / minibatch_size))
-    updates_done = 0
+    total_updates_est = max(
+        1, (total_frames // frames_per_batch) * ppo_epochs * math.ceil(frames_per_batch / minibatch_size)
+    )
+    updates_done       = 0
     global_decision_step = 0
 
     for it, batch in enumerate(collector):
         traj = batch.clone(False)
 
-        # --- make reward/done/terminated available at root ("agents",...) ---
-        # Some wrappers already provide them at root, some only under "next".
         for k in [("agents", "reward"), ("agents", "done"), ("agents", "terminated")]:
             nk = ("next",) + k
             if k not in traj.keys(True, True) and nk in traj.keys(True, True):
                 traj.set(k, traj.get(nk))
-
-            # always squeeze last singleton if present
             squeeze_last1(traj, k)
             squeeze_last1(traj.get("next"), k)
 
-        if ("agents","done") in traj.keys(True, True):
+        if ("agents", "done") in traj.keys(True, True):
             traj.set(("agents", "done"), traj.get(("agents", "done")).to(torch.bool))
-        if ("agents","terminated") in traj.keys(True, True):
+        if ("agents", "terminated") in traj.keys(True, True):
             traj.set(("agents", "terminated"), traj.get(("agents", "terminated")).to(torch.bool))
-        if ("agents","done") in traj.get("next").keys(True, True):
-            traj.get("next").set(("agents", "done"), traj.get("next").get(("agents","done")).to(torch.bool))
-        if ("agents","terminated") in traj.get("next").keys(True, True):
-            traj.get("next").set(("agents", "terminated"), traj.get("next").get(("agents","terminated")).to(torch.bool))
+        if ("agents", "done") in traj.get("next").keys(True, True):
+            traj.get("next").set(("agents", "done"), traj.get("next").get(("agents", "done")).to(torch.bool))
+        if ("agents", "terminated") in traj.get("next").keys(True, True):
+            traj.get("next").set(("agents", "terminated"), traj.get("next").get(("agents", "terminated")).to(torch.bool))
 
-        # --- values + GAE ---
-        # Single forward pass gives V(s_0)..V(s_{T-1}) with consistent LSTM context.
-        # next_values[t] = vals[t+1] (same pass), so δ_t = r_t + γ*V(s_{t+1}) - V(s_t)
-        # is computed from a single coherent LSTM unroll — no context mismatch.
-        # The final bootstrap V(s_T) uses a fresh zero-state single-step critic call.
         with torch.no_grad():
             value_net(traj)
-            vals = traj.get(("agents", "state_value"))  # [B,T,E]
+            vals = traj.get(("agents", "state_value"))
 
-            # Propagate per-step critic h_in states into the trajectory so that
-            # PPO subsequence updates start from the correct LSTM context (not zeros).
             h_v_seq = traj.get("recurrent_state_h_v_seq", default=None)
+            c_v_seq = traj.get("recurrent_state_c_v_seq", default=None)
             if h_v_seq is not None:
-                traj.set("recurrent_state_h_v", h_v_seq)  # [B, T, 1, H]
+                traj.set("recurrent_state_h_v", h_v_seq)
+            if c_v_seq is not None:
+                traj.set("recurrent_state_c_v", c_v_seq)
 
             B_sz = vals.shape[0]
-            Hc = hidden_dim * 2
-            dev = vals.device
-            h_v_final = getattr(critic_core, "_h_v_final", None)
-            c_v_final = getattr(critic_core, "_c_v_final", None)
+            Hc   = hidden_dim * 2
+            dev  = vals.device
+            h_v_final = traj.get("recurrent_state_h_v_final", default=None)
+            c_v_final = traj.get("recurrent_state_c_v_final", default=None)
+            if h_v_final is not None and h_v_final.ndim == 4:
+                h_v_final = h_v_final[:, -1]
+            if c_v_final is not None and c_v_final.ndim == 4:
+                c_v_final = c_v_final[:, -1]
+
             boot_td = TensorDict(
                 {
                     "observation_flat": traj.get("next").get("observation_flat")[:, -1],
@@ -1159,9 +1069,9 @@ def train(
                 device=dev,
             )
             value_net(boot_td)
-            v_boot = boot_td.get(("agents", "state_value"))  # [B, E]
+            v_boot = boot_td.get(("agents", "state_value"))
 
-            next_vals = torch.cat([vals[:, 1:], v_boot.unsqueeze(1)], dim=1)  # [B,T,E]
+            next_vals = torch.cat([vals[:, 1:], v_boot.unsqueeze(1)], dim=1)
             traj.set(("next", "agents", "state_value"), next_vals)
 
             compute_gae_inplace(traj, gamma=gamma, lmbda=gae_lambda, n_edges=n_edges)
@@ -1172,9 +1082,7 @@ def train(
 
         for _ in range(ppo_epochs):
             for sub in valid_sequence_minibatches(traj, seq_len=seq_len, minibatch_size=minibatch_size):
-                # anneal
-                alpha = 1.0 - (updates_done / total_updates_est)
-                alpha = max(alpha, 0.0)
+                alpha = max(0.0, 1.0 - (updates_done / total_updates_est))
                 if bool(train_cfg["optim"].get("anneal_lr", True)):
                     lr_now = base_lr * alpha
                     for g in optim.param_groups:
@@ -1182,7 +1090,6 @@ def train(
                 clip_eps_now = base_clip_eps * alpha if bool(train_cfg["loss"].get("anneal_clip_epsilon", True)) else base_clip_eps
                 updates_done += 1
 
-                # recompute current logits/values on this sub-sequence with stored recurrent inputs
                 actor_core(sub)
                 actor_head(sub)
                 value_net(sub)
@@ -1199,9 +1106,9 @@ def train(
                 adv = (adv - adv.mean(dim=(0, 1), keepdim=True)) / (adv.std(dim=(0, 1), keepdim=True) + 1e-8)
 
                 logits = sub.get(("agents", "logits"))
-                dist = Categorical(logits=logits)
+                dist   = Categorical(logits=logits)
                 new_logp = dist.log_prob(act)
-                entropy = dist.entropy()
+                entropy  = dist.entropy()
 
                 ratio = torch.exp(new_logp - old_logp)
                 surr1 = ratio * adv
@@ -1237,62 +1144,108 @@ def train(
                 torch.nn.utils.clip_grad_norm_(params, max_grad_norm)
                 optim.step()
 
-                last_total_loss = total_loss.detach()
+                last_total_loss  = total_loss.detach()
                 last_policy_loss = policy_loss.detach()
                 last_critic_loss = critic_loss.detach()
-                last_entropy = entropy.mean().detach()
+                last_entropy     = entropy.mean().detach()
 
         collector.update_policy_weights_()
 
         reward_mean = float(traj.get(("agents", "reward")).mean().item())
-        qoe_mean = float(traj.get(("next", "agents", "observation", "qoe_mean")).mean().item())
+        qoe_mean    = float(traj.get(("next", "agents", "observation", "qoe_mean")).mean().item())
 
         _r_lres = float(traj.get(("next", "agents", "observation", "reward_lambda_res")).mean().item())
         _r_bcd  = float(traj.get(("next", "agents", "observation", "reward_benign_col_dmg")).mean().item())
         _r_qoe  = float(traj.get(("next", "agents", "observation", "reward_qoe_penalty")).mean().item())
         _vio    = float(traj.get(("next", "agents", "observation", "qoe_vio_rate")).mean().item())
 
-        # atk_pass_frac = 1 - drop/in = lambda_res (fraction of attack that passed IDS)
         print(
             f"Iter={it:4d} | rew={reward_mean:+.4f} "
             f"| atk_pass={_r_lres:.3f} bcd={_r_bcd:.3f} qoe_sf={_r_qoe:.3f} "
             f"| qoe_vio={_vio:.1%}"
         )
 
-        obs = traj.get(("agents", "observation", "obs"))  # [B,T,E,D]
+        obs = traj.get(("agents", "observation", "obs"))
+        obs_log = obs.clone()
+        norm_t = env.transform[2]
+        for k in ["cpu_to_ids_ratio", "ema_mom"]:
+            idx = obs_keys.index(k)
+            loc   = norm_t.loc.view(n_edges, obs_dim)[:, idx].to(obs_log.device)
+            scale = norm_t.scale.view(n_edges, obs_dim)[:, idx].to(obs_log.device)
+            obs_log[..., idx] = obs[..., idx] * scale + loc
+
         global_decision_step = wandb_log_obs_steps(
-            obs, 
-            obs_keys, 
-            keep_keys={"cpu_to_ids_ratio"}, 
-            global_step_start=global_decision_step
+            obs_log, obs_keys, keep_keys={"cpu_to_ids_ratio", "ema_mom"}, global_step_start=global_decision_step
         )
 
         if (it + 1) % ckpt_every == 0:
-            save_ckpt(ckpt_dir / f"ckpt_iter_{it+1:06d}.pt", policy, value_net, optim, env_cfg, train_cfg, it + 1, device, env)
+            save_ckpt(ckpt_dir / f"ckpt_iter_{it+1:06d}.pt", policy, value_net, optim,
+                      env_cfg, train_cfg, it + 1, device, env)
 
         if qoe_mean > best_qoe:
             best_qoe = qoe_mean
-            save_ckpt(ckpt_dir / "ckpt_best.pt", policy, value_net, optim, env_cfg, train_cfg, it + 1, device, env)
+            save_ckpt(ckpt_dir / "ckpt_best.pt", policy, value_net, optim,
+                      env_cfg, train_cfg, it + 1, device, env)
 
         wandb.log(
             {
                 "iter": it,
-                "qoe/mean":     float(traj.get(("next", "agents", "observation", "qoe_mean")).mean().item()),
-                "qoe/vio_rate": _vio,
-                "reward/mean":  reward_mean,
-                # --- raw reward components (unweighted, positive) ---
+                "qoe/mean":              float(traj.get(("next", "agents", "observation", "qoe_mean")).mean().item()),
+                "qoe/vio_rate":          _vio,
+                "reward/mean":           reward_mean,
                 "reward/lambda_res":     _r_lres,
                 "reward/benign_col_dmg": _r_bcd,
                 "reward/qoe_penalty":    _r_qoe,
-                "loss/total": float(last_total_loss.item()) if last_total_loss is not None else 0.0,
-                "loss/policy": float(last_policy_loss.item()) if last_policy_loss is not None else 0.0,
-                "loss/critic": float(last_critic_loss.item()) if last_critic_loss is not None else 0.0,
-                "entropy": float(last_entropy.item()) if last_entropy is not None else 0.0,
-                "train/lr": float(optim.param_groups[0]["lr"]),
+                "loss/total":   float(last_total_loss.item())  if last_total_loss  is not None else 0.0,
+                "loss/policy":  float(last_policy_loss.item()) if last_policy_loss is not None else 0.0,
+                "loss/critic":  float(last_critic_loss.item()) if last_critic_loss is not None else 0.0,
+                "entropy":      float(last_entropy.item())     if last_entropy     is not None else 0.0,
+                "train/lr":       float(optim.param_groups[0]["lr"]),
                 "train/clip_eps": float(clip_eps_now),
             }
         )
+"""
+Multi-Agent Reward Variants for Recurrent (LSTM) Training.
+Includes both Centralised (CMA) and Independent (IMA) configurations.
+"""
+
+_Base = EdgeIDSParallelEnv
+
+
+class EdgeIDSCMAParallelEnv(_Base):
+    """Centralised Multi-Agent (CMA) reward variant."""
+    def _compute_step_reward(self, lres, bcd, qsf, vio, attack_in):
+        active = attack_in > 1e-6
+        r_lres = float(np.mean(lres[active])) if np.any(active) else 0.0
+        r_bcd  = float(np.mean(bcd))
+        r_qsf  = float(np.mean(qsf))
+        r_vio  = float(np.mean(vio))
+        rew_scalar = -(self.alpha * r_qsf + self.beta * r_lres + self.gamma_r * r_bcd)
+        E = len(lres)
+        return (
+            np.full(E, rew_scalar, dtype=np.float32),
+            np.full(E, r_lres,     dtype=np.float32),
+            np.full(E, r_bcd,      dtype=np.float32),
+            np.full(E, r_qsf,      dtype=np.float32),
+            np.full(E, r_vio,      dtype=np.float32),
+        )
+
+
+class EdgeIDSIMAParallelEnv(_Base):
+    """Independent Multi-Agent (IMA) reward variant."""
+    def _compute_step_reward(self, lres, bcd, qsf, vio, attack_in):
+        rew = -(self.alpha * qsf + self.beta * lres + self.gamma_r * bcd)
+        return rew, lres, bcd, qsf, vio
 
 
 if __name__ == "__main__":
-    train()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", type=str, default="cma", choices=["cma", "ima"])
+    parser.add_argument("--cfg", type=str, default="./configs/simulation_ma_0.yaml")
+    args = parser.parse_args()
+
+    env_cls = EdgeIDSCMAParallelEnv if args.mode == "cma" else EdgeIDSIMAParallelEnv
+    train(env_class=env_cls, env_cfg_path=args.cfg)
+
+# python train_ma_lstm.py --mode cma --cfg configs/simulation_ma_0.yaml
+# python train_ma_lstm.py --mode ima --cfg configs/simulation_ma_0.yaml train_ma_lstm.py --mode ima --cfg configs/simulation_ma_0.yaml

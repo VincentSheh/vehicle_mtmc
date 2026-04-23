@@ -18,7 +18,7 @@ logger:
   backend: wandb
   entity: asture123-national-taiwan-university
   project_name: multiedgeids
-  exp_name: base_ima
+  exp_name: lstm_c_u250_ids05_ema_128_3
   plots:
     enabled: true
     out_dir: logs/wandb_plots
@@ -54,7 +54,8 @@ loss:
 # Model
 # =========================
 model:
-  hidden_dim: 64           # ActorNet / CriticNet hidden size
+  num_layers: 3
+  hidden_dim: 128          # ActorNet / CriticNet hidden size
   n_actions: 3             # discrete {scale down, hold, scale up}
 
 # =========================

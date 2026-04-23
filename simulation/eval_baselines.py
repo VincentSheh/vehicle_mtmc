@@ -22,7 +22,8 @@ import pandas as pd
 import yaml
 from tqdm import tqdm
 
-from environment import build_env_base, TorchRLEnvWrapper
+from environment import build_env_base
+from train_sa_lstm import TorchRLEnvWrapper
 from method_policy import ActContext, BaselinePolicy, make_baseline_policy
 from matplotlib import pyplot as plt
 
@@ -38,11 +39,11 @@ DEFAULT_METHODS = [
     "offline_optimal",
     "lstm_rl",
 ]
-# DEFAULT_METHODS = [
-#     "autoscale_def",
-#     "offline_optimal",
-#     "lstm_rl",
-# ]
+DEFAULT_METHODS = [
+    "autoscale_def",
+    "offline_optimal",
+    "lstm_rl",
+]
 
 # Human-readable labels used in plots and summary table
 DISPLAY_NAMES: Dict[str, str] = {
@@ -65,12 +66,13 @@ def plot_ts_continuous(
     beta: int = 3,
 ):
     static_panels = [
-        ("benign_col_dmg", "Benign Collateral Damage"),
-        ("local_num_req",  "Local #Req"),
-        ("attack_in_rate", "Attack in rate"),
-        ("attack_drop_rate", "Attack drop rate"),
-        ("cpu_util",       "CPU Utilization"),
-        ("cpu_to_ids_ratio", "CPU→IDS Ratio"),
+        ("benign_col_dmg",    "Benign Collateral Damage"),
+        ("local_num_req",     "Local #Req"),
+        ("attack_in_rate",    "Attack in rate"),
+        ("attack_drop_rate",  "Attack drop rate"),
+        ("reward_lambda_res", "λ_res (raw attack pass-through)"),
+        ("cpu_util",          "CPU Utilization"),
+        ("cpu_to_ids_ratio",  "CPU→IDS Ratio"),
     ]
 
     n_edges  = len(area_ids)
@@ -621,7 +623,7 @@ def main():
     ap.add_argument("--ids_cpu_min",       type=float, default=0.5)
     ap.add_argument("--methods",           nargs="+",  default=None,
                     help="Methods to evaluate. Defaults: random constant_0.5 constant_4.0 reactive")
-    ap.add_argument("--tbsa_table",        default="tbsa_table.npz",
+    ap.add_argument("--tbsa_table",        default="tbsa_table_15.npz",
                     help="TBSA lookup-table path (needed when 'tbsa' is in --methods)")
     # ap.add_argument("--ckpt",              default="checkpoints/rew_32_netting_a4_rew/ckpt_iter_000600.pt",
     # ap.add_argument("--ckpt",              default="checkpoints/tdsc/ckpt_iter_000500.pt",

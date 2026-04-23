@@ -190,7 +190,7 @@ class LSTMRLPolicy(BaselinePolicy):
         import torch.nn as nn
         from tensordict.nn import TensorDictModule, TensorDictSequential
         from torchrl.modules import LSTMModule as TorchRLLSTM
-        from train_lstm import SplitObsModule, MergeModule
+        from train_sa_lstm import SplitObsModule, MergeModule
 
         self.device = torch.device(device)
         self.greedy = greedy
