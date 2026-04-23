@@ -174,15 +174,15 @@ class EdgeArea:
 
         self.pipeline = pipeline
 
-        if attack_type_library is not None:
-            print(f"\n[{area_id}] Attack type library (fixed for this run):")
-            print(f"  {'ID':<4} {'pattern':<8} {'λ_base':>8} {'noise_σ':>8} "
-                  f"{'t_min(s)':>9} {'t_max(s)':>9} {'lat_ms':>7} {'bw_Mbps':>8}")
-            for tid in range(attack_type_library.n_types):
-                s = attack_type_library.get(tid)
-                print(f"  {tid:<4} {s.pattern_type:<8} {s.lambda_base:>8.1f} {s.noise_std:>8.3f} "
-                      f"{s.t_min_pattern:>9.1f} {s.t_max_pattern:>9.1f} "
-                      f"{s.latency_per_flow:>7.3f} {s.bw_per_flow:>8.4f}")
+        # if attack_type_library is not None:
+        #     print(f"\n[{area_id}] Attack type library (fixed for this run):")
+        #     print(f"  {'ID':<4} {'pattern':<8} {'λ_base':>8} {'noise_σ':>8} "
+        #           f"{'t_min(s)':>9} {'t_max(s)':>9} {'lat_ms':>7} {'bw_Mbps':>8}")
+        #     for tid in range(attack_type_library.n_types):
+        #         s = attack_type_library.get(tid)
+        #         print(f"  {tid:<4} {s.pattern_type:<8} {s.lambda_base:>8.1f} {s.noise_std:>8.3f} "
+        #               f"{s.t_min_pattern:>9.1f} {s.t_max_pattern:>9.1f} "
+        #               f"{s.latency_per_flow:>7.3f} {s.bw_per_flow:>8.4f}")
 
         self.ids_cpu = 0.5
         self.va_cpu = self.budget.cpu - self.ids_cpu

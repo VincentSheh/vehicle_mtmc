@@ -428,6 +428,6 @@ def make_baseline_policy(
             raise ValueError("ckpt_path must be provided for 'lstm_rl' policy")
         if obs_keys is None:
             raise ValueError("obs_keys must be provided for 'lstm_rl' policy")
-        return LSTMRLPolicy(ckpt_path=ckpt_path, obs_keys=obs_keys, device=device, greedy=True)
+        return LSTMRLPolicy(ckpt_path=ckpt_path, obs_keys=obs_keys, device=device, greedy=False)
     else:
         raise ValueError(f"Unknown baseline policy name: {name!r}")

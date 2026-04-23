@@ -379,6 +379,20 @@ def build_env_from_cfg(cfg: dict):
         )
 
         users = []
+
+        # Support global user_sampler
+        global_user_cfg = cfg["globals"].get("user_sampler")
+        if global_user_cfg:
+            users.append(
+                User(
+                    user_id=f"{area_cfg['area_id']}_user_0",
+                    slot_ms=globals_cfg.slot_ms,
+                    t_max=cfg["run"]["t_max"],
+                    seed=cfg["run"]["seed"],
+                    synth_cfg=global_user_cfg["synthetic"],
+                )
+            )
+
         for u in area_cfg.get("users", []):
             users.append(
                 User(

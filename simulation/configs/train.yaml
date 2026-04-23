@@ -1,4 +1,11 @@
 # =========================
+# Environment
+# =========================
+env:
+  atk_level: "default"
+  user_level: "default"
+
+# =========================
 # Collector
 # =========================
 collector:

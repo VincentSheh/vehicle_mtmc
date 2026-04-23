@@ -53,7 +53,11 @@ class AttackTypeLibrary:
         pattern_types = cfg.get("pattern_types", ["sinus", "pw", "expo", "static"])
         specs = []
         for i in range(self.n_types):
-            lb_range   = cfg["lambda_base"]
+            lb_range = cfg.get("lambda_base")
+            if "lambda_level" in cfg:
+                lvl = cfg.get("level", "default")
+                lb_range = cfg["lambda_level"].get(lvl, cfg["lambda_level"].get("default"))
+
             ns_range   = cfg["noise_std"]
             tcm_range  = cfg["t_cycle_min"]
             tcd_range  = cfg["t_cycle_delta"]
@@ -172,7 +176,7 @@ class Attacker:
         self._flows_ema = pd.Series(self._flows).ewm(alpha=alpha, adjust=False).mean().to_numpy(dtype=np.float32)
 
     def _init_start(self):
-        self.active_len = self.t_max // 4
+        self.active_len = self.t_max // 2
         max_start = self.t_max - self.active_len
         # Sample start and scaling BEFORE trace generation so these are
         # identical across pattern types for the same seed.
@@ -308,13 +312,21 @@ class User:
 
         cfg = self.synth_cfg
 
+        mu_min = cfg.get("mu_min", 5.0)
+        mu_max = cfg.get("mu_max", 40.0)
+        if "mu_level" in cfg:
+            lvl = cfg.get("level", "default")
+            mu_range = cfg["mu_level"].get(lvl, cfg["mu_level"].get("default"))
+            if mu_range:
+                mu_min, mu_max = mu_range
+
         df = self.generate_req_trace(
             t_steps=self.t_max,
             slot_ms=self.slot_ms,
             rng=self.rng,
             rw_sigma_per_sqrt_sec=cfg["rw_sigma_per_sqrt_sec"],
-            mu_min=cfg["mu_min"],
-            mu_max=cfg["mu_max"],
+            mu_min=mu_min,
+            mu_max=mu_max,
             kappa=cfg["kappa"],
             sigma=cfg["sigma"],
         )
