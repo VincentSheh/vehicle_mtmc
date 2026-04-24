@@ -230,6 +230,7 @@ class EdgeArea:
 
         # 3) Sample a new attack type from the library for this episode
         if self.attack_type_library is not None:
+            self.attack_type_library._sample_all(self.rng)
             n = self.attack_type_library.n_types
             concentration = np.ones(n) * self.dirichlet_alpha
             p_attack_type = self.rng.dirichlet(concentration)

@@ -25,7 +25,7 @@ logger:
   backend: wandb
   entity: asture123-national-taiwan-university
   project_name: edgeids
-  exp_name: so_32_netting_a4_sf35
+  exp_name: a4_sf20_atk3_a18
   plots:
     enabled: true
     out_dir: logs/wandb_plots

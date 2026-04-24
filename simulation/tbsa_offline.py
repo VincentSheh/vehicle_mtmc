@@ -245,7 +245,7 @@ def main():
                     help="Episodes per IDS CPU value")
     ap.add_argument("--decision_interval", type=int, default=500,
                     help="Ticks between decisions (should match eval)")
-    ap.add_argument("--n_attack_bins", type=int, default=20)
+    ap.add_argument("--n_attack_bins", type=int, default=10)
     ap.add_argument("--n_req_bins", type=int, default=10)
     ap.add_argument(
         "--ids_cpu_values",
