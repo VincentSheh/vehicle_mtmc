@@ -56,6 +56,7 @@ DISPLAY_NAMES: Dict[str, str] = {
     "autoscale_def":   "Autoscale (Defense load)",
     "offline_optimal": "Offline Optimal (TBSA)",
     "lstm_rl":         "LSTM RL",
+    "ma_lstm_rl":      "MA LSTM RL",
     # legacy / custom names fall through to raw name
 }
 
@@ -678,7 +679,7 @@ def main():
             policies: Dict[str, BaselinePolicy] = {}
             for name in methods:
                 tbsa_path = str(tbsa_table_path) if name in ("tbsa", "offline_optimal") else None
-                ckpt      = args.ckpt             if name == "lstm_rl" else None
+                ckpt      = args.ckpt             if name in ("lstm_rl", "ma_lstm_rl") else None
                 ok_keys   = obs_keys              if name == "lstm_rl" else None
                 try:
                     policies[name] = make_baseline_policy(

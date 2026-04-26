@@ -436,6 +436,247 @@ class LSTMRLPolicy(BaselinePolicy):
 
 
 # ---------------------------------------------------------------------------
+# Multi-Agent LSTM RL policy (loads a train_ma_lstm.py checkpoint)
+# ---------------------------------------------------------------------------
+class MALSTMRLPolicy(BaselinePolicy):
+    """
+    Wraps a multi-agent checkpoint produced by train_ma_lstm.py (AgentRecurrentCore + actor head).
+
+    Builds per-edge observations directly from the environment history using the
+    same 11-feature layout used during MA training, runs a single joint forward
+    pass for all edges, and returns per-edge CPU targets.
+    """
+    # Obs layout from EdgeIDSParallelEnv.obs_keys — fixed for all MA checkpoints
+    _OBS_KEYS: List[str] = [
+        "ids_user_in_rate",
+        "attack_in_rate",
+        "ema_mom",
+        "cpu_to_ids_ratio",
+        "ids_cpu_utilization",
+        "neighbor_ids_util",
+        "neighbor_delta",
+        "neighbor_atk_rate",
+        "prev_slo_vio",
+        "transition_ticks_norm",
+        "delta_in_flight_norm",
+    ]
+    _OBS_DIM = 11
+    _TEMPORAL_OBS_KEYS = {"ids_user_in_rate", "attack_in_rate", "neighbor_atk_rate"}
+    # First 5 are read from history; last 6 are computed from transition/neighbor state
+    _BASE_N = 5
+
+    def __init__(self, ckpt_path: str, device: str = "cpu", greedy: bool = False):
+        import torch
+        import torch.nn as nn
+        from train_ma_lstm import AgentRecurrentCore
+
+        self.device = torch.device(device)
+        self.greedy = greedy
+        self.scale_step = 0.5
+
+        state = torch.load(ckpt_path, map_location=self.device, weights_only=False)
+        train_cfg = state["train_cfg"]
+
+        hidden_dim     = int(train_cfg["model"]["hidden_dim"])
+        self.n_actions = int(train_cfg["model"]["n_actions"])
+        self.hidden_dim = hidden_dim
+
+        # Derive n_edges from obsnorm shape  (loc shape = n_edges * obs_dim)
+        obsnorm = state.get("obsnorm", {})
+        _LOC_KEY   = "transforms.2.loc"
+        _SCALE_KEY = "transforms.2.scale"
+        if _LOC_KEY in obsnorm:
+            self.n_edges = int(obsnorm[_LOC_KEY].shape[0]) // self._OBS_DIM
+        else:
+            env_cfg = state.get("env_cfg", {})
+            self.n_edges = max(1, len(env_cfg.get("edge_areas", [])))
+
+        temporal_local_idx = [i for i, k in enumerate(self._OBS_KEYS) if k in self._TEMPORAL_OBS_KEYS]
+        static_local_idx   = [i for i, k in enumerate(self._OBS_KEYS) if k not in self._TEMPORAL_OBS_KEYS]
+        n_static       = len(static_local_idx)
+        actor_feat_dim = hidden_dim + n_static
+
+        self.actor_core = AgentRecurrentCore(
+            n_edges=self.n_edges,
+            obs_dim=self._OBS_DIM,
+            hidden_dim=hidden_dim,
+            device=str(self.device),
+            temporal_local_idx=temporal_local_idx,
+            static_local_idx=static_local_idx,
+        )
+        self.actor_head = nn.Linear(actor_feat_dim, self.n_actions).to(self.device)
+
+        # Map checkpoint keys:
+        #   ProbabilisticActor(TDS(core, head)).state_dict() →
+        #     "module.module.0.*"        (AgentRecurrentCore)
+        #     "module.module.1.module.*" (actor head TDM's inner nn.Linear)
+        policy_sd = state["policy"]
+        CORE_PFX  = "module.module.0."
+        HEAD_PFX  = "module.module.1.module."
+        core_sd = {k[len(CORE_PFX):]: v for k, v in policy_sd.items() if k.startswith(CORE_PFX)}
+        head_sd = {k[len(HEAD_PFX):]: v for k, v in policy_sd.items() if k.startswith(HEAD_PFX)}
+
+        if not core_sd:
+            prefixes = sorted({".".join(k.split(".")[:3]) for k in policy_sd.keys()})
+            print(f"[MALSTMRLPolicy] WARNING: no keys matched core prefix '{CORE_PFX}'; "
+                  f"found prefixes: {prefixes}")
+
+        missing, unexpected = self.actor_core.load_state_dict(core_sd, strict=False)
+        if missing:
+            print(f"[MALSTMRLPolicy] WARNING: missing core keys ({len(missing)}): {missing[:5]}")
+        if unexpected:
+            print(f"[MALSTMRLPolicy] WARNING: unexpected core keys ({len(unexpected)}): {unexpected[:5]}")
+        missing, unexpected = self.actor_head.load_state_dict(head_sd, strict=False)
+        if missing:
+            print(f"[MALSTMRLPolicy] WARNING: missing head keys ({len(missing)}): {missing[:5]}")
+
+        self.actor_core.eval()
+        self.actor_head.eval()
+
+        # Observation normalisation (ObservationNorm at transform index 2)
+        self.obs_loc = self.obs_scale = None
+        if _LOC_KEY in obsnorm and _SCALE_KEY in obsnorm:
+            self.obs_loc   = obsnorm[_LOC_KEY].detach().to(self.device)
+            self.obs_scale = obsnorm[_SCALE_KEY].detach().to(self.device)
+            print(f"[MALSTMRLPolicy] ObsNorm loaded: shape={self.obs_loc.shape}, n_edges={self.n_edges}")
+        else:
+            print("[MALSTMRLPolicy] WARNING: no obsnorm found — running WITHOUT normalisation")
+
+        self._h: Optional[object] = None
+        self._c: Optional[object] = None
+
+    def reset(self) -> None:
+        self._h = None
+        self._c = None
+
+    def _build_ma_obs(self, ctx: ActContext) -> np.ndarray:
+        """Replicate EdgeIDSParallelEnv._build_observation() from the eval-loop context."""
+        import pandas as pd
+
+        env      = ctx.env
+        n_edges  = len(ctx.ids_cpu)
+        area_ids = [e.area_id for e in env.edge_areas]
+        obs      = np.zeros((n_edges, self._OBS_DIM), dtype=np.float32)
+
+        if not env.history:
+            return obs.reshape(-1)
+
+        records = env.history[-ctx.decision_interval * n_edges:]
+        df      = pd.DataFrame([m.__dict__ for m in records])
+
+        # Base 5 features read from history (indices 0-4)
+        for i, area_id in enumerate(area_ids):
+            g = df[df["area_id"] == area_id]
+            if g.empty:
+                continue
+            for j, k in enumerate(self._OBS_KEYS[:self._BASE_N]):
+                if k not in g.columns:
+                    continue
+                obs[i, j] = float(g[k].values[-1]) if k == "cpu_to_ids_ratio" else float(np.mean(g[k].values))
+
+        # Neighbor features: ids_util (5), delta (6), atk_rate (7)
+        edge_ids_util: Dict[str, float] = {}
+        edge_atk_rate: Dict[str, float] = {}
+        for area_id in area_ids:
+            g = df[df["area_id"] == area_id]
+            if g.empty:
+                edge_ids_util[area_id] = 0.0
+                edge_atk_rate[area_id] = 0.0
+            else:
+                edge_ids_util[area_id] = float(np.clip(
+                    np.mean(g["ids_cpu_utilization"].values if "ids_cpu_utilization" in g.columns else [0.0]),
+                    0.0, 1.0))
+                edge_atk_rate[area_id] = float(np.mean(
+                    g["attack_in_rate"].values if "attack_in_rate" in g.columns else [0.0]))
+
+        for i, area_id in enumerate(area_ids):
+            nbr_utils, nbr_deltas, nbr_atk = [], [], []
+            for j in range(n_edges):
+                if j == i:
+                    continue
+                nbr_utils.append(edge_ids_util[area_ids[j]])
+                nbr_atk.append(edge_atk_rate[area_ids[j]])
+                nbr_deltas.append(float(ctx.delta_in_flight_norm[j]))  # already normalised
+            obs[i, 5] = float(np.mean(nbr_utils))  if nbr_utils  else 0.0
+            obs[i, 6] = float(np.mean(nbr_deltas)) if nbr_deltas else 0.0
+            obs[i, 7] = float(np.mean(nbr_atk))    if nbr_atk    else 0.0
+
+        # prev_slo_vio (index 8)
+        for i, area_id in enumerate(area_ids):
+            g = df[df["area_id"] == area_id]
+            if g.empty:
+                obs[i, 8] = 0.0
+                continue
+            last_qoe  = float(g["qoe_mean"].values[-1]) if "qoe_mean" in g.columns else 0.0
+            threshold = float(env.edge_areas[i].slo_threshold)
+            obs[i, 8] = 1.0 if last_qoe < threshold else 0.0
+
+        # Transition state (indices 9, 10) — taken directly from ctx
+        for i in range(n_edges):
+            obs[i, 9]  = float(ctx.transition_ticks_norm[i])
+            obs[i, 10] = float(ctx.delta_in_flight_norm[i])
+
+        return obs.reshape(-1).astype(np.float32)
+
+    def _normalise(self, obs_flat: np.ndarray) -> np.ndarray:
+        if self.obs_loc is None:
+            return obs_flat
+        import torch
+        x = torch.from_numpy(obs_flat).to(self.device)
+        return ((x - self.obs_loc) / (self.obs_scale + 1e-8)).cpu().numpy()
+
+    def act(self, ctx: ActContext) -> tuple[Optional[np.ndarray], np.ndarray]:
+        import torch
+        from tensordict import TensorDict
+
+        n_edges = len(ctx.ids_cpu)
+
+        obs_flat = self._build_ma_obs(ctx)
+        obs_norm = self._normalise(obs_flat)
+
+        if self._h is None:
+            self._h = torch.zeros(1, n_edges, 1, self.hidden_dim, device=self.device)
+            self._c = torch.zeros(1, n_edges, 1, self.hidden_dim, device=self.device)
+
+        obs_t = torch.from_numpy(obs_norm).float().to(self.device).unsqueeze(0)  # (1, n_edges*obs_dim)
+
+        td = TensorDict(
+            {
+                "observation_flat":              obs_t,
+                "is_init":                       torch.zeros(1, 1, device=self.device, dtype=torch.bool),
+                ("agents", "recurrent_state_h"): self._h,
+                ("agents", "recurrent_state_c"): self._c,
+            },
+            batch_size=[1],
+            device=self.device,
+        )
+
+        with torch.no_grad():
+            td       = self.actor_core(td)
+            features = td.get(("agents", "features"))        # (1, n_edges, actor_feat_dim)
+            logits   = self.actor_head(features).squeeze(0)  # (n_edges, n_actions)
+            self._h  = td.get(("agents", "recurrent_state_h_out"))
+            self._c  = td.get(("agents", "recurrent_state_c_out"))
+
+        ids_cpu_abs = np.empty(n_edges, dtype=np.float32)
+        for i in range(n_edges):
+            edge_logits = logits[i]
+            if self.greedy:
+                action = int(torch.argmax(edge_logits).item())
+            else:
+                probs  = torch.softmax(edge_logits, dim=-1)
+                action = int(torch.multinomial(probs, 1).item())
+            delta_cmd   = (action - (self.n_actions - 1) / 2.0) * self.scale_step
+            ids_cpu_abs[i] = float(np.clip(
+                ctx.ids_cpu[i] + delta_cmd,
+                ctx.ids_cpu_min,
+                ctx.ids_cpu_max[i],
+            ))
+
+        return ids_cpu_abs, np.zeros(n_edges, dtype=np.int64)
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 def make_baseline_policy(
@@ -446,7 +687,7 @@ def make_baseline_policy(
     device: str = "cpu",
 ) -> BaselinePolicy:
     """
-    name examples: "random", "constant_0.5", "constant_1.5", "reactive", "tbsa", "lstm_rl"
+    name examples: "random", "constant_0.5", "constant_1.5", "reactive", "tbsa", "lstm_rl", "ma_lstm_rl"
     """
     if name.startswith("constant_"):
         cpu_val = float(name.split("_", 1)[1])
@@ -476,5 +717,9 @@ def make_baseline_policy(
         if obs_keys is None:
             raise ValueError("obs_keys must be provided for 'lstm_rl' policy")
         return LSTMRLPolicy(ckpt_path=ckpt_path, obs_keys=obs_keys, device=device, greedy=False)
+    elif name == "ma_lstm_rl":
+        if ckpt_path is None:
+            raise ValueError("ckpt_path must be provided for 'ma_lstm_rl' policy")
+        return MALSTMRLPolicy(ckpt_path=ckpt_path, device=device, greedy=False)
     else:
         raise ValueError(f"Unknown baseline policy name: {name!r}")

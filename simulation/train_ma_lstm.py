@@ -631,7 +631,7 @@ class AgentRecurrentCore(nn.Module):
         if FD != E * D:
             raise RuntimeError(f"observation_flat last dim {FD} != E*D {E*D}")
 
-        obs_be = x.view(B, T, E, D).reshape(B * E, T, D)
+        obs_be = x.view(B, T, E, D).transpose(1, 2).reshape(B * E, T, D)
         temporal_be = obs_be[..., self.temporal_idx]
         static_be   = obs_be[..., self.static_idx]
         feats_be = self.feature(temporal_be)
@@ -652,16 +652,16 @@ class AgentRecurrentCore(nn.Module):
 
         merged_be = torch.cat([lstm_out, static_be], dim=-1)
         F_out = H + self.n_static
-        feats_btEH = merged_be.reshape(B, E, T, F_out).transpose(1, 2).contiguous()
+        feats_be_out = merged_be.reshape(B, E, T, F_out).transpose(1, 2).contiguous()
 
         if step_mode:
-            td.set(("agents", "features"), feats_btEH[:, 0])
+            td.set(("agents", "features"), feats_be_out[:, 0])
             h_out = h_n.transpose(0, 1).reshape(B, E, 1, H)
             c_out = c_n.transpose(0, 1).reshape(B, E, 1, H)
             td.set(("agents", "recurrent_state_h_out"), h_out)
             td.set(("agents", "recurrent_state_c_out"), c_out)
         else:
-            td.set(("agents", "features"), feats_btEH)
+            td.set(("agents", "features"), feats_be_out)
 
         return td
 
@@ -758,11 +758,20 @@ class CriticRecurrentCore(nn.Module):
 @torch.no_grad()
 def compute_gae_inplace(traj: TensorDictBase, gamma: float, lmbda: float, n_edges: int):
     reward = traj.get(("agents", "reward"))
-    done = traj.get(("agents", "done")).to(torch.bool)
-    terminated = traj.get(("agents", "terminated")).to(torch.bool)
+    done = traj.get(("agents", "done"))
+    terminated = traj.get(("agents", "terminated"))
     values = traj.get(("agents", "state_value"))
     next_values = traj.get("next").get(("agents", "state_value"))
 
+    # Ensure all are [B, T, E]
+    if reward.ndim == 4 and reward.shape[-1] == 1: reward = reward.squeeze(-1)
+    if done.ndim == 4 and done.shape[-1] == 1: done = done.squeeze(-1)
+    if terminated.ndim == 4 and terminated.shape[-1] == 1: terminated = terminated.squeeze(-1)
+    if values.ndim == 4 and values.shape[-1] == 1: values = values.squeeze(-1)
+    if next_values.ndim == 4 and next_values.shape[-1] == 1: next_values = next_values.squeeze(-1)
+
+    done = done.to(torch.bool)
+    terminated = terminated.to(torch.bool)
     not_end = (~(done | terminated)).to(values.dtype)
 
     B, T, E = reward.shape
@@ -1025,8 +1034,6 @@ def train(
             nk = ("next",) + k
             if k not in traj.keys(True, True) and nk in traj.keys(True, True):
                 traj.set(k, traj.get(nk))
-            squeeze_last1(traj, k)
-            squeeze_last1(traj.get("next"), k)
 
         if ("agents", "done") in traj.keys(True, True):
             traj.set(("agents", "done"), traj.get(("agents", "done")).to(torch.bool))

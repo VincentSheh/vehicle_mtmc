@@ -57,15 +57,16 @@ DISPLAY_NAMES: Dict[str, str] = {
     "autoscale_def":   "Autoscale (Def)",
     "offline_optimal": "TBSA Optimal",
     "lstm_rl":         "LSTM RL",
+    "ma_lstm_rl":      "MA LSTM RL",
 }
 
 
 DEFAULT_METHODS = [
-    "no_ids",
-    "static_low",
-    "static_high",
-    "autoscale_def",
-    "offline_optimal",
+    # "no_ids",
+    # "static_low",
+    # "static_high",
+    # "autoscale_def",
+    # "offline_optimal",
     "lstm_rl",
 ]
 
@@ -238,7 +239,7 @@ def collect_data(args) -> dict:
     policies: dict = {}
     for mname in methods:
         tbsa_path = str(args.tbsa_table) if mname in ("tbsa", "offline_optimal") else None
-        ckpt      = args.ckpt            if mname == "lstm_rl" else None
+        ckpt      = args.ckpt            if mname in ("lstm_rl", "ma_lstm_rl") else None
         ok_keys   = obs_keys             if mname == "lstm_rl" else None
         try:
             policies[mname] = make_baseline_policy(
