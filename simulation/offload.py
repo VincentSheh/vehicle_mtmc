@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple, Optional
 import math
+import random
 import numpy as np
 
 
@@ -86,6 +87,9 @@ def balance_workload(
     senders   = [e for e in area_ids if supply[e] > EPS]
     receivers = [e for e in area_ids if demand[e] > EPS]
 
+    random.shuffle(senders)
+    random.shuffle(receivers)
+
     flow_float: Dict[Any, Dict[Any, float]] = {e: {e: W[e]} for e in area_ids}
     rem_supply = {e: supply[e] for e in senders}
     rem_demand = {e: demand[e] for e in receivers}
@@ -145,6 +149,7 @@ def balance_workload_cto(
         for r in receivers
         if s != r
     ]
+    random.shuffle(all_links)
     all_links.sort(key=lambda x: x[2])
 
     flow_float: Dict[Any, Dict[Any, float]] = {e: {e: W[e]} for e in area_ids}
@@ -234,6 +239,7 @@ def balance_workload_cto_acc(
             cost = delay_penalty - acc
             scored_links.append((cost, s, r))
 
+    random.shuffle(scored_links)
     scored_links.sort(key=lambda x: x[0])
 
     flow_float: Dict[Any, Dict[Any, float]] = {e: {e: W[e]} for e in area_ids}
@@ -337,7 +343,9 @@ def score_based_offload(
         if total <= EPS:
             continue
 
-        for r, p in sorted(pos.items(), key=lambda kv: -kv[1]):
+        items = list(pos.items())
+        random.shuffle(items)
+        for r, p in sorted(items, key=lambda kv: -kv[1]):
             if p <= EPS or to_move <= EPS:
                 break
             share = min((p / total) * rem_supply[src], rem_demand.get(r, 0.0), to_move)

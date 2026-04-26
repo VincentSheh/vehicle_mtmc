@@ -52,8 +52,15 @@ class AttackTypeLibrary:
         cfg = self.sampler_cfg
         pattern_types = cfg.get("pattern_types", ["sinus", "pw", "expo", "static"])
         specs = []
+
+        # Support dynamic level injection for lambda_base
+        if "lambda_level" in cfg:
+            lvl = cfg.get("level", "default")
+            lb_range = cfg["lambda_level"].get(lvl, cfg["lambda_level"]["default"])
+        else:
+            lb_range = cfg["lambda_base"]
+
         for i in range(self.n_types):
-            lb_range   = cfg["lambda_base"]
             ns_range   = cfg["noise_std"]
             tcm_range  = cfg["t_cycle_min"]
             tcd_range  = cfg["t_cycle_delta"]
@@ -309,13 +316,22 @@ class User:
 
         cfg = self.synth_cfg
 
+        # Support dynamic level injection for mu range
+        if "mu_level" in cfg:
+            lvl = cfg.get("level", "default")
+            mu_range = cfg["mu_level"].get(lvl, cfg["mu_level"]["default"])
+            mu_min, mu_max = mu_range
+        else:
+            mu_min = cfg["mu_min"]
+            mu_max = cfg["mu_max"]
+
         df = self.generate_req_trace(
             t_steps=self.t_max,
             slot_ms=self.slot_ms,
             rng=self.rng,
             rw_sigma_per_sqrt_sec=cfg["rw_sigma_per_sqrt_sec"],
-            mu_min=cfg["mu_min"],
-            mu_max=cfg["mu_max"],
+            mu_min=mu_min,
+            mu_max=mu_max,
             kappa=cfg["kappa"],
             sigma=cfg["sigma"],
         )

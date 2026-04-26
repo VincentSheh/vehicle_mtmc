@@ -18,7 +18,7 @@ logger:
   backend: wandb
   entity: asture123-national-taiwan-university
   project_name: multiedgeids
-  exp_name: lstm_c_u250_ids05_ema_128_3
+  exp_name: lstm_i_u200_atk3_a4
   plots:
     enabled: true
     out_dir: logs/wandb_plots

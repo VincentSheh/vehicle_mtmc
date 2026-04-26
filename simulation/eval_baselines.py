@@ -14,6 +14,9 @@ from __future__ import annotations
 
 import argparse
 import math
+import copy
+import tempfile
+import os
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -625,29 +628,24 @@ def main():
                     help="Methods to evaluate. Defaults: random constant_0.5 constant_4.0 reactive")
     ap.add_argument("--tbsa_table",        default="tbsa_table_15.npz",
                     help="TBSA lookup-table path (needed when 'tbsa' is in --methods)")
-    # ap.add_argument("--ckpt",              default="checkpoints/rew_32_netting_a4_rew/ckpt_iter_000600.pt",
-    # ap.add_argument("--ckpt",              default="checkpoints/tdsc/ckpt_iter_000500.pt",
     ap.add_argument("--ckpt",              default="checkpoints/singleedge/rew_32_netting_a4_rew/ckpt_best.pt",
                     help="Checkpoint path (needed when 'lstm_rl' is in --methods)")
     ap.add_argument("--device",            default="cpu")
     args = ap.parse_args()
 
     with open(args.cfg) as f:
-        cfg = yaml.safe_load(f)
+        cfg_original = yaml.safe_load(f)
 
-    # Sync global random state with training for AttackTypeLibrary (identical to train_lstm.py)
-    base_seed = int(cfg["run"]["seed"])
+    base_seed = int(cfg_original["run"]["seed"])
     np.random.seed(base_seed)
 
-    decision_interval = args.decision_interval or int(cfg["globals"]["decision_interval"])
+    decision_interval = args.decision_interval or int(cfg_original["globals"]["decision_interval"])
 
-    outdir = Path(args.outdir)
-    outdir.mkdir(parents=True, exist_ok=True)
+    outdir_base = Path(args.outdir)
+    outdir_base.mkdir(parents=True, exist_ok=True)
 
-    # Resolve methods list
     methods: List[str] = args.methods if args.methods else list(DEFAULT_METHODS)
 
-    # Read obs_keys and reward weights from a throw-away wrapper instance
     _wrapper      = TorchRLEnvWrapper(cfg_path=args.cfg, decision_interval=decision_interval, device="cpu")
     obs_keys      = _wrapper.obs_keys
     reward_alpha  = _wrapper.reward_alpha
@@ -657,94 +655,112 @@ def main():
     n_actions     = _wrapper.n_actions
     del _wrapper
 
-    env = build_env_base(args.cfg)
+    atk_lvls = ["low", "mid", "high"]
+    user_lvls = ["low", "mid", "high"]
 
-    # Build one policy per method
-    tbsa_table_path = Path(args.tbsa_table)
-    policies: Dict[str, BaselinePolicy] = {}
-    for name in methods:
-        tbsa_path = str(tbsa_table_path) if name in ("tbsa", "offline_optimal") else None
-        ckpt      = args.ckpt             if name == "lstm_rl" else None
-        ok_keys   = obs_keys              if name == "lstm_rl" else None
-        try:
-            policies[name] = make_baseline_policy(
-                name,
-                tbsa_table_path=tbsa_path,
-                ckpt_path=ckpt,
-                obs_keys=ok_keys,
-                device=args.device,
-            )
-        except (ValueError, FileNotFoundError) as exc:
-            print(f"[warn] Skipping '{name}': {exc}")
+    for atk_lvl in atk_lvls:
+        for user_lvl in user_lvls:
+            print(f"\n>>> Evaluating Levels: Attack={atk_lvl}, User={user_lvl}")
+            
+            cfg = copy.deepcopy(cfg_original)
+            if "attack_sampler" in cfg.get("globals", {}):
+                cfg["globals"]["attack_sampler"]["level"] = atk_lvl
+            
+            if "user_sampler" in cfg.get("globals", {}) and "synthetic" in cfg["globals"]["user_sampler"]:
+                cfg["globals"]["user_sampler"]["synthetic"]["level"] = user_lvl
 
-    methods = [m for m in methods if m in policies]
-    if not methods:
-        raise SystemExit("No valid methods to evaluate.")
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as tmp:
+                yaml.dump(cfg, tmp)
+                tmp_cfg_path = tmp.name
 
-    # Accumulate per-decision results across episodes
-    results: Dict[str, Dict[str, np.ndarray]] = {m: {} for m in methods}
-    # Track carry-over state per method (matches training SyncDataCollector behavior)
-    last_ids_cpu: Dict[str, Optional[np.ndarray]] = {m: None for m in methods}
+            try:
+                env = build_env_base(tmp_cfg_path)
+            finally:
+                if os.path.exists(tmp_cfg_path):
+                    os.remove(tmp_cfg_path)
 
-    for ep in tqdm(range(args.episodes), desc="episodes"):
-        ep_seed = base_seed + (ep + 1) * 1000   # matches training: base_seed + episode_id*1000
-        for mname in methods:
-            ep_result, final_ids = run_episode(
-                env=env,
-                cfg=cfg,
-                policy=policies[mname],
-                obs_keys=obs_keys,
-                decision_interval=decision_interval,
-                scale_step=args.scale_step,
-                n_actions=n_actions,
-                ids_cpu_min=args.ids_cpu_min,
-                seed=ep_seed,
-                reward_alpha=reward_alpha,
-                reward_beta=reward_beta,
-                reward_gamma=reward_gamma,
-                reward_q_th=reward_q_th,
-                initial_ids_cpu=last_ids_cpu[mname],
-                # initial_ids_cpu=None,
-            )
-            last_ids_cpu[mname] = final_ids
-            for k, v in ep_result.items():
-                existing = results[mname].get(k)
-                if existing is None or existing.size == 0:
-                    results[mname][k] = v
-                else:
-                    results[mname][k] = np.concatenate([existing, v], axis=0)
+            tbsa_table_path = Path(args.tbsa_table)
+            policies: Dict[str, BaselinePolicy] = {}
+            for name in methods:
+                tbsa_path = str(tbsa_table_path) if name in ("tbsa", "offline_optimal") else None
+                ckpt      = args.ckpt             if name == "lstm_rl" else None
+                ok_keys   = obs_keys              if name == "lstm_rl" else None
+                try:
+                    policies[name] = make_baseline_policy(
+                        name,
+                        tbsa_table_path=tbsa_path,
+                        ckpt_path=ckpt,
+                        obs_keys=ok_keys,
+                        device=args.device,
+                    )
+                except (ValueError, FileNotFoundError) as exc:
+                    print(f"[warn] Skipping '{name}': {exc}")
 
-    # Remap to display names for plots and summary
-    display_results = {DISPLAY_NAMES.get(m, m): results[m] for m in methods}
+            valid_methods = [m for m in methods if m in policies]
+            if not valid_methods:
+                print(f"[skip] No valid methods for Attack={atk_lvl}, User={user_lvl}")
+                continue
 
-    area_ids = [e.area_id for e in env.edge_areas]
+            results: Dict[str, Dict[str, np.ndarray]] = {m: {} for m in valid_methods}
+            last_ids_cpu: Dict[str, Optional[np.ndarray]] = {m: None for m in valid_methods}
 
-    ts_path      = outdir / "qoe_ts.png"
-    summary_path = outdir / "summary.png"
-    plot_ts_continuous(display_results, ts_path, area_ids=area_ids, slo_qoe_min=reward_q_th, beta=3)
-    plot_qoe_vio_bars( display_results, summary_path, qoe_slo_min=reward_q_th, beta=3)
+            for ep in tqdm(range(args.episodes), desc=f"episodes ({atk_lvl}/{user_lvl})"):
+                ep_seed = base_seed + (ep + 1) * 1000
+                for mname in valid_methods:
+                    ep_result, final_ids = run_episode(
+                        env=env,
+                        cfg=cfg,
+                        policy=policies[mname],
+                        obs_keys=obs_keys,
+                        decision_interval=decision_interval,
+                        scale_step=args.scale_step,
+                        n_actions=n_actions,
+                        ids_cpu_min=args.ids_cpu_min,
+                        seed=ep_seed,
+                        reward_alpha=reward_alpha,
+                        reward_beta=reward_beta,
+                        reward_gamma=reward_gamma,
+                        reward_q_th=reward_q_th,
+                        initial_ids_cpu=last_ids_cpu[mname],
+                    )
+                    last_ids_cpu[mname] = final_ids
+                    for k, v in ep_result.items():
+                        existing = results[mname].get(k)
+                        if existing is None or existing.size == 0:
+                            results[mname][k] = v
+                        else:
+                            results[mname][k] = np.concatenate([existing, v], axis=0)
 
-    print(f"Plots saved to {outdir}/")
+            lvl_outdir = outdir_base / f"atk_{atk_lvl}_user_{user_lvl}"
+            lvl_outdir.mkdir(parents=True, exist_ok=True)
+            
+            display_results = {DISPLAY_NAMES.get(m, m): results[m] for m in valid_methods}
+            area_ids = [e.area_id for e in env.edge_areas]
+            ts_path      = lvl_outdir / "qoe_ts.png"
+            summary_path = lvl_outdir / "summary.png"
+            plot_ts_continuous(display_results, ts_path, area_ids=area_ids, slo_qoe_min=reward_q_th, beta=3)
+            plot_qoe_vio_bars( display_results, summary_path, qoe_slo_min=reward_q_th, beta=3)
 
-    # Summary table — comparable to wandb training metrics
-    col_w = 26
-    header = f"{'Method':<{col_w}} {'qoe_vio_rate':>12} {'reward/mean':>12} {'qoe_penalty':>12} {'atk_drop_pct':>12} {'lambda_res':>12}"
-    print("\n" + header)
-    print("-" * len(header))
-    for mname in methods:
-        r = results[mname]
-        atk_in_sum  = float(r['attack_in_rate'].sum())
-        atk_drp_sum = float(r['attack_drop_rate'].sum())
-        atk_drop_pct = atk_drp_sum / atk_in_sum if atk_in_sum > 1e-6 else 0.0
-        label = DISPLAY_NAMES.get(mname, mname)
-        print(
-            f"{label:<{col_w}} "
-            f"{float(np.mean(r['qoe_vio_rate'])):>12.1%} "
-            f"{float(np.mean(r['reward'])):>12.4f} "
-            f"{float(np.mean(r['reward_qoe_penalty'])):>12.4f} "
-            f"{atk_drop_pct:>12.1%} "
-            f"{1.0 - atk_drop_pct:>12.4f}"
-        )
+            print(f"Plots saved to {lvl_outdir}/")
+
+            col_w = 26
+            header = f"{'Method':<{col_w}} {'qoe_vio_rate':>12} {'reward/mean':>12} {'qoe_penalty':>12} {'atk_drop_pct':>12} {'lambda_res':>12}"
+            print("\n" + header)
+            print("-" * len(header))
+            for mname in valid_methods:
+                r = results[mname]
+                atk_in_sum  = float(r['attack_in_rate'].sum())
+                atk_drp_sum = float(r['attack_drop_rate'].sum())
+                atk_drop_pct = atk_drp_sum / atk_in_sum if atk_in_sum > 1e-6 else 0.0
+                label = DISPLAY_NAMES.get(mname, mname)
+                print(
+                    f"{label:<{col_w}} "
+                    f"{float(np.mean(r['qoe_vio_rate'])):>12.1%} "
+                    f"{float(np.mean(r['reward'])):>12.4f} "
+                    f"{float(np.mean(r['reward_qoe_penalty'])):>12.4f} "
+                    f"{atk_drop_pct:>12.1%} "
+                    f"{1.0 - atk_drop_pct:>12.4f}"
+                )
 
 
 if __name__ == "__main__":

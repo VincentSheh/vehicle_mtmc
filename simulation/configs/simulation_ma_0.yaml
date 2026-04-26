@@ -19,15 +19,34 @@ globals:
   attack_sampler:
     n_types: 10
     dirichlet_alpha: 0.2  # symmetric Dirichlet concentration over edges per type; higher=uniform, lower=concentrated on one edge
-    # pattern_types: ["sinus", "pw", "expo"]
-    pattern_types: ["pw"]
-    lambda_base:      [14000, 18000]   # flows/sec
+    pattern_types: ["sinus", "pw", "expo" ] #, "yoyo"]
+    # pattern_types: ["pw"]
+    # pattern_types: ["yoyo"]
+    level: "default"
+    lambda_level:
+      default: [14000, 18000]
+      low: [5000, 10000]
+      mid: [12000, 16000]
+      high: [18000, 24000]
     noise_std:        [0.05, 0.10]
     t_cycle_min:      [300, 500]     # seconds (lower bound on cycle duration)
-    t_cycle_delta:    [300, 800]     # seconds added to t_min to get t_max
-    latency_per_flow: [2, 4]   # ms per flow
-    bw_per_flow:      [0.0, 0.0]     # Mbps per flow
+    t_cycle_delta:    [300, 800]   # seconds added to t_min to get t_max
+    latency_per_flow: [2,4]      # ms per flow  (latency_per_flow * 1000 * va_cpu / lambda_base)
+    bw_per_flow:      [0.0, 0.0]   # Mbps per flow
+    # bw_per_flow:      [0.15, 0.30]   # Mbps per flow
     non_defendable_bw_const: 0.0
+  
+  user_sampler:
+    synthetic:
+      level: "default"
+      rw_sigma_per_sqrt_sec: 1.2      
+      kappa: 0.25 
+      sigma: 8 # Before Conversion to per step request = 0.9
+      mu_level:
+        default: [20.0, 200.0]
+        low: [10.0, 100.0]
+        mid: [30.0, 150.0]
+        high: [50.0, 250.0]
 
   reward:
     alpha_inv: 11.0   # QoE shortfall normalizer   
@@ -35,7 +54,7 @@ globals:
     gamma_inv: 10.0   # Benign collateral normalizer
     q_th:      0.35   # QoE shortfall threshold
 
-  offload_mode: "cto"  # "none" | "cto" | "cto_acc" | "delay_workload" | "full"
+  offload_mode: "cto_acc"  # "none" | "cto" | "cto_acc" | "delay_workload" | "full"
   # VA-stage attack offload mode:
   #   false (default) — admitted attacks stay at their IDS executor; VA capacity is
   #                     pre-reduced by attack load before the benign-user offload plan.
@@ -52,7 +71,7 @@ globals:
   #                  + (util_src  - util_dst)   * w4   [full only]
   offload_weights:
     w1: 1.0   # FNR accuracy improvement
-    w2: 0.0   # FPR accuracy improvement
+    w2: 1000.0   # FPR accuracy improvement
     w3: 1.000  # propagation delay penalty
 
   # Accuracy-by-region matrix: [src_edge_idx][exec_edge_idx] = [FPR, FNR]
@@ -61,22 +80,18 @@ globals:
   # Off-diagonal = cross-edge accuracy (typically higher error due to domain shift).
   # Order matches edge_areas list: E1=0, E2=1.
   accuracy_by_region:
-    # - [[0.0, 0.0], [0.0, 1.0], [0.0, 0.5]]   # traffic from E1: inspected at [E1, E2, E3]
-    # - [[0.0, 0.2], [0.0, 0.00], [0.0, 0.8]]   # traffic from E2: inspected at [E1, E2, E3]
-    # - [[0.0, 0.8], [0.0, 0.3], [0.0, 0.0]]   # traffic from E3: inspected at [E1, E2, E3]    
-    # - [[0.00, 0.00], [0.5, 0.00], [0.5, 0.00]]  # E1→E2 similar; E1→E3 more domain shift                                                                                                                                                                        
-    # - [[0.5, 0.00], [0.00, 0.00], [0.5, 0.00]]  # E2→E3 more similar than E2→E1                                                                                                                                                                                   
-    # - [[0.5, 0.00], [0.5, 0.00], [0.5, 0.00]]  # E3→E2 more similar than E3→E1         
-    # - [[0.0, 0.00], [0.1, 0.00], [0.1, 0.00]]   # traffic from E1: inspected at [E1, E2, E3]
-    # - [[0.1, 0.00], [0.0, 0.00], [0.1, 0.00]]   # traffic from E2: inspected at [E1, E2, E3]
-    # - [[0.1, 0.00], [0.1, 0.00], [0.0, 0.00]]   # traffic from E3: inspected at [E1, E2, E3]
-    # - [[0.0, 0.00], [0.0, 0.1], [0.0, 0.1]]   # traffic from E1: inspected at [E1, E2, E3]
-    # - [[0.0, 0.1], [0.0, 0.00], [0.0, 0.1]]   # traffic from E2: inspected at [E1, E2, E3]
-    # - [[0.0, 0.1], [0.0, 0.1], [0.0, 0.00]]   # traffic from E3: inspected at [E1, E2, E3]
-    - [[0.0, 0.00], [0.0, 0.00], [0.0, 0.00]]   # traffic from E1: inspected at [E1, E2, E3]
-    - [[0.0, 0.00], [0.0, 0.00], [0.0, 0.00]]   # traffic from E2: inspected at [E1, E2, E3]
-    - [[0.0, 0.00], [0.0, 0.00], [0.0, 0.00]]   # traffic from E3: inspected at [E1, E2, E3]
-
+    # - [[0.0, 0.00], [0.0, 0.00], [0.0, 0.00]]   # traffic from E1: inspected at [E1, E2, E3]
+    # - [[0.0, 0.00], [0.0, 0.00], [0.0, 0.00]]   # traffic from E2: inspected at [E1, E2, E3]
+    # - [[0.0, 0.00], [0.0, 0.00], [0.0, 0.00]]   # traffic from E3: inspected at [E1, E2, E3]
+    # - [[0.0,0.0]]
+    # Raw Accuracy Matrix
+    # - [[0.0, 0.00], [0.0, 0.00], [0.0, 0.00]]   # traffic from E1: inspected at [E1, E2, E3]
+    # - [[0.0, 0.00], [0.0, 0.00], [0.0, 0.00]]   # traffic from E2: inspected at [E1, E2, E3]
+    # - [[0.0, 0.00], [0.0, 0.00], [0.0, 0.00]]   # traffic from E3: inspected at [E1, E2, E3]
+    # Validation Select Accuracy Matrix
+    - [[0.215, 0.00], [0.5, 0.00], [0.5, 0.00]]   # traffic from E1: inspected at [E1, E2, E3]
+    - [[0.5, 0.00], [0.031, 0.00], [0.5, 0.00]]   # traffic from E2: inspected at [E1, E2, E3]
+    - [[0.5, 0.00], [0.5, 0.00], [0.043, 0.00]]   # traffic from E3: inspected at [E1, E2, E3]
 
   # Propagation delay matrix in ms: row=source edge index, col=target edge index.
   # Order matches edge_areas list: E1=0, E2=1, E3=2. Diagonal must be 0.
@@ -87,9 +102,13 @@ globals:
     # - [0.0,  0.0, 0.0]
     # - [0.0,  0.0, 0.0]
     # - [0.0, 0.0,  0.0]
-    - [0.0,  20.0, 30.0]
-    - [20.0,  0.0, 40.0]
-    - [30.0, 40.0,  0.0]
+    # - [0.0,  20.0, 30.0]
+    # - [20.0,  0.0, 40.0]
+    # - [30.0, 40.0,  0.0]
+    - [0.0,  20.0, 10.0]
+    - [10.0,  0.0, 20.0]
+    - [10.0, 20.0,  0.0]
+    # - [0.0,0.0]    
 
   video_pipeline:
     reid_latency: 20 #! Should consider batch processing
@@ -152,15 +171,6 @@ edge_areas:
 
     dirichlet_concentration: 1.0  # Dirichlet alpha for P(a|e); 1.0 = uniform over attack types
 
-    users:
-      - user_id: 0
-        synthetic:
-          rw_sigma_per_sqrt_sec: 1.2
-          mu_min: 20.0
-          mu_max: 250.0
-          kappa: 0.25
-          sigma: 8
-
 
   - area_id: "E2"
     cpu_cycle_per_ms: 3.8 #3.8GHz #3.8E6 / ms
@@ -174,15 +184,6 @@ edge_areas:
 
     dirichlet_concentration: 1.0  # Dirichlet alpha for P(a|e); 1.0 = uniform over attack types
 
-    users:
-      - user_id: 0
-        synthetic:
-          rw_sigma_per_sqrt_sec: 1.2
-          mu_min: 20.0
-          mu_max: 250.0
-          kappa: 0.25
-          sigma: 8
-
 
   - area_id: "E3"
     cpu_cycle_per_ms: 3.8 #3.8GHz #3.8E6 / ms
@@ -195,12 +196,3 @@ edge_areas:
       Gamma: 0.0005
 
     dirichlet_concentration: 1.0  # Dirichlet alpha for P(a|e); 1.0 = uniform over attack types
-
-    users:
-      - user_id: 0
-        synthetic:
-          rw_sigma_per_sqrt_sec: 1.2
-          mu_min: 20.0
-          mu_max: 250.0
-          kappa: 0.25
-          sigma: 8

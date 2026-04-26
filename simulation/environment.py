@@ -659,6 +659,7 @@ def build_env_from_cfg(cfg: dict):
 
     # Global fallback IDS accuracy (used when area has no ids_config)
     global_ids_accuracy = {"default": (0.0, 0.0)}
+    global_user_cfg = cfg["globals"].get("user_sampler")
 
     for area_cfg in cfg["edge_areas"]:
         ids_accuracy = (
@@ -675,16 +676,32 @@ def build_env_from_cfg(cfg: dict):
         )
 
         users = []
-        for u in area_cfg.get("users", []):
+        area_users_cfg = area_cfg.get("users", [])
+        
+        if not area_users_cfg and global_user_cfg:
+            # Create a default user if none specified but global sampler exists
             users.append(
                 User(
-                    user_id=u["user_id"],
+                    user_id=0,
                     slot_ms=globals_cfg.slot_ms,
                     t_max=cfg["run"]["t_max"],
                     seed=cfg["run"]["seed"],
-                    synth_cfg=u["synthetic"],
+                    synth_cfg=global_user_cfg["synthetic"],
                 )
             )
+        else:
+            for u in area_users_cfg:
+                # Prefer global user_sampler if present
+                synth_cfg = global_user_cfg["synthetic"] if global_user_cfg else u["synthetic"]
+                users.append(
+                    User(
+                        user_id=u["user_id"],
+                        slot_ms=globals_cfg.slot_ms,
+                        t_max=cfg["run"]["t_max"],
+                        seed=cfg["run"]["seed"],
+                        synth_cfg=synth_cfg,
+                    )
+                )
 
         # With attack_type_library, attackers are built dynamically at episode reset
         attackers = []
@@ -796,7 +813,7 @@ def test_environment_run(cfg_path: str, plot=False, decision_interval: int = 500
     env = build_env_base(cfg_path)
 
     dfs = []
-    for i in range(10):
+    for i in range(1):
         env.reset(seed=1000 + i)
 
         n_edges = len(env.edge_areas)
@@ -897,4 +914,4 @@ def test_environment_run(cfg_path: str, plot=False, decision_interval: int = 500
     print(f"Plots saved to {out_dir}/")    
         
 if __name__ == "__main__":
-    test_environment_run("./configs/simulation_ma_0.yaml", plot=True, method="constant", constant_cpu=0.0)
+    test_environment_run("./configs/simulation_ma_0.yaml", plot=True, method="constant", constant_cpu=3.0)
