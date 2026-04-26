@@ -116,12 +116,20 @@ class EdgeIDSParallelEnv(PZooParallelEnv):
             "ema_mom",
             "cpu_to_ids_ratio",
             "ids_cpu_utilization",
-            "neighbor_ids_util",
-            "neighbor_delta",
-            "neighbor_atk_rate",
-            "prev_slo_vio",
+        ]
+        if self.n_edges > 1:
+            self.obs_keys += [
+                "neighbor_ids_util",
+                "neighbor_delta",
+                "neighbor_atk_rate",
+                "prev_slo_vio",
+                
+            ]
+        
+        self.obs_keys += [
             "transition_ticks_norm",
             "delta_in_flight_norm",
+            "queue_ahead_norm",
         ]
         self.obs_dim = len(self.obs_keys)
 
@@ -219,8 +227,14 @@ class EdgeIDSParallelEnv(PZooParallelEnv):
         for i in range(self.n_edges):
             ids_cpu_max = float(self.env.edge_areas[i].budget.cpu - VA_CPU_RESERVE)
             prev = self.ids_cpu[i].copy()
+            
+            # Netting queue logic: clamp requested target relative to settled
+            _settled = float(self.ids_cpu_settled[i])
+            _max_q   = float(self.scaling_quanta[-1])
             self.ids_cpu[i] = np.clip(
-                self.ids_cpu[i] + delta_cmd[i], self.ids_cpu_min, ids_cpu_max
+                self.ids_cpu[i] + delta_cmd[i], 
+                max(self.ids_cpu_min, _settled - _max_q), 
+                min(ids_cpu_max, _settled + _max_q)
             )
             delta_eff = float(self.ids_cpu[i] - prev)
 
@@ -244,6 +258,7 @@ class EdgeIDSParallelEnv(PZooParallelEnv):
         total_bcd  = np.zeros(self.n_edges, dtype=np.float32)
         total_qsf  = np.zeros(self.n_edges, dtype=np.float32)
         total_vio  = np.zeros(self.n_edges, dtype=np.float32)
+        active_ticks = np.zeros(self.n_edges, dtype=np.int32)
 
         terminated_flag = False
         steps = 0
@@ -290,6 +305,7 @@ class EdgeIDSParallelEnv(PZooParallelEnv):
                 total_bcd  += bcd_d
                 total_qsf  += qsf_d
                 total_vio  += vio_d
+                active_ticks += (attack_in > 1e-6).astype(np.int32)
 
             steps += 1
             if self.env.t >= self.env.t_max:
@@ -297,7 +313,7 @@ class EdgeIDSParallelEnv(PZooParallelEnv):
                 break
 
         rew_agents = (total_rew  / max(1, steps)).astype(np.float32, copy=False)
-        info_lres  = (total_lres / max(1, steps)).astype(np.float32, copy=False)
+        info_lres  = np.where(active_ticks > 0, total_lres / np.maximum(active_ticks, 1), 0.0).astype(np.float32)
         info_bcd   = (total_bcd  / max(1, steps)).astype(np.float32, copy=False)
         info_qsf   = (total_qsf  / max(1, steps)).astype(np.float32, copy=False)
         info_vio   = (total_vio  / max(1, steps)).astype(np.float32, copy=False)
@@ -347,65 +363,66 @@ class EdgeIDSParallelEnv(PZooParallelEnv):
         records = self.env.history[-self.decision_interval * self.n_edges :]
         df = pd.DataFrame([m.__dict__ for m in records])
 
-        n_base = 5
-
+        # 1. Local base metrics
+        base_keys = ["ids_user_in_rate", "attack_in_rate", "ema_mom", "cpu_to_ids_ratio", "ids_cpu_utilization"]
         for i, area_id in enumerate(self.area_ids):
             g = df[df["area_id"] == area_id]
             if g.empty:
                 continue
-            for j in range(n_base):
-                k = self.obs_keys[j]
+            for k in base_keys:
+                if k not in self.obs_keys: continue
+                idx = self.obs_keys.index(k)
                 vals = g[k].values
                 if k == "cpu_to_ids_ratio":
-                    obs[i, j] = float(vals[-1])
+                    obs[i, idx] = float(vals[-1])
                 else:
-                    obs[i, j] = float(np.mean(vals))
+                    obs[i, idx] = float(np.mean(vals))
 
-        edge_ids_util: Dict[str, float] = {}
-        edge_atk_rate: Dict[str, float] = {}
-        for area_id in self.area_ids:
-            g = df[df["area_id"] == area_id]
-            if g.empty:
-                edge_ids_util[area_id] = 0.0
-                edge_atk_rate[area_id] = 0.0
-            else:
-                edge_ids_util[area_id] = float(np.clip(np.mean(g["ids_cpu_utilization"].values), 0.0, 1.0))
-                edge_atk_rate[area_id] = float(np.mean(g["attack_in_rate"].values))
+        # 2. Neighbor metrics (only if present)
+        if self.n_edges > 1:
+            edge_ids_util: Dict[str, float] = {}
+            edge_atk_rate: Dict[str, float] = {}
+            for area_id in self.area_ids:
+                g = df[df["area_id"] == area_id]
+                if g.empty:
+                    edge_ids_util[area_id] = 0.0
+                    edge_atk_rate[area_id] = 0.0
+                else:
+                    edge_ids_util[area_id] = float(np.clip(np.mean(g["ids_cpu_utilization"].values), 0.0, 1.0))
+                    edge_atk_rate[area_id] = float(np.mean(g["attack_in_rate"].values))
 
-        max_delta = self.scale_step * (self.n_actions - 1) / 2.0
-        for i, area_id in enumerate(self.area_ids):
-            nbr_utils: List[float] = []
-            nbr_deltas: List[float] = []
-            nbr_atk: List[float] = []
-            for j in range(self.n_edges):
-                if j == i:
-                    continue
-                other_id = self.area_ids[j]
-                nbr_utils.append(edge_ids_util[other_id])
-                nbr_atk.append(edge_atk_rate[other_id])
-                delta = float(self.ids_cpu_target[j]) - float(self.ids_cpu_settled[j])
-                nbr_deltas.append(float(np.clip(delta / max(max_delta, 1e-6), -1.0, 1.0)))
+            max_delta = self.scale_step * (self.n_actions - 1) / 2.0
+            for i, area_id in enumerate(self.area_ids):
+                nbr_utils: List[float] = []
+                nbr_deltas: List[float] = []
+                nbr_atk: List[float] = []
+                for j in range(self.n_edges):
+                    if j == i:
+                        continue
+                    other_id = self.area_ids[j]
+                    nbr_utils.append(edge_ids_util[other_id])
+                    nbr_atk.append(edge_atk_rate[other_id])
+                    delta = float(self.ids_cpu_target[j]) - float(self.ids_cpu_settled[j])
+                    nbr_deltas.append(float(np.clip(delta / max(max_delta, 1e-6), -1.0, 1.0)))
 
-            obs[i, n_base]     = float(np.mean(nbr_utils))  if nbr_utils  else 0.0
-            obs[i, n_base + 1] = float(np.mean(nbr_deltas)) if nbr_deltas else 0.0
-            obs[i, n_base + 2] = float(np.mean(nbr_atk))    if nbr_atk    else 0.0
+                obs[i, self.obs_keys.index("neighbor_ids_util")] = float(np.mean(nbr_utils))  if nbr_utils  else 0.0
+                obs[i, self.obs_keys.index("neighbor_delta")]    = float(np.mean(nbr_deltas)) if nbr_deltas else 0.0
+                obs[i, self.obs_keys.index("neighbor_atk_rate")] = float(np.mean(nbr_atk))    if nbr_atk    else 0.0
+                
+                # SLA History
+                g = df[df["area_id"] == area_id]
+                if not g.empty:
+                    last_qoe = float(g["qoe_mean"].values[-1])
+                    threshold = float(self.env.edge_areas[i].slo_threshold)
+                    obs[i, self.obs_keys.index("prev_slo_vio")] = 1.0 if last_qoe < threshold else 0.0
 
-        for i, area_id in enumerate(self.area_ids):
-            g = df[df["area_id"] == area_id]
-            if g.empty:
-                obs[i, n_base + 3] = 0.0
-                continue
-            last_qoe = float(g["qoe_mean"].values[-1])
-            threshold = float(self.env.edge_areas[i].slo_threshold)
-            obs[i, n_base + 3] = 1.0 if last_qoe < threshold else 0.0
-
+        # 3. Scaling metrics (always present)
         max_dur = float(self.scaling_time_steps[-1])
+        max_delta = self.scale_step * (self.n_actions - 1) / 2.0
         for i in range(self.n_edges):
-            obs[i, -2] = float(self.transition_ticks_remaining[i]) / max(max_dur, 1.0)
-
-        for i in range(self.n_edges):
+            obs[i, self.obs_keys.index("transition_ticks_norm")] = float(self.transition_ticks_remaining[i]) / max(max_dur, 1.0)
             delta_in_flight = float(self.ids_cpu_target[i]) - float(self.ids_cpu_settled[i])
-            obs[i, -1] = float(np.clip(delta_in_flight / max(max_delta, 1e-6), -1.0, 1.0))
+            obs[i, self.obs_keys.index("delta_in_flight_norm")] = float(np.clip(delta_in_flight / max(max_delta, 1e-6), -1.0, 1.0))
 
         return obs
 
@@ -631,7 +648,7 @@ class AgentRecurrentCore(nn.Module):
         if FD != E * D:
             raise RuntimeError(f"observation_flat last dim {FD} != E*D {E*D}")
 
-        obs_be = x.view(B, T, E, D).reshape(B * E, T, D)
+        obs_be = x.view(B, T, E, D).transpose(1, 2).reshape(B * E, T, D)
         temporal_be = obs_be[..., self.temporal_idx]
         static_be   = obs_be[..., self.static_idx]
         feats_be = self.feature(temporal_be)
@@ -652,16 +669,16 @@ class AgentRecurrentCore(nn.Module):
 
         merged_be = torch.cat([lstm_out, static_be], dim=-1)
         F_out = H + self.n_static
-        feats_btEH = merged_be.reshape(B, E, T, F_out).transpose(1, 2).contiguous()
+        feats_be_out = merged_be.reshape(B, E, T, F_out).transpose(1, 2).contiguous()
 
         if step_mode:
-            td.set(("agents", "features"), feats_btEH[:, 0])
+            td.set(("agents", "features"), feats_be_out[:, 0])
             h_out = h_n.transpose(0, 1).reshape(B, E, 1, H)
             c_out = c_n.transpose(0, 1).reshape(B, E, 1, H)
             td.set(("agents", "recurrent_state_h_out"), h_out)
             td.set(("agents", "recurrent_state_c_out"), c_out)
         else:
-            td.set(("agents", "features"), feats_btEH)
+            td.set(("agents", "features"), feats_be_out)
 
         return td
 
@@ -758,11 +775,20 @@ class CriticRecurrentCore(nn.Module):
 @torch.no_grad()
 def compute_gae_inplace(traj: TensorDictBase, gamma: float, lmbda: float, n_edges: int):
     reward = traj.get(("agents", "reward"))
-    done = traj.get(("agents", "done")).to(torch.bool)
-    terminated = traj.get(("agents", "terminated")).to(torch.bool)
+    done = traj.get(("agents", "done"))
+    terminated = traj.get(("agents", "terminated"))
     values = traj.get(("agents", "state_value"))
     next_values = traj.get("next").get(("agents", "state_value"))
 
+    # Ensure all are [B, T, E]
+    if reward.ndim == 4 and reward.shape[-1] == 1: reward = reward.squeeze(-1)
+    if done.ndim == 4 and done.shape[-1] == 1: done = done.squeeze(-1)
+    if terminated.ndim == 4 and terminated.shape[-1] == 1: terminated = terminated.squeeze(-1)
+    if values.ndim == 4 and values.shape[-1] == 1: values = values.squeeze(-1)
+    if next_values.ndim == 4 and next_values.shape[-1] == 1: next_values = next_values.squeeze(-1)
+
+    done = done.to(torch.bool)
+    terminated = terminated.to(torch.bool)
     not_end = (~(done | terminated)).to(values.dtype)
 
     B, T, E = reward.shape
@@ -1025,8 +1051,6 @@ def train(
             nk = ("next",) + k
             if k not in traj.keys(True, True) and nk in traj.keys(True, True):
                 traj.set(k, traj.get(nk))
-            squeeze_last1(traj, k)
-            squeeze_last1(traj.get("next"), k)
 
         if ("agents", "done") in traj.keys(True, True):
             traj.set(("agents", "done"), traj.get(("agents", "done")).to(torch.bool))

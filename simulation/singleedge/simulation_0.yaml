@@ -1,0 +1,122 @@
+run:
+  t_max: 30000
+  seed: 22
+
+eval:
+  episode: 30
+  
+
+globals:
+  cpu_clock_cycle: 3.8 # Used to convert detection latency to cycle
+  cpu_cores: 8
+  fps: 5
+  decision_interval: 300
+  scaling_time_step: [300, 450, 498, 544] # for 0.5,1.0,1.5,2.0 scaling
+
+  ids: # With 0.0357, it can defend 28000 attacks with 8 IDS CPU
+    latency_ms: 0.0357 #0.357
+    cycles_ms: 0.0
+  
+  attack_sampler:
+    n_types: 10
+    active_len_factor: 0.5
+    pattern_types: ["sinus", "pw", "expo" ] #, "yoyo"]
+    # pattern_types: ["pw"]
+    # pattern_types: ["yoyo"]
+    level: "default"
+    lambda_level:
+      default: [7000, 18000]
+      low: [5000, 10000]
+      mid: [12000, 16000]
+      high: [18000, 24000]
+    noise_std:        [0.05, 0.10]
+    t_cycle_min:      [300, 500]     # seconds (lower bound on cycle duration)
+    t_cycle_delta:    [300, 800]   # seconds added to t_min to get t_max
+    latency_per_flow: [0.01,0.02]      # ms per flow  (latency_per_flow * 1000 * va_cpu / lambda_base)
+    bw_per_flow:      [0.0, 0.0]   # Mbps per flow
+    # bw_per_flow:      [0.15, 0.30]   # Mbps per flow
+    non_defendable_bw_const: 0.0
+  
+  user_sampler:
+    synthetic:
+      level: "default"
+      rw_sigma_per_sqrt_sec: 1.2      
+      kappa: 0.25 
+      sigma: 8 # Before Conversion to per step request = 0.9
+      mu_level:
+        default: [20.0, 200.0]
+        low: [10.0, 100.0]
+        mid: [30.0, 150.0]
+        high: [50.0, 250.0] 
+
+  reward:
+    alpha_inv: 5.0   # QoE shortfall normalizer        (alpha = 1/alpha_inv = 10)      || 0.10
+    beta_inv:  9.0   # Attack residual normalizer       (beta  = 1/beta_inv  =  5)     || 0.20
+    gamma_inv: 8.0   # Benign collateral normalizer     (gamma = 1/gamma_inv ≈  8.33)  || 0.12
+    q_th:      0.35   # QoE shortfall threshold
+
+  video_pipeline:
+    reid_latency: 20 #! Should consider batch processing
+
+    configs:
+      - detector: nanoDet-m
+        map: 0.235 #Highest map for this detector
+        latency_ms:
+          detection: 4.05
+        cycles:
+          detection: 0      
+        res_to_acc: 
+        - base_resolution_h: 412
+          map: 0.235
+        - base_resolution_h: 320
+          map: 0.206
+        - base_resolution_h: 224
+          map: 0.179
+
+      - detector: nanoDet-plus-m
+        map: 0.304
+        latency_ms:
+          detection: 6.55
+        cycles:
+          detection: 0      
+        res_to_acc: 
+        - base_resolution_h: 412
+          map: 0.304
+        - base_resolution_h: 320
+          map: 0.27
+        - base_resolution_h: 224
+          map: 0.25          
+
+      - detector: nanoDet-plus-m-1.5x
+        map: 0.341
+        latency_ms:
+          detection: 10.17
+        cycles:
+          detection: 0      
+        res_to_acc: 
+        - base_resolution_h: 412
+          map: 0.341
+        - base_resolution_h: 320
+          map: 0.299
+        - base_resolution_h: 224
+          map: 0.27
+
+
+
+edge_areas:
+  - area_id: "E1"
+    cpu_cycle_per_ms: 3.8 #3.8GHz #3.8E6 / ms
+    slo_beta: 3.0
+    slo_threshold: 0.2
+    budget: { cpu: 8.0, mem: 8.0, uplink: 100 } #100Mbps
+    constraints:
+      D_Max: 250.0
+      MOTA_min: 0.1  
+      Gamma: 0.0005 
+
+    dirichlet_concentration: 1.0  # Dirichlet alpha for P(a|e); 1.0 = uniform over attack types
+
+    ids_config:
+      accuracy_by_type:
+        #! Explicitly set to 0 for training
+        default: [0.00, 0.00]   # single global [FPR, FNR] applied to all attack types
