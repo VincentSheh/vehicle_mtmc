@@ -130,7 +130,6 @@ def load_means_from_csv(path: Path) -> tuple[dict, list[str]]:
 
 def save_means_to_csv(means: dict, methods_display: list[str], outpath: Path):
     rows = []
-    metric_label_map = dict(METRICS)
     for atk_lvl in LEVELS:
         for user_lvl in LEVELS:
             for method_label in methods_display:
@@ -152,6 +151,44 @@ def save_means_to_csv(means: dict, methods_display: list[str], outpath: Path):
         writer.writeheader()
         writer.writerows(rows)
     print(f"Saved: {outpath}")
+
+
+def append_cell_to_csv(
+    atk_lvl: str, user_lvl: str,
+    cell_means: dict,          # {method_label: {metric_key: float}}
+    outpath: Path,
+):
+    """Append one (atk, user) cell to the CSV, writing the header if the file is new."""
+    fieldnames = ["atk_level", "user_level", "method", "metric", "metric_label", "value"]
+    rows = []
+    for method_label, m in cell_means.items():
+        for metric_key, metric_title in METRICS:
+            rows.append({
+                "atk_level":    atk_lvl,
+                "user_level":   user_lvl,
+                "method":       method_label,
+                "metric":       metric_key,
+                "metric_label": metric_title,
+                "value":        m.get(metric_key, float("nan")),
+            })
+    outpath.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not outpath.exists()
+    with open(outpath, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerows(rows)
+
+
+def completed_cells(path: Path) -> set[tuple[str, str]]:
+    """Return the set of (atk_level, user_level) pairs already saved in the CSV."""
+    if not path.exists():
+        return set()
+    done: set[tuple[str, str]] = set()
+    with open(path, newline="") as f:
+        for row in csv.DictReader(f):
+            done.add((row["atk_level"], row["user_level"]))
+    return done
 
 
 # ---------------------------------------------------------------------------
@@ -186,7 +223,7 @@ def _make_dummy_data(methods: list[str]) -> dict:
 # Real evaluation
 # ---------------------------------------------------------------------------
 
-def collect_data(args) -> dict:
+def collect_data(args, outpath: Path = None, existing_means: dict = None) -> dict:
     from eval_baselines import run_episode
     from environment import build_env_base, TorchRLEnvWrapper
     from method_policy import make_baseline_policy
@@ -199,10 +236,23 @@ def collect_data(args) -> dict:
 
     methods: list[str] = args.methods if args.methods else list(DEFAULT_METHODS)
 
+    done = completed_cells(outpath) if outpath is not None else set()
+
+    # Seed means with any previously completed cells so the caller gets a full dict.
     data: dict = {}
     for atk_lvl in LEVELS:
         data[atk_lvl] = {}
         for user_lvl in LEVELS:
+            if (atk_lvl, user_lvl) in done and existing_means is not None:
+                # Re-use saved cell; store as raw arrays are not needed downstream.
+                data[atk_lvl][user_lvl] = {}
+
+    for atk_lvl in LEVELS:
+        for user_lvl in LEVELS:
+            if (atk_lvl, user_lvl) in done:
+                print(f"[resume] Skipping atk={atk_lvl}, user={user_lvl} (already in CSV).")
+                continue
+
             print(f"\n{'='*70}")
             print(f" Evaluating: atk={atk_lvl}  user={user_lvl}")
             print("="*70)
@@ -292,6 +342,15 @@ def collect_data(args) -> dict:
                     label = DISPLAY_NAMES.get(mname, mname)
                     cell[label] = accumulated[mname]
                 data[atk_lvl][user_lvl] = cell
+
+                # Flush this cell to disk immediately so a later crash doesn't lose it.
+                if outpath is not None:
+                    cell_means = {
+                        DISPLAY_NAMES.get(mname, mname): _arrays_to_means(accumulated[mname])
+                        for mname in valid_methods
+                    }
+                    append_cell_to_csv(atk_lvl, user_lvl, cell_means, outpath)
+                    print(f"[checkpoint] Saved atk={atk_lvl}, user={user_lvl} → {outpath}")
 
             finally:
                 if os.path.exists(tmp_path):
@@ -412,7 +471,7 @@ def main():
     ap.add_argument("--outdir",            default="eval_out/scenario_grid")
     ap.add_argument("--dummy",             action="store_true",
                     help="Use random data; skip simulation for layout verification")
-    ap.add_argument("--ckpt",              default="checkpoints/rew_32_netting_a4_rew/ckpt_best.pt")
+    ap.add_argument("--ckpt",              default="checkpoints/a4_sf20_atk3_a18_default_default/ckpt_best.pt")
     ap.add_argument("--tbsa_table",        default="tbsa_table.npz")
     ap.add_argument("--ids_cpu_min",       type=float, default=0.5)
     ap.add_argument("--scale_step",        type=float, default=0.5)
@@ -431,16 +490,26 @@ def main():
         means = build_means_from_data(data, methods_display)
         save_means_to_csv(means, methods_display, csv_path)
 
-    elif csv_path.exists():
-        print(f"[replot] Found existing {csv_path} — skipping simulation.")
+    elif csv_path.exists() and completed_cells(csv_path) == {(a, u) for a in LEVELS for u in LEVELS}:
+        print(f"[replot] Found complete {csv_path} — skipping simulation.")
         means, methods_display = load_means_from_csv(csv_path)
 
     else:
         methods = args.methods if args.methods else list(DEFAULT_METHODS)
         methods_display = [DISPLAY_NAMES.get(m, m) for m in methods]
-        data  = collect_data(args)
+        existing_means = None
+        if csv_path.exists():
+            n_done = len(completed_cells(csv_path))
+            print(f"[resume] Partial CSV found ({n_done}/9 cells done) — resuming.")
+            existing_means, _ = load_means_from_csv(csv_path)
+        data = collect_data(args, outpath=csv_path, existing_means=existing_means)
         means = build_means_from_data(data, methods_display)
-        save_means_to_csv(means, methods_display, csv_path)
+        # Merge in any cells that were loaded from CSV (not re-run).
+        if existing_means is not None:
+            for atk_lvl in LEVELS:
+                for user_lvl in LEVELS:
+                    if not means[atk_lvl][user_lvl] and existing_means.get(atk_lvl, {}).get(user_lvl):
+                        means[atk_lvl][user_lvl] = existing_means[atk_lvl][user_lvl]
 
     plot_grid(means, methods_display, outdir / "scenario_grid_by_user.png",   x_dim="user")
     plot_grid(means, methods_display, outdir / "scenario_grid_by_attack.png", x_dim="attack")

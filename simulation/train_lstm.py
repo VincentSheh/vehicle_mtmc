@@ -1,3 +1,5 @@
+import multiprocessing as mp
+mp.set_start_method('spawn', force=True)
 import yaml
 import math
 import torch
@@ -110,7 +112,7 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
     logger_cfg = train_cfg.setdefault("logger", {})
     if "exp_name" not in logger_cfg:
         logger_cfg["exp_name"] = "ppo_run"
-    logger_cfg["exp_name"] += f"_{atk_lvl}_{user_lvl}"
+    # logger_cfg["exp_name"] += f"_{atk_lvl}_{user_lvl}"
 
     try:
         t_max = env_cfg["run"]["t_max"]
