@@ -904,13 +904,15 @@ def test_environment_run(cfg_path: str, plot=False, decision_interval: int = 500
 
     atk_in   = all_df["attack_in_rate"].sum()
     atk_drop = all_df["attack_drop_rate"].sum()
+    user_drop = all_df["user_drop_rate"].sum()
     malicious_drop_pct = 100.0 * atk_drop / atk_in if atk_in > 0 else 0.0
 
     avg_qoe = all_df["qoe_mean"].mean()
     print(f"Average QoE (qoe_mean):       {avg_qoe:.4f}")
     print(f"Average QoE (benign_col_dmg): {all_df['benign_col_dmg'].mean():.4f}")
     print(f"SLO violation rate (q_th={q_th:.2f}): {violation_rate:.4f} ({100*violation_rate:.1f}%)")
-    print(f"Malicious traffic dropped:    {malicious_drop_pct:.1f}%")
+    print(f"Benign requests dropped:      {user_drop:.0f}")
+    print(f"Malicious traffic dropped:    {atk_drop:.0f} ({malicious_drop_pct:.1f}%)")
     print(f"Plots saved to {out_dir}/")    
         
 if __name__ == "__main__":

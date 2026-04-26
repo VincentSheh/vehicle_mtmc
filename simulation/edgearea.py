@@ -386,19 +386,22 @@ class EdgeArea:
                 gamma=float(gamma),
             )
 
-        qoe, _ = self.match_detectors_to_resolutions(upload_plan, od_plan)
+        # Consistency fix: pass the number of requests that survived IDS (benign_req_in)
+        # to ensure that drops at uplink or compute stages result in zero quality for those requests.
+        qoe, _ = self.match_detectors_to_resolutions(upload_plan, od_plan, total_N=benign_req_in)
 
         va_cpu_utilization = min(1.0, (used_cycles + attack_cycles_per_ms + self.ids_cpu * self.cpu_cycle_per_ms) / max(total_cycles_per_ms, 1e-9))
         served_compute = int(sum(od_plan.values()))
         assert served_compute + int(dropped_compute) == int(served_req_uplink)
 
-        # QoE normalisation: penalise all drops including FPR user drops
+        # QoE normalisation: penalise all drops including FPR user drops using a quadratic penalty.
         # original_user_in (pre-IDS) is the true denominator; falls back to admitted count
         qoe_denom = int(original_user_in) if original_user_in is not None else benign_req_in
         qoe_denom = max(qoe_denom, benign_req_in)  # never smaller than admitted count
         if qoe_denom <= 0:
             qoe = 1.0
         else:
+            # drop_frac represents total fraction of requests dropped (IDS + Uplink + Compute)
             drop_frac = 1.0 - served_compute / float(qoe_denom)
             qoe = qoe * (1.0 - drop_frac) ** 2
 
@@ -629,6 +632,7 @@ class EdgeArea:
         self,
         upload_plan: Dict[int, int],
         det_plan: Dict[str, int],
+        total_N: Optional[int] = None,
     ) -> Tuple[float, Dict[Tuple[str, int], int]]:
         """
         Monotone matching:
@@ -710,9 +714,15 @@ class EdgeArea:
         if missing:
             raise KeyError(f"Missing (det,h) in pipeline.res_to_acc: {missing[:10]}")
 
-        total = int(sum(assign.values()))
-        if total <= 0:
+        total_served = int(sum(assign.values()))
+        if total_served <= 0:
             return 0.0, {}
+
+        # Consistency fix: treat dropped requests as zero quality by using the total
+        # number of requests entering the compute stage as the denominator.
+        denom = int(total_N) if total_N is not None else total_served
+        if denom <= 0:
+            return 0.0, assign
 
         qmax = self.pipeline._qmax_acc
         qoe_sum = 0.0
@@ -720,7 +730,7 @@ class EdgeArea:
             q = float(det_res_map[(d, int(h))]) / qmax
             qoe_sum += float(n) * q
 
-        qoe = qoe_sum / float(total)
+        qoe = qoe_sum / float(denom)
         return float(qoe), assign
 
     def step_local(self, t: int):
@@ -871,4 +881,3 @@ class EdgeArea:
         }
         return cache
     
- 

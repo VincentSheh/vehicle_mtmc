@@ -54,7 +54,7 @@ globals:
     gamma_inv: 10.0   # Benign collateral normalizer
     q_th:      0.35   # QoE shortfall threshold
 
-  offload_mode: "cto_acc"  # "none" | "cto" | "cto_acc" | "delay_workload" | "full"
+  offload_mode: "cto"  # "none" | "cto" | "cto_acc" | "delay_workload" | "full"
   # VA-stage attack offload mode:
   #   false (default) — admitted attacks stay at their IDS executor; VA capacity is
   #                     pre-reduced by attack load before the benign-user offload plan.
@@ -89,9 +89,13 @@ globals:
     # - [[0.0, 0.00], [0.0, 0.00], [0.0, 0.00]]   # traffic from E2: inspected at [E1, E2, E3]
     # - [[0.0, 0.00], [0.0, 0.00], [0.0, 0.00]]   # traffic from E3: inspected at [E1, E2, E3]
     # Validation Select Accuracy Matrix
-    - [[0.215, 0.00], [0.5, 0.00], [0.5, 0.00]]   # traffic from E1: inspected at [E1, E2, E3]
-    - [[0.5, 0.00], [0.031, 0.00], [0.5, 0.00]]   # traffic from E2: inspected at [E1, E2, E3]
-    - [[0.5, 0.00], [0.5, 0.00], [0.043, 0.00]]   # traffic from E3: inspected at [E1, E2, E3]
+    - [[0.215, 0.00], [0.074, 0.00], [0.116, 0.00]]   # traffic from E1: inspected at [E1, E2, E3]
+    - [[0.325, 0.00], [0.031, 0.00], [0.049, 0.00]]   # traffic from E2: inspected at [E1, E2, E3]
+    - [[0.179, 0.00], [0.038, 0.00], [0.043, 0.00]]   # traffic from E3: inspected at [E1, E2, E3]
+    # Global Model Accuracy Matrix
+    # - [[0.184, 0.00], [0.075, 0.00], [0.065, 0.00]]   # traffic from E1: inspected at [E1, E2, E3]
+    # - [[0.184, 0.00], [0.075, 0.00], [0.065, 0.00]]   # traffic from E2: inspected at [E1, E2, E3]
+    # - [[0.184, 0.00], [0.075, 0.00], [0.065, 0.00]]   # traffic from E3: inspected at [E1, E2, E3]
 
   # Propagation delay matrix in ms: row=source edge index, col=target edge index.
   # Order matches edge_areas list: E1=0, E2=1, E3=2. Diagonal must be 0.
