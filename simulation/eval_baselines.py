@@ -43,8 +43,6 @@ DEFAULT_METHODS = [
     "lstm_rl",
 ]
 DEFAULT_METHODS = [
-    "autoscale_def",
-    "offline_optimal",
     "lstm_rl",
 ]
 

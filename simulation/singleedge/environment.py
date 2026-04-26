@@ -1,0 +1,1052 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple, Any
+
+import torch
+from tensordict import TensorDict
+from torchrl.envs import EnvBase
+from torchrl.data import (
+    CompositeSpec,
+    UnboundedContinuousTensorSpec,
+    BoundedTensorSpec,
+    DiscreteTensorSpec,
+    MultiDiscreteTensorSpec,
+)
+
+from pathlib import Path
+import yaml
+import os
+import copy
+import numpy as np
+import pandas as pd
+from matplotlib import pyplot as plt
+
+from service import IDS, VideoPipeline
+
+from request import User, Attacker, AttackTypeLibrary
+
+from edgearea import ResourceBudget, EdgeArea
+
+from offload import OffloadDecision, OffloadState
+
+N_ACTION = 9
+
+@dataclass(frozen=True)
+class GlobalConfig:
+    cpu_cycle_per_ms: float
+    cpu_cores: int
+    slot_ms: float
+    ids_cycles_per_packet: float
+
+@dataclass
+class StepMetrics:
+    t: int
+    area_id: str
+
+    # QoE
+    qoe_mean: float
+    qoe_mean_ideal: float
+    benign_col_dmg: float
+
+    # Requests (OD-only pipeline)
+    local_num_req: int                  # served (after IDS + uplink + compute)
+    ema: float
+    ema_mom: float
+
+    # IDS / attack
+    ids_coverage: float
+    attack_in_rate: float
+    attack_drop_rate: float
+    user_drop_rate: float
+    cpu_to_ids_ratio: float
+    ids_cpu_utilization: float
+
+    # VA / BW
+    va_cpu_utilization: float
+    attack_cpu_frac: float           # fraction of total CPU budget consumed by attacker
+    bw_utilization: float
+
+    overhead: float
+    
+    # Per-step plan (detector mixing)
+    od_plan: Dict[str, int] = field(default_factory=dict)
+
+    # Optional network impact metric
+    I_net: float = 0.0
+
+    
+def load_globals(cfg: dict) -> GlobalConfig:
+    g = cfg["globals"]
+
+    cpu_cycle_per_ms = float(g["cpu_clock_cycle"])
+    cpu_cores = int(g["cpu_cores"])
+
+    fps = float(g.get("fps", 5.0))
+    slot_ms = 1000.0 / fps
+
+    ids_latency_ms = float(g["ids"]["latency_ms"])
+    ids_cycles_per_packet = ids_latency_ms * cpu_cycle_per_ms * cpu_cores
+
+    return GlobalConfig(
+        cpu_cycle_per_ms=cpu_cycle_per_ms,
+        cpu_cores=cpu_cores,
+        slot_ms=slot_ms,
+        ids_cycles_per_packet=ids_cycles_per_packet,
+    )
+
+class Environment:
+    def __init__(
+        self,
+        edge_areas: List[EdgeArea],
+        delay_ms: np.ndarray,
+        t_max: int,
+        seed: int = 0,
+    ):
+        self.edge_areas = edge_areas
+        self.delay_ms = delay_ms
+        self.t_max = int(t_max)
+        self.t = 0
+        self.history: List[StepMetrics] = []
+        self.last_history: List[StepMetrics] = []
+        self.final_qoe = 0
+
+        np.random.seed(seed)
+
+    def reset(self, seed):
+        self.t = 0
+        self.last_history = list(self.history)
+        self.history.clear()
+        self.final_qoe = 0
+        for i, edge in enumerate(self.edge_areas):
+            edge.reset(seed=seed + i)        
+
+    def cooperative_offload_ot(
+        self,
+        states: List[OffloadState],
+    ) -> Tuple[List[OffloadState], List[OffloadDecision], np.ndarray]:
+        """
+        Synchronized greedy OT offloading across all edges.
+
+        Returns:
+        - updated states
+        - list of OffloadDecision
+        - I_net array of shape (n,) where I_net[i] = I_in[i] - I_out[i]
+        """
+        n = len(states)
+        for i, st in enumerate(states):
+            st.idx = i
+
+        decisions: List[OffloadDecision] = []
+
+        # per-slot offload counters
+        I_in = np.zeros(n, dtype=np.int64)
+        I_out = np.zeros(n, dtype=np.int64)
+
+        def finish_time_ms(st: OffloadState) -> float:
+            q = st.total_q()
+            if q <= 0:
+                return 0.0
+            if st.avail_cycles_aft_atk_per_ms <= 0:
+                return float("inf")
+            cycles = q * st.track_cycles_per_obj
+            return cycles / max(1e-9, st.avail_cycles_aft_atk_per_ms)
+
+        TOP = list(range(n))
+        TOP.sort(key=lambda i: finish_time_ms(states[i]))
+
+        changed = True
+        while changed:
+            changed = False
+
+            slow_order = sorted(TOP, key=lambda i: finish_time_ms(states[i]), reverse=True)
+
+            for src in slow_order:
+                src_st = states[src]
+                if src_st.total_q() <= 0:
+                    continue
+
+                local_C = finish_time_ms(src_st)
+
+                for dst in TOP:
+                    if dst == src:
+                        continue
+
+                    dst_st = states[dst]
+
+                    remote_cycles = (dst_st.total_q() + 1) * dst_st.track_cycles_per_obj
+                    remote_C = (
+                        remote_cycles / max(1e-9, dst_st.avail_cycles_aft_atk_per_ms)
+                        + float(self.delay_ms[src, dst])
+                    )
+
+                    # must still meet dst slack window
+                    if remote_C > dst_st.latest_track_finish_ms:
+                        continue
+
+                    # beneficial move
+                    if remote_C < local_C:
+                        # move exactly one object
+                        src_st.local_q_obj -= 1
+                        dst_st.recv_q_obj += 1
+
+                        I_out[src] += 1
+                        I_in[dst] += 1
+
+                        decisions.append(OffloadDecision(src_idx=src, dst_idx=dst, num_obj=1))
+
+                        # resort since workloads changed
+                        TOP.sort(key=lambda i: finish_time_ms(states[i]))
+                        changed = True
+                        break
+
+        I_net = I_in - I_out  # shape: (n,)
+        return states, decisions, I_net
+    
+    def _snapshot_edges(self):
+        return [edge.get_state() for edge in self.edge_areas], np.random.get_state()
+
+    def _restore_edges(self, snapshot):
+        edge_states, rng_state = snapshot
+        np.random.set_state(rng_state)
+        for i, edge in enumerate(self.edge_areas):
+            edge.set_state(edge_states[i])
+    
+    def step(self, ids_cpus, overhead=0):
+        snapshot = self._snapshot_edges()
+
+        # 1. ideal from pre-step state
+        ideal_ids_cpus = [0.0] * len(self.edge_areas)
+        ideal_cache = self._run_step_once(
+            ids_cpus=ideal_ids_cpus,
+            overhead=overhead,
+            disable_attack=True,
+        )
+
+        # 2. restore pre-step state
+        self._restore_edges(snapshot)
+
+        # 3. actual from the same pre-step state
+        real_cache = self._run_step_once(
+            ids_cpus=ids_cpus,
+            overhead=overhead,
+            disable_attack=False,
+        )    
+        for edge in self.edge_areas:
+            cache = real_cache[edge.area_id]
+            cache_ideal = ideal_cache[edge.area_id]
+            ids_out = cache["ids_out"]
+
+            self.history.append(
+                StepMetrics(
+                    t=self.t,
+                    area_id=edge.area_id,
+                    qoe_mean=float(cache["qoe"]),
+                    qoe_mean_ideal=float(cache_ideal["qoe"]),
+                    benign_col_dmg=float(cache_ideal["qoe"] - cache["qoe"]),
+
+                    ids_coverage=float(ids_out.get("coverage", 0.0)),
+                    attack_in_rate=float(ids_out.get("attack_in_rate", 0.0)),
+                    user_drop_rate=float(ids_out.get("user_drop_rate", 0.0)),
+                    attack_drop_rate=float(ids_out.get("attack_drop_rate", 0.0)),
+                    od_plan=cache["od_plan"],
+
+                    local_num_req=int(cache["local_num_request"]),
+                    ema=float(cache["ema"]),
+                    ema_mom=float(cache["ema_mom"]),
+                    cpu_to_ids_ratio=edge.ids_cpu / edge.budget.cpu,
+                    va_cpu_utilization=float(cache["va_cpu_utilization"]),
+                    attack_cpu_frac=float(cache["attack_cpu_frac"]),
+                    ids_cpu_utilization=float(ids_out["ids_cpu_util"]),
+                    bw_utilization=float(cache["uplink_util"]),
+
+                    overhead=float(overhead),
+                )
+            )
+
+        self.t += 1
+
+        if self.t >= self.t_max:
+            qoe_slo = []
+            for edge in self.edge_areas:
+                h = [m for m in self.history if m.area_id == edge.area_id]
+                if len(h) == 0:
+                    continue
+
+                last_block = h[-self.t_max:]
+                qoes = np.asarray([float(m.qoe_mean) for m in last_block], dtype=np.float32)
+
+                viol = (qoes < edge.slo_threshold).astype(np.float32)
+                viol_rate = float(viol.mean()) if len(viol) > 0 else 0.0
+                V_edge = np.exp(-edge.slo_beta * viol_rate)
+
+                # qoe_slo.append(float(qoes.mean()) * 1)
+                qoe_slo.append(float(qoes.mean()) * V_edge)
+
+            self.final_qoe = np.mean(qoe_slo) if len(qoe_slo) > 0 else 0.0        
+        
+        
+    def _run_step_once(self, ids_cpus, overhead=0.0, disable_attack=False):
+        local_cache = {}
+
+        if isinstance(ids_cpus, torch.Tensor):
+            ids_cpus = ids_cpus.detach().cpu().tolist()
+
+        for i, edge in enumerate(self.edge_areas):
+            val = float(ids_cpus[i])
+
+            overhead_ids = float(overhead) if overhead > 0.0 else 0.0
+            overhead_va  = float(-overhead) if overhead < 0.0 else 0.0
+
+            ids_cpu_eff = val - overhead_ids
+            va_cpu_eff  = edge.budget.cpu - val - overhead_va
+
+            ids_cpu_eff = float(np.clip(ids_cpu_eff, 0.0, edge.budget.cpu))
+            va_cpu_eff  = float(np.clip(va_cpu_eff,  0.0, edge.budget.cpu))
+
+            total = ids_cpu_eff + va_cpu_eff
+            if total > edge.budget.cpu:
+                excess = total - edge.budget.cpu
+                va_cpu_eff = max(0.5, va_cpu_eff - excess)
+
+            edge.ids_cpu = ids_cpu_eff
+            edge.va_cpu  = va_cpu_eff
+
+            if disable_attack:
+                for atk in getattr(edge, "attackers", []):
+                    atk_active_prev = getattr(atk, "episode_active", True)
+                    atk._tmp_prev_episode_active = atk_active_prev
+                    atk.episode_active = False
+
+            cache = edge.step_local(self.t)
+            local_cache[edge.area_id] = cache
+
+            if disable_attack:
+                for atk in getattr(edge, "attackers", []):
+                    if hasattr(atk, "_tmp_prev_episode_active"):
+                        atk.episode_active = atk._tmp_prev_episode_active
+                        del atk._tmp_prev_episode_active
+
+            assert edge.ids_cpu >= 0.0
+            assert edge.va_cpu >= 0.0
+            assert edge.ids_cpu + edge.va_cpu <= edge.budget.cpu + 1e-6
+
+        return local_cache
+                
+        
+        
+def build_env_from_cfg(cfg: dict):
+    globals_cfg = load_globals(cfg)
+
+    # --------------------------------------------------
+    # Build AttackTypeLibrary (if attack_sampler block present)
+    # --------------------------------------------------
+    sampler_cfg = cfg["globals"].get("attack_sampler")
+    if sampler_cfg:
+        lib_rng = np.random.default_rng(cfg["run"]["seed"])
+        attack_type_library = AttackTypeLibrary(
+            n_types=int(sampler_cfg.get("n_types", 10)),
+            sampler_cfg=sampler_cfg,
+            rng=lib_rng,
+        )
+    else:
+        attack_type_library = None
+
+    # --------------------------------------------------
+    # Build shared VideoPipeline
+    # --------------------------------------------------
+    video_pipeline = VideoPipeline(
+        reid_latency_ms_per_object=cfg["globals"]["video_pipeline"]["reid_latency"],
+        configs=cfg["globals"]["video_pipeline"]["configs"],
+        cpu_cycle_per_ms=globals_cfg.cpu_cycle_per_ms,
+        cpu_cores=globals_cfg.cpu_cores,
+    )
+    # --------------------------------------------------
+    # Build EdgeAreas
+    # --------------------------------------------------
+    edge_areas = []
+
+    for area_cfg in cfg["edge_areas"]:
+        ids = IDS(
+            cycles_per_packet=globals_cfg.ids_cycles_per_packet,
+            accuracy_by_type_fpr_fnr={
+                k: tuple(v)
+                for k, v in area_cfg["ids_config"]["accuracy_by_type"].items()
+            },
+            cpu_cycle_per_ms=globals_cfg.cpu_cycle_per_ms,
+            cpu_cores=globals_cfg.cpu_cores,
+            slot_ms=globals_cfg.slot_ms,
+        )
+
+        users = []
+
+        # Support global user_sampler
+        global_user_cfg = cfg["globals"].get("user_sampler")
+        if global_user_cfg:
+            users.append(
+                User(
+                    user_id=f"{area_cfg['area_id']}_user_0",
+                    slot_ms=globals_cfg.slot_ms,
+                    t_max=cfg["run"]["t_max"],
+                    seed=cfg["run"]["seed"],
+                    synth_cfg=global_user_cfg["synthetic"],
+                )
+            )
+
+        for u in area_cfg.get("users", []):
+            users.append(
+                User(
+                    user_id=u["user_id"],
+                    slot_ms=globals_cfg.slot_ms,
+                    t_max=cfg["run"]["t_max"],
+                    seed=cfg["run"]["seed"],
+                    synth_cfg=u["synthetic"],
+                )
+            )
+
+        # With attack_type_library, attackers are built dynamically at episode reset
+        attackers = []
+
+        edge = EdgeArea(
+            area_id=area_cfg["area_id"],
+            cpu_cycle_per_ms=area_cfg.get("cpu_cycle_per_ms"),
+            slot_ms=globals_cfg.slot_ms,
+            slo_beta=area_cfg["slo_beta"],
+            slo_threshold=area_cfg["slo_threshold"],
+            budget=ResourceBudget(**area_cfg["budget"]),
+            constraints=area_cfg["constraints"],
+            ids=ids,
+            users=users,
+            attackers=attackers,
+            pipeline=video_pipeline,
+            attack_type_library=attack_type_library,
+            t_max=cfg["run"]["t_max"],
+            dirichlet_alpha=float(area_cfg.get("dirichlet_concentration", 1.0)),
+        )
+
+        edge_areas.append(edge)
+
+
+    # Build delay matrix (simple symmetric test case)
+    n = len(edge_areas)
+    delay_ms = np.zeros((n, n)) #! TODO
+    for i in range(n):
+        for j in range(n):
+            delay_ms[i, j] = 2.0 if i != j else 0.0  # 2 ms inter-edge delay
+
+    # Build environment
+    env = Environment(
+        edge_areas=edge_areas,
+        delay_ms=delay_ms,
+        t_max=cfg["run"]["t_max"],
+        seed=cfg["run"]["seed"],
+    )
+    env.reset(cfg["run"]["seed"])
+    return env
+
+
+def build_env_base(cfg_path: str):
+    cfg_text = Path(cfg_path).read_text(encoding="utf-8")
+    cfg = yaml.safe_load(cfg_text)
+    return build_env_from_cfg(cfg)
+
+
+class TorchRLEnvWrapper(EnvBase):
+    """
+    Correct TorchRL EnvBase wrapper.
+
+    - reset() returns a td with keys: observation, done, terminated (and optionally reward)
+    - _step(td) returns NEXT td with keys: observation, reward, done, terminated
+      TorchRL will create td["next"] automatically.
+    """
+
+    def __init__(
+        self,
+        cfg_path: str,
+        decision_interval: int = 300,
+        n_actions: int = N_ACTION,
+        seed: int = 0,
+        device: str | torch.device = "cpu",
+    ):
+        super().__init__(device=torch.device(device), batch_size=[])
+
+        self.env = build_env_base(cfg_path)
+        self.n_edges = len(self.env.edge_areas)
+        self.area_ids = [e.area_id for e in self.env.edge_areas]
+        self.episode_id = 0
+        self.base_seed = seed
+        self.decision_interval = int(decision_interval)
+        self.n_actions = int(n_actions)
+        # self._step_count = 0
+
+        self.obs_keys = [
+            "local_num_req",
+            # "attack_drop_rate",
+            "attack_in_rate",
+            "ema_mom",
+            "cpu_to_ids_ratio",
+            # "va_cpu_utilization",
+            "ids_cpu_utilization",
+            # "bw_utilization",
+            # "I_net",
+        ]
+
+        # Scaling state: pending signed CPU units of overhead remaining
+        _cfg = yaml.safe_load(Path(cfg_path).read_text(encoding="utf-8"))
+        self.scaling_time_steps: List[int] = list(
+            _cfg["globals"].get("scaling_time_step", [300, 450, 498, 544])
+        )
+
+        # Reward weights — read from config so they're tracked and reproducible
+        _reward_cfg = _cfg["globals"].get("reward", {})
+        self.reward_alpha = float(_reward_cfg.get("alpha_inv", 0.10))
+        self.reward_beta  = float(_reward_cfg.get("beta_inv",  0.20))
+        self.reward_gamma = float(_reward_cfg.get("gamma_inv", 0.12))
+        self.reward_q_th  = float(_reward_cfg.get("q_th", 0.20))
+        self.scaling_quanta: List[float] = [0.5, 1.0, 1.5, 2.0]
+
+        # Method 2 serialised-scaling state
+        self.ids_cpu_target: torch.Tensor      # current transition target (= settled when not transitioning)
+        self.transition_ticks_remaining: int = 0   # 0 = settled
+        self.transition_ticks_total:     int = 1   # avoid div-by-zero
+
+        self.obs_dim = len(self.obs_keys) + 3   # +3: ticks_remaining_norm, delta_in_flight_norm, queue_ahead_norm
+        self.obs_size = self.n_edges * self.obs_dim
+
+        self.action_dim = self.n_edges
+        self._last_action = torch.zeros(self.action_dim, device=self.device, dtype=torch.float32)
+        self.scale_step = 0.5  # CPU units per scale
+        self.ids_cpu_min = 0.5
+
+        self.ids_cpu = torch.tensor(
+            [e.ids_cpu for e in self.env.edge_areas],
+            device=self.device,
+            dtype=torch.float32,
+        )
+        self.ids_cpu_settled = self.ids_cpu.clone()
+        self.ids_cpu_target  = self.ids_cpu.clone()
+
+        self._set_seed(seed)
+        self._make_specs()
+
+    # ---------------- Scaling helpers ----------------
+
+    def _lookup_scaling_duration(self, magnitude: float) -> int:
+        """Return ticks to drain `magnitude` CPU units of scaling work."""
+        for i, q in enumerate(self.scaling_quanta):
+            if magnitude <= q + 1e-9:
+                return self.scaling_time_steps[i]
+        return self.scaling_time_steps[-1]
+
+    # ---------------- TorchRL required ----------------
+
+    def _set_seed(self, seed: Optional[int]):
+        if seed is None:
+            return None
+        np.random.seed(int(seed))
+        torch.manual_seed(int(seed))
+        return seed
+
+    def _make_specs(self):
+        self.observation_spec = CompositeSpec(
+            observation=UnboundedContinuousTensorSpec(
+                shape=(self.n_edges, self.obs_dim),
+                dtype=torch.float32,
+                device=self.device,
+            ),
+            observation_flat=UnboundedContinuousTensorSpec(
+                shape=(self.obs_size,),
+                dtype=torch.float32,
+                device=self.device,
+            ),
+
+            # extra keys that survive rollout collection
+            qoe_mean=UnboundedContinuousTensorSpec(
+                shape=(1,),
+                dtype=torch.float32,
+                device=self.device,
+            ),
+            # reward component breakdown (β·λ_res, γ·bcd, α·qoe_shortfall)
+            reward_lambda_res=UnboundedContinuousTensorSpec(
+                shape=(1,), dtype=torch.float32, device=self.device,
+            ),
+            reward_benign_col_dmg=UnboundedContinuousTensorSpec(
+                shape=(1,), dtype=torch.float32, device=self.device,
+            ),
+            reward_qoe_penalty=UnboundedContinuousTensorSpec(
+                shape=(1,), dtype=torch.float32, device=self.device,
+            ),
+            qoe_vio_rate=UnboundedContinuousTensorSpec(
+                shape=(1,), dtype=torch.float32, device=self.device,
+            ),
+            t_internal=BoundedTensorSpec(
+                low=0,
+                high=max(1, int(self.env.t_max)),
+                shape=(1,),
+                dtype=torch.int64,
+                device=self.device,
+            ),
+        )
+
+        self.action_spec = CompositeSpec(
+            action=DiscreteTensorSpec(
+                n=self.n_actions,   # e.g., 9 for {-4, ..., 0, ..., +4} * scale_step
+                # shape=(self.n_edges,),
+                device=self.device,
+            )
+        )
+
+        self.reward_spec = CompositeSpec(
+            reward=UnboundedContinuousTensorSpec(
+                shape=(1,),
+                dtype=torch.float32,
+                device=self.device,
+            )
+        )
+
+        self.done_spec = CompositeSpec(
+            done=BoundedTensorSpec(
+                low=0,
+                high=1,
+                shape=(1,),
+                dtype=torch.bool,
+                device=self.device,
+            ),
+            terminated=BoundedTensorSpec(
+                low=0,
+                high=1,
+                shape=(1,),
+                dtype=torch.bool,
+                device=self.device,
+            ),
+            truncated=BoundedTensorSpec(
+                low=0,
+                high=1,
+                shape=(1,),
+                dtype=torch.bool,
+                device=self.device,
+            ),
+        )
+
+    # ---------------- Reset / Step ----------------
+    def _reset(self, tensordict=None):
+        self.episode_id += 1
+        episode_seed = self.base_seed + self.episode_id * 1000
+
+        # Seed ONLY torch (policy randomness)
+        torch.manual_seed(episode_seed)
+
+        # Reset env with explicit seeds
+        self.env.reset(episode_seed)
+
+        # Clear scaling state
+        self.ids_cpu_settled             = self.ids_cpu.clone()
+        self.ids_cpu_target              = self.ids_cpu.clone()
+        self.transition_ticks_remaining  = 0
+        self.transition_ticks_total      = 1
+
+
+        obs = self._build_observation().to(self.device)
+        obs_flat = obs.reshape(-1)
+
+        _zero1 = torch.zeros(1, dtype=torch.float32, device=self.device)
+        return TensorDict(
+            {
+                "observation": obs,
+                "observation_flat": obs_flat,
+                "qoe_mean":              _zero1.clone(),
+                "reward_lambda_res":     _zero1.clone(),
+                "reward_benign_col_dmg": _zero1.clone(),
+                "reward_qoe_penalty":    _zero1.clone(),
+                "qoe_vio_rate":          _zero1.clone(),
+                "t_internal": torch.tensor([int(self.env.t)], dtype=torch.int64, device=self.device),
+                "done":       torch.zeros(1, dtype=torch.bool, device=self.device),
+                "terminated": torch.zeros(1, dtype=torch.bool, device=self.device),
+                "truncated":  torch.zeros(1, dtype=torch.bool, device=self.device),
+            },
+            batch_size=[],
+            device=self.device,
+        )
+        
+    def _decision_ids_util(self) -> float:
+        """Max IDS CPU utilization across edges over the last decision window."""
+        if len(self.env.history) < self.decision_interval * self.n_edges:
+            return 0.0
+        records = self.env.history[-self.decision_interval * self.n_edges:]
+        df = pd.DataFrame([m.__dict__ for m in records])
+
+        utils = []
+        for area_id in self.area_ids:
+            g = df[df["area_id"] == area_id]
+            if g.empty or "ids_cpu_utilization" not in g.columns:
+                continue
+            utils.append(float(np.clip(np.mean(g["ids_cpu_utilization"].values), 0.0, 1.0)))
+        return float(max(utils)) if utils else 0.0
+
+    def _reactive_delta(self) -> float:
+        """Return delta in {-1,0,+1} based on IDS util thresholding."""
+        util = self._decision_ids_util()
+        if util >= 0.80:
+            return 1.0
+        if util <= 0.20:
+            return -1.0
+        return 0.0        
+
+    def _step(self, tensordict: TensorDict) -> TensorDict:
+        action = tensordict["action"]                       # scalar 0 to n_actions-1
+        # propose change: center at (n_actions - 1) / 2
+        delta_cmd = (action.to(self.device).float() - ((self.n_actions - 1) / 2.0)) * self.scale_step
+        # delta_cmd = self._reactive_delta() * self.scale_step  # -1, 0, +1
+
+        prev_ids = self.ids_cpu[0].clone()
+        edge = self.env.edge_areas[0]
+        ids_cpu_max_val = float(edge.budget.cpu - 0.5)
+
+        # ids_cpu tracks the desired ("queued") target.
+        # Netting queue: delta is applied on top of the current queue, not settled.
+        # Commands issued during a transition accumulate; they do not reset to settled.
+        # Queue is clamped to settled ± max_quantum so the gap never exceeds the largest
+        # single scaling step the transition system supports.
+        _settled = float(self.ids_cpu_settled[0].item())
+        _max_q   = float(self.scaling_quanta[-1])   # 2.0
+        self.ids_cpu[0] = torch.clamp(
+            self.ids_cpu[0] + delta_cmd,
+            min=max(self.ids_cpu_min, _settled - _max_q),
+            max=min(ids_cpu_max_val,  _settled + _max_q),
+        )
+        delta_eff = float((self.ids_cpu[0] - prev_ids).item())
+
+        # Settled: apply delta immediately (start transition).
+        # In transition: net delta onto queue; ids_cpu_target unchanged until current
+        # transition completes, then the accumulated queue fires as the next command.
+        if self.transition_ticks_remaining <= 0:
+            if abs(delta_eff) > 1e-9:
+                self.ids_cpu_target[0] = self.ids_cpu[0]
+                gap = abs(float(self.ids_cpu_target[0].item()) - float(self.ids_cpu_settled[0].item()))
+                self.transition_ticks_total     = self._lookup_scaling_duration(gap)
+                self.transition_ticks_remaining = self.transition_ticks_total
+        # else: in transition — ids_cpu already updated as queue; ids_cpu_target unchanged
+
+        # Effective allocation during a transition.
+        # Both directions: IDS holds at settled for the full duration.
+        # scale-up   (delta > 0): step_overhead = -delta < 0  → overhead_va  = delta  (VA  pays)
+        # scale-down (delta < 0): step_overhead = -delta > 0  → overhead_ids = |delta| (IDS pays)
+        # Symmetric: the scaling side absorbs the overhead cost in both directions.
+        target  = float(self.ids_cpu_target[0].item())
+        settled = float(self.ids_cpu_settled[0].item())
+        delta_to_settled = target - settled
+
+        ids_cpu_eff = self.ids_cpu_settled.clone()   # IDS holds at settled in all cases
+        step_overhead = -delta_to_settled if (self.transition_ticks_remaining > 0 and abs(delta_to_settled) > 1e-9) else 0.0
+
+        total_reward = 0.0
+        total_lambda_res = 0.0
+        total_benign_col_dmg = 0.0
+        total_qoe_penalty = 0.0
+        terminated_flag = False
+        steps = 0
+
+        # 2) Simulate decision_interval internal timesteps
+        for _ in range(self.decision_interval):
+            if self.transition_ticks_remaining > 0:
+                self.transition_ticks_remaining -= 1
+                if self.transition_ticks_remaining == 0:
+                    # Commit: settle at ids_cpu_target
+                    self.ids_cpu_settled[0] = self.ids_cpu_target[0]
+                    # Fire queued command if ids_cpu diverged from new settled
+                    queued_delta = float(self.ids_cpu[0].item()) - float(self.ids_cpu_settled[0].item())
+                    if abs(queued_delta) > 1e-9:
+                        self.ids_cpu_target[0] = self.ids_cpu[0]
+                        gap = abs(queued_delta)
+                        self.transition_ticks_total     = self._lookup_scaling_duration(gap)
+                        self.transition_ticks_remaining = self.transition_ticks_total
+                        new_d = float(self.ids_cpu_target[0].item()) - float(self.ids_cpu_settled[0].item())
+                        ids_cpu_eff[0] = float(self.ids_cpu_settled[0].item())   # hold at settled (both directions)
+                        step_overhead = -new_d if new_d > 1e-9 else 0.0
+                    else:
+                        ids_cpu_eff[0] = float(self.ids_cpu_settled[0].item())
+                        step_overhead = 0.0
+
+            self.env.step(ids_cpu_eff, step_overhead)
+            r = self._build_reward()
+            total_reward           += float(r["reward"].item())
+            total_lambda_res       += r["lambda_res"]
+            total_benign_col_dmg   += r["benign_col_dmg"]
+            total_qoe_penalty      += r["qoe_penalty"]
+            steps += 1
+            if self.env.t >= self.env.t_max:
+                terminated_flag = True
+                break
+
+        n = max(1, steps)
+        reward = torch.tensor([total_reward / n], dtype=torch.float32, device=self.device)
+
+        # QoE violation rate over the decision window
+        window = self.env.history[-self.decision_interval * self.n_edges:]
+        if window:
+            qoes = np.asarray([m.qoe_mean for m in window], dtype=np.float32)
+            qoe_vio_rate = float(np.mean(qoes < self.reward_q_th))
+        else:
+            qoe_vio_rate = 0.0
+
+        # 3) Build aggregated outputs
+        obs = self._build_observation().to(self.device)
+        obs_flat = obs.reshape(-1)
+
+        terminated = torch.tensor(
+            [terminated_flag], dtype=torch.bool, device=self.device
+        )
+        truncated = torch.zeros(1, dtype=torch.bool, device=self.device)
+        done = terminated | truncated
+
+        t_internal_end = int(self.env.t)
+        qoe_mean = float(self.env.final_qoe)
+
+        _f32 = lambda v: torch.tensor([v], dtype=torch.float32, device=self.device)
+        return TensorDict(
+            {
+                "observation":      obs,
+                "observation_flat": obs_flat,
+                "reward":           reward,
+                "qoe_mean":              _f32(qoe_mean * 30),
+                "reward_lambda_res":     _f32(total_lambda_res    / n),
+                "reward_benign_col_dmg": _f32(total_benign_col_dmg / n),
+                "reward_qoe_penalty":    _f32(total_qoe_penalty   / n),
+                "qoe_vio_rate":          _f32(qoe_vio_rate),
+                "t_internal": torch.tensor([t_internal_end], dtype=torch.int64, device=self.device),
+                "done":       done,
+                "terminated": terminated,
+                "truncated":  truncated,
+            },
+            batch_size=[],
+            device=self.device,
+        )
+
+    # ---------------- Helpers ----------------
+    def _build_observation(self) -> torch.Tensor:
+        obs = torch.zeros((self.n_edges, self.obs_dim), dtype=torch.float32, device=self.device)
+
+        if not self.env.history:
+            return obs
+
+        records = self.env.history[-self.decision_interval * self.n_edges:]
+
+        df = pd.DataFrame([m.__dict__ for m in records])
+
+        for i, area_id in enumerate(self.area_ids):
+            g = df[df["area_id"] == area_id]
+            if g.empty:
+                continue
+            for j, k in enumerate(self.obs_keys):
+                vals = g[k].values
+                if k == "I_net":
+                    obs[i, j] = float(np.sum(vals))
+                elif k == "cpu_to_ids_ratio":
+                    obs[i, j] = float(vals[-1])
+                elif k == "ema_mom":
+                    vals_nz = vals[vals != 0.0]
+                    if len(vals_nz) == 0:
+                        obs[i, j] = 0.0
+                        continue
+                    obs[i, j] = float(np.mean(vals_nz))
+                else:
+                    obs[i, j] = float(np.mean(vals))
+
+        # Feature -3: remaining transition ticks normalised by max possible duration ∈ [0, 1]
+        # Using max_duration (not T_total) gives a consistent drain rate across all transition
+        # sizes, and encodes duration in the initial value (0.55 = T=300, 1.0 = T=544).
+        max_dur = float(self.scaling_time_steps[-1])
+        obs[:, -3] = float(self.transition_ticks_remaining) / max(max_dur, 1.0)
+
+        # max_delta shared by the two delta features below
+        max_delta = self.scale_step * (self.n_actions - 1) / 2.0
+
+        # Feature -2: delta in flight — (ids_cpu_target - ids_cpu_settled) / max_delta ∈ [-1, 1]
+        # Direction and magnitude of the transition currently executing.
+        delta_in_flight = float(self.ids_cpu_target[0].item()) - float(self.ids_cpu_settled[0].item())
+        obs[:, -2] = float(np.clip(delta_in_flight / max(max_delta, 1e-6), -1.0, 1.0))
+
+        # Feature -1: queue ahead — (ids_cpu - ids_cpu_target) / max_delta ∈ [-1, 1]
+        # Commands accumulated on the netting queue beyond the current in-flight transition.
+        # Zero when settled or when no extra commands have been queued mid-transition.
+        queue_ahead = float(self.ids_cpu[0].item()) - float(self.ids_cpu_target[0].item())
+        obs[:, -1] = float(np.clip(queue_ahead / max(max_delta, 1e-6), -1.0, 1.0))
+
+        return obs
+
+    def _build_reward(self) -> dict:
+        """Return reward scalar + the three scaled component magnitudes."""
+        _zero = {"reward": torch.zeros(1, dtype=torch.float32, device=self.device),
+                 "lambda_res": 0.0, "benign_col_dmg": 0.0, "qoe_penalty": 0.0}
+        if not self.env.history:
+            return _zero
+
+        last_block = self.env.history[-self.n_edges:]
+
+        qoe        = np.asarray([float(m.qoe_mean)        for m in last_block], dtype=np.float32)
+        bcd        = np.asarray([float(m.benign_col_dmg)  for m in last_block], dtype=np.float32)
+        attack_in  = np.asarray([float(m.attack_in_rate)  for m in last_block], dtype=np.float32)
+        attack_drop = np.asarray([float(m.attack_drop_rate) for m in last_block], dtype=np.float32)
+
+        alpha = self.reward_alpha
+        beta  = self.reward_beta
+        gamma = self.reward_gamma
+        q_th  = self.reward_q_th
+
+        attack_pass = np.maximum(0.0, attack_in - attack_drop)
+        lambda_res  = np.divide(attack_pass, attack_in, out=np.zeros_like(attack_pass), where=attack_in > 1e-6).astype(np.float32)
+        
+        qoe_shortfall = np.maximum(0.0, q_th - qoe) / max(q_th, 1e-6)
+
+        # raw (unweighted) components — used for tracking and print
+        # lambda_res only averaged over ticks where attacks are present so that
+        # quiet windows (lres=0) don't dilute the penalty and match eval semantics.
+        active = attack_in > 1e-6
+        r_lambda_res  = float(np.mean(lambda_res[active])) if np.any(active) else 0.0
+        r_bcd         = float(np.mean(bcd))             # QoE units
+        r_qoe_penalty = float(np.mean(qoe_shortfall))   # normalised shortfall [0, 1]
+
+        reward = -(alpha * r_qoe_penalty + beta * r_lambda_res + gamma * r_bcd)
+        return {
+            "reward":          torch.tensor([reward], dtype=torch.float32, device=self.device),
+            "lambda_res":      r_lambda_res,
+            "benign_col_dmg":  r_bcd,
+            "qoe_penalty":     r_qoe_penalty,
+        }
+            
+def _reactive_ids_cpu(env, ids_cpu: np.ndarray, decision_interval: int,
+                       scale_step: float = 0.5, ids_cpu_min: float = 0.5) -> np.ndarray:
+    """Compute new ids_cpu allocation using reactive thresholding on IDS utilization."""
+    n_edges = len(env.edge_areas)
+    ids_cpu_max = np.array([e.budget.cpu - 0.5 for e in env.edge_areas], dtype=np.float32)
+
+    if len(env.history) < decision_interval * n_edges:
+        return ids_cpu.copy()
+
+    block = env.history[-decision_interval * n_edges:]
+    df = pd.DataFrame([m.__dict__ for m in block])
+
+    utils = []
+    for edge in env.edge_areas:
+        g = df[df["area_id"] == edge.area_id]
+        if g.empty or "ids_cpu_utilization" not in g.columns:
+            continue
+        utils.append(float(np.clip(np.mean(g["ids_cpu_utilization"].values), 0.0, 1.0)))
+
+    util = float(max(utils)) if utils else 0.0
+
+    if util >= 0.80:
+        delta = np.ones(n_edges, dtype=np.float32)
+    elif util <= 0.20:
+        delta = -np.ones(n_edges, dtype=np.float32)
+    else:
+        delta = np.zeros(n_edges, dtype=np.float32)
+
+    new_ids_cpu = ids_cpu + delta * scale_step
+    new_ids_cpu = np.clip(new_ids_cpu, ids_cpu_min, ids_cpu_max)
+    return new_ids_cpu
+
+
+def test_environment_run(cfg_path: str, plot=False, decision_interval: int = 500,
+                         method: str = "reactive", constant_cpu: float = 0.5):
+    """
+    method: "reactive"    - threshold-based IDS CPU adjustment every decision_interval steps
+            "constant"    - fixed ids_cpu = constant_cpu for all steps
+    """
+    env = build_env_base(cfg_path)
+
+    dfs = []
+    for i in range(15):
+        env.reset(seed=1000 + i)
+
+        n_edges = len(env.edge_areas)
+        ids_cpu_max = np.array([e.budget.cpu - 0.5 for e in env.edge_areas], dtype=np.float32)
+
+        if method == "constant":
+            ids_cpu = np.clip(np.full(n_edges, constant_cpu, dtype=np.float32), 0.0, ids_cpu_max)
+        else:
+            ids_cpu = np.array([e.ids_cpu for e in env.edge_areas], dtype=np.float32)
+
+        t = 0
+        while t < env.t_max:
+            if method == "reactive":
+                ids_cpu = _reactive_ids_cpu(env, ids_cpu, decision_interval)
+
+            for _ in range(decision_interval):
+                env.step(ids_cpu.tolist())
+                t += 1
+                if t >= env.t_max:
+                    break
+
+        df = pd.DataFrame([m.__dict__ for m in env.history])
+        df["episode"] = i
+        df["t"] = i * env.t_max + df["t"]
+        dfs.append(df)
+
+    all_df = pd.concat(dfs, ignore_index=True)
+    assert not all_df.empty, "No metrics produced"
+    assert np.isfinite(all_df["qoe_mean"]).all(), "Invalid QoE values"
+    assert all_df["ids_coverage"].between(0, 1).all(), "IDS coverage out of range"
+
+
+    out_dir = "logs/test"
+    os.makedirs(out_dir, exist_ok=True)
+
+    # QoE over time
+    qoe_pivot = all_df.pivot(index="t", columns="area_id", values="qoe_mean")
+    ax_qoe = qoe_pivot.plot(figsize=(10, 4), title="QoE over time", alpha=0.25)
+    qoe_pivot.rolling(500, min_periods=1).mean().plot(ax=ax_qoe, linewidth=2)
+    ax_qoe.get_figure().savefig(f"{out_dir}/qoe_over_time.png", bbox_inches="tight")
+
+    # Latency over time
+    (
+        all_df.pivot(index="t", columns="area_id", values="ids_cpu_utilization")
+        .plot(figsize=(10, 4), title="IDS CPU Utilization")
+        .get_figure()
+        .savefig(f"{out_dir}/ids_cpu_utilization.png", bbox_inches="tight")
+    )
+
+    ax = all_df.pivot(index="t", columns="area_id", values="local_num_req").plot(
+        figsize=(10, 4),
+        title="Num Request",
+        alpha=0.25,
+    )
+
+    all_df.pivot(index="t", columns="area_id", values="local_num_req") \
+        .rolling(500, min_periods=1) \
+        .mean() \
+        .plot(ax=ax, linewidth=2)
+
+    ax.get_figure().savefig(f"{out_dir}/local_num_req_combined.png", bbox_inches="tight")
+    # Ema mom
+    (
+        all_df.pivot(index="t", columns="area_id", values="ema_mom")
+        .plot(figsize=(10, 4), title="EMA Momentum")
+        .get_figure()
+        .savefig(f"{out_dir}/ema_mom.png", bbox_inches="tight")
+    )
+    
+    # Attack in 
+    (
+        all_df.pivot(index="t", columns="area_id", values=["attack_in_rate", "attack_drop_rate"])
+        .plot(figsize=(10, 4), title="Attack In Rate")
+        .get_figure()
+        .savefig(f"{out_dir}/attack_in_rate.png", bbox_inches="tight")
+    )
+
+    all_df["machine_count"] = all_df["cpu_to_ids_ratio"] * 16
+
+    (
+        all_df.pivot(index="t", columns="area_id", values="machine_count")
+        .plot(figsize=(10, 4), title="Machine Count")
+        .get_figure()
+        .savefig(f"{out_dir}/machine_count.png", bbox_inches="tight")
+    )    
+
+    avg_qoe = df["qoe_mean"].mean()
+    print(f"Average QoE (qoe_mean): {avg_qoe:.4f}")
+    print(f"Average QoE (benign_col_dmg): {df['benign_col_dmg'].mean():.4f}")
+    print(f"Plots saved to {out_dir}/")    
+        
+if __name__ == "__main__":
+    test_environment_run("./configs/simulation_0.yaml", plot=True, method="constant", constant_cpu=2.0)
