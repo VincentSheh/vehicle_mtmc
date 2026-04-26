@@ -27,7 +27,7 @@ from tqdm import tqdm
 
 from environment import build_env_base
 from train_sa_lstm import TorchRLEnvWrapper
-from method_policy import ActContext, BaselinePolicy, make_baseline_policy
+from method_policy import ActContext, BaselinePolicy, make_baseline_policy, OFFLOAD_DISPLAY_NAMES
 from matplotlib import pyplot as plt
 
 SCALING_QUANTA = [0.5, 1.0, 1.5, 2.0]
@@ -631,6 +631,9 @@ def main():
     ap.add_argument("--ckpt",              default="checkpoints/singleedge/rew_32_netting_a4_rew/ckpt_best.pt",
                     help="Checkpoint path (needed when 'lstm_rl' is in --methods)")
     ap.add_argument("--device",            default="cpu")
+    ap.add_argument("--offload_modes",     nargs="+", default=None,
+                    help="Offload modes to compare (e.g. none balance delay_workload full). "
+                         "Defaults to the value in the config file.")
     args = ap.parse_args()
 
     with open(args.cfg) as f:
@@ -658,26 +661,20 @@ def main():
     atk_lvls = ["low", "mid", "high"]
     user_lvls = ["low", "mid", "high"]
 
+    # Resolve offload modes: explicit list or fall back to config value
+    cfg_offload_mode = cfg_original["globals"].get("offload_mode", "balance")
+    offload_modes: List[str] = args.offload_modes if args.offload_modes else [cfg_offload_mode]
+    multi_offload = len(offload_modes) > 1
+
     for atk_lvl in atk_lvls:
         for user_lvl in user_lvls:
             print(f"\n>>> Evaluating Levels: Attack={atk_lvl}, User={user_lvl}")
-            
-            cfg = copy.deepcopy(cfg_original)
-            if "attack_sampler" in cfg.get("globals", {}):
-                cfg["globals"]["attack_sampler"]["level"] = atk_lvl
-            
-            if "user_sampler" in cfg.get("globals", {}) and "synthetic" in cfg["globals"]["user_sampler"]:
-                cfg["globals"]["user_sampler"]["synthetic"]["level"] = user_lvl
 
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as tmp:
-                yaml.dump(cfg, tmp)
-                tmp_cfg_path = tmp.name
-
-            try:
-                env = build_env_base(tmp_cfg_path)
-            finally:
-                if os.path.exists(tmp_cfg_path):
-                    os.remove(tmp_cfg_path)
+            cfg_base = copy.deepcopy(cfg_original)
+            if "attack_sampler" in cfg_base.get("globals", {}):
+                cfg_base["globals"]["attack_sampler"]["level"] = atk_lvl
+            if "user_sampler" in cfg_base.get("globals", {}) and "synthetic" in cfg_base["globals"]["user_sampler"]:
+                cfg_base["globals"]["user_sampler"]["synthetic"]["level"] = user_lvl
 
             tbsa_table_path = Path(args.tbsa_table)
             policies: Dict[str, BaselinePolicy] = {}
@@ -701,40 +698,72 @@ def main():
                 print(f"[skip] No valid methods for Attack={atk_lvl}, User={user_lvl}")
                 continue
 
-            results: Dict[str, Dict[str, np.ndarray]] = {m: {} for m in valid_methods}
-            last_ids_cpu: Dict[str, Optional[np.ndarray]] = {m: None for m in valid_methods}
+            # results keyed by "{method}[{offload_mode}]" when comparing multiple modes,
+            # or just "{method}" when a single mode is evaluated.
+            results: Dict[str, Dict[str, np.ndarray]] = {}
+            last_ids_cpu: Dict[str, Optional[np.ndarray]] = {}
 
-            for ep in tqdm(range(args.episodes), desc=f"episodes ({atk_lvl}/{user_lvl})"):
-                ep_seed = base_seed + (ep + 1) * 1000
+            for offload_mode in offload_modes:
+                cfg = copy.deepcopy(cfg_base)
+                cfg["globals"]["offload_mode"] = offload_mode
+
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as tmp:
+                    yaml.dump(cfg, tmp)
+                    tmp_cfg_path = tmp.name
+
+                try:
+                    env = build_env_base(tmp_cfg_path)
+                finally:
+                    if os.path.exists(tmp_cfg_path):
+                        os.remove(tmp_cfg_path)
+
                 for mname in valid_methods:
-                    ep_result, final_ids = run_episode(
-                        env=env,
-                        cfg=cfg,
-                        policy=policies[mname],
-                        obs_keys=obs_keys,
-                        decision_interval=decision_interval,
-                        scale_step=args.scale_step,
-                        n_actions=n_actions,
-                        ids_cpu_min=args.ids_cpu_min,
-                        seed=ep_seed,
-                        reward_alpha=reward_alpha,
-                        reward_beta=reward_beta,
-                        reward_gamma=reward_gamma,
-                        reward_q_th=reward_q_th,
-                        initial_ids_cpu=last_ids_cpu[mname],
-                    )
-                    last_ids_cpu[mname] = final_ids
-                    for k, v in ep_result.items():
-                        existing = results[mname].get(k)
-                        if existing is None or existing.size == 0:
-                            results[mname][k] = v
-                        else:
-                            results[mname][k] = np.concatenate([existing, v], axis=0)
+                    rkey = f"{mname}[{offload_mode}]" if multi_offload else mname
+                    results[rkey] = {}
+                    last_ids_cpu[rkey] = None
+
+                for ep in tqdm(range(args.episodes),
+                               desc=f"episodes ({atk_lvl}/{user_lvl}/offload={offload_mode})"):
+                    ep_seed = base_seed + (ep + 1) * 1000
+                    for mname in valid_methods:
+                        rkey = f"{mname}[{offload_mode}]" if multi_offload else mname
+                        ep_result, final_ids = run_episode(
+                            env=env,
+                            cfg=cfg,
+                            policy=policies[mname],
+                            obs_keys=obs_keys,
+                            decision_interval=decision_interval,
+                            scale_step=args.scale_step,
+                            n_actions=n_actions,
+                            ids_cpu_min=args.ids_cpu_min,
+                            seed=ep_seed,
+                            reward_alpha=reward_alpha,
+                            reward_beta=reward_beta,
+                            reward_gamma=reward_gamma,
+                            reward_q_th=reward_q_th,
+                            initial_ids_cpu=last_ids_cpu[rkey],
+                        )
+                        last_ids_cpu[rkey] = final_ids
+                        for k, v in ep_result.items():
+                            existing = results[rkey].get(k)
+                            if existing is None or existing.size == 0:
+                                results[rkey][k] = v
+                            else:
+                                results[rkey][k] = np.concatenate([existing, v], axis=0)
 
             lvl_outdir = outdir_base / f"atk_{atk_lvl}_user_{user_lvl}"
             lvl_outdir.mkdir(parents=True, exist_ok=True)
-            
-            display_results = {DISPLAY_NAMES.get(m, m): results[m] for m in valid_methods}
+
+            def _display_label(rkey: str) -> str:
+                if multi_offload and "[" in rkey:
+                    mname, om = rkey.rsplit("[", 1)
+                    om = om.rstrip("]")
+                    base = DISPLAY_NAMES.get(mname, mname)
+                    ol   = OFFLOAD_DISPLAY_NAMES.get(om, om)
+                    return f"{base} ({ol})"
+                return DISPLAY_NAMES.get(rkey, rkey)
+
+            display_results = {_display_label(rk): results[rk] for rk in results}
             area_ids = [e.area_id for e in env.edge_areas]
             ts_path      = lvl_outdir / "qoe_ts.png"
             summary_path = lvl_outdir / "summary.png"
@@ -743,16 +772,16 @@ def main():
 
             print(f"Plots saved to {lvl_outdir}/")
 
-            col_w = 26
+            col_w = 32
             header = f"{'Method':<{col_w}} {'qoe_vio_rate':>12} {'reward/mean':>12} {'qoe_penalty':>12} {'atk_drop_pct':>12} {'lambda_res':>12}"
             print("\n" + header)
             print("-" * len(header))
-            for mname in valid_methods:
-                r = results[mname]
+            for rkey in results:
+                r = results[rkey]
                 atk_in_sum  = float(r['attack_in_rate'].sum())
                 atk_drp_sum = float(r['attack_drop_rate'].sum())
                 atk_drop_pct = atk_drp_sum / atk_in_sum if atk_in_sum > 1e-6 else 0.0
-                label = DISPLAY_NAMES.get(mname, mname)
+                label = _display_label(rkey)
                 print(
                     f"{label:<{col_w}} "
                     f"{float(np.mean(r['qoe_vio_rate'])):>12.1%} "

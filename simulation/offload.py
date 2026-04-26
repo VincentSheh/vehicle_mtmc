@@ -300,9 +300,13 @@ def score_based_offload(
         flow = {e: {e: int(round(W[e]))} for e in area_ids}
         return _build_plan(flow, area_ids)
 
-    N_star = {e: float(c_dst[e]) for e in area_ids}
-    if cap_dst is not None:
-        N_star = {e: min(N_star[e], float(cap_dst[e])) for e in area_ids}
+    C_tot = float(sum(c_dst[e] for e in area_ids))
+    if C_tot > EPS:
+        N_star = {e: float(c_dst[e]) * (W_tot / C_tot) for e in area_ids}
+    else:
+        N_star = {e: 0.0 for e in area_ids}
+    # cap each edge at its own capacity to prevent overcapacity when W_tot > C_tot
+    N_star = {e: min(N_star[e], float(c_dst[e])) for e in area_ids}
 
     supply    = {e: max(0.0, W[e] - N_star[e]) for e in area_ids}
     demand    = {e: max(0.0, N_star[e] - W[e]) for e in area_ids}
@@ -345,7 +349,8 @@ def score_based_offload(
 
         items = list(pos.items())
         random.shuffle(items)
-        for r, p in sorted(items, key=lambda kv: -kv[1]):
+        sorted_items = sorted(items, key=lambda kv: -kv[1])
+        for r, p in sorted_items:
             if p <= EPS or to_move <= EPS:
                 break
             share = min((p / total) * rem_supply[src], rem_demand.get(r, 0.0), to_move)
@@ -355,6 +360,19 @@ def score_based_offload(
             flow_float[src][r]    = flow_float[src].get(r, 0.0) + share
             to_move              -= share
             rem_demand[r]        -= share
+
+        # Drain any supply stranded by demand caps in the proportional pass
+        if to_move > EPS:
+            for r, _ in sorted_items:
+                if to_move <= EPS:
+                    break
+                extra = min(rem_demand.get(r, 0.0), to_move)
+                if extra <= EPS:
+                    continue
+                flow_float[src][src] -= extra
+                flow_float[src][r]    = flow_float[src].get(r, 0.0) + extra
+                to_move              -= extra
+                rem_demand[r]        -= extra
 
     return _build_plan(_round_and_conserve(flow_float, W), area_ids)
 

@@ -36,6 +36,8 @@ import numpy as np
 import yaml
 from tqdm import tqdm
 
+from method_policy import OFFLOAD_DISPLAY_NAMES
+
 LEVELS = ["low", "mid", "high"]
 LEVEL_LABELS = {"low": "Low", "mid": "Mid", "high": "High"}
 
@@ -56,6 +58,7 @@ DISPLAY_NAMES: Dict[str, str] = {
     "offline_optimal": "TBSA Optimal",
     "lstm_rl":         "LSTM RL",
 }
+
 
 DEFAULT_METHODS = [
     "no_ids",
@@ -158,16 +161,17 @@ def save_means_to_csv(means: dict, methods_display: list[str], outpath: Path):
 # Dummy data generation
 # ---------------------------------------------------------------------------
 
-def _make_dummy_data(methods: list[str]) -> dict:
-    """Returns data[atk_lvl][user_lvl][method_label] = {raw_key: array}."""
+def _make_dummy_data(method_labels: list[str]) -> dict:
+    """Returns data[atk_lvl][user_lvl][method_label] = {raw_key: array}.
+    Accepts pre-built display labels (already include offload mode suffix when applicable).
+    """
     rng = np.random.default_rng(0)
     data: dict = {}
     for i, atk_lvl in enumerate(LEVELS):
         data[atk_lvl] = {}
         for j, user_lvl in enumerate(LEVELS):
             data[atk_lvl][user_lvl] = {}
-            for k, mname in enumerate(methods):
-                label = DISPLAY_NAMES.get(mname, mname)
+            for k, label in enumerate(method_labels):
                 n = 50
                 base_slo  = 0.05 + 0.15 * i + 0.05 * k + 0.03 * j
                 base_bcd  = 0.02 + 0.08 * i + 0.02 * k - 0.01 * j
@@ -186,6 +190,14 @@ def _make_dummy_data(methods: list[str]) -> dict:
 # Real evaluation
 # ---------------------------------------------------------------------------
 
+def _make_display_label(mname: str, offload_mode: str, multi_offload: bool) -> str:
+    base = DISPLAY_NAMES.get(mname, mname)
+    if multi_offload:
+        ol = OFFLOAD_DISPLAY_NAMES.get(offload_mode, offload_mode)
+        return f"{base} ({ol})"
+    return base
+
+
 def collect_data(args) -> dict:
     from eval_baselines import run_episode
     from environment import build_env_base
@@ -200,6 +212,47 @@ def collect_data(args) -> dict:
 
     methods: list[str] = args.methods if args.methods else list(DEFAULT_METHODS)
 
+    cfg_offload_mode = cfg_original["globals"].get("offload_mode", "balance")
+    offload_modes: list[str] = args.offload_modes if args.offload_modes else [cfg_offload_mode]
+    multi_offload = len(offload_modes) > 1
+
+    # Derive obs/reward params once from the original config
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as tmp_orig:
+        yaml.dump(cfg_original, tmp_orig)
+        tmp_orig_path = tmp_orig.name
+    try:
+        decision_interval = args.decision_interval or int(cfg_original["globals"]["decision_interval"])
+        _wrapper     = TorchRLEnvWrapper(cfg_path=tmp_orig_path, decision_interval=decision_interval, device="cpu")
+        obs_keys     = _wrapper.obs_keys
+        reward_alpha = _wrapper.reward_alpha
+        reward_beta  = _wrapper.reward_beta
+        reward_gamma = _wrapper.reward_gamma
+        reward_q_th  = _wrapper.reward_q_th
+        n_actions    = _wrapper.n_actions
+        del _wrapper
+    finally:
+        if os.path.exists(tmp_orig_path):
+            os.remove(tmp_orig_path)
+
+    # Build policies once (they are env-independent)
+    policies: dict = {}
+    for mname in methods:
+        tbsa_path = str(args.tbsa_table) if mname in ("tbsa", "offline_optimal") else None
+        ckpt      = args.ckpt            if mname == "lstm_rl" else None
+        ok_keys   = obs_keys             if mname == "lstm_rl" else None
+        try:
+            policies[mname] = make_baseline_policy(
+                mname,
+                tbsa_table_path=tbsa_path,
+                ckpt_path=ckpt,
+                obs_keys=ok_keys,
+                device=args.device,
+            )
+        except (ValueError, FileNotFoundError) as exc:
+            print(f"[warn] Skipping '{mname}': {exc}")
+
+    valid_methods = [m for m in methods if m in policies]
+
     data: dict = {}
     for atk_lvl in LEVELS:
         data[atk_lvl] = {}
@@ -208,96 +261,72 @@ def collect_data(args) -> dict:
             print(f" Evaluating: atk={atk_lvl}  user={user_lvl}")
             print("="*70)
 
-            cfg = copy.deepcopy(cfg_original)
-            cfg["globals"]["attack_sampler"]["level"] = atk_lvl
-            cfg["globals"]["user_sampler"]["synthetic"]["level"] = user_lvl
+            if not valid_methods:
+                print(f"[warn] No valid methods, skipping.")
+                data[atk_lvl][user_lvl] = {}
+                continue
 
-            with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as tmp:
-                yaml.dump(cfg, tmp)
-                tmp_path = tmp.name
+            cell: dict = {}
 
-            try:
-                decision_interval = args.decision_interval or int(cfg["globals"]["decision_interval"])
+            for offload_mode in offload_modes:
+                cfg = copy.deepcopy(cfg_original)
+                cfg["globals"]["attack_sampler"]["level"] = atk_lvl
+                cfg["globals"]["user_sampler"]["synthetic"]["level"] = user_lvl
+                cfg["globals"]["offload_mode"] = offload_mode
 
-                _wrapper     = TorchRLEnvWrapper(cfg_path=tmp_path, decision_interval=decision_interval, device="cpu")
-                obs_keys     = _wrapper.obs_keys
-                reward_alpha = _wrapper.reward_alpha
-                reward_beta  = _wrapper.reward_beta
-                reward_gamma = _wrapper.reward_gamma
-                reward_q_th  = _wrapper.reward_q_th
-                n_actions    = _wrapper.n_actions
-                del _wrapper
+                with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as tmp:
+                    yaml.dump(cfg, tmp)
+                    tmp_path = tmp.name
 
-                env = build_env_base(tmp_path)
+                try:
+                    env = build_env_base(tmp_path)
 
-                policies: dict = {}
-                for mname in methods:
-                    tbsa_path = str(args.tbsa_table) if mname in ("tbsa", "offline_optimal") else None
-                    ckpt      = args.ckpt            if mname == "lstm_rl" else None
-                    ok_keys   = obs_keys             if mname == "lstm_rl" else None
-                    try:
-                        policies[mname] = make_baseline_policy(
-                            mname,
-                            tbsa_table_path=tbsa_path,
-                            ckpt_path=ckpt,
-                            obs_keys=ok_keys,
-                            device=args.device,
-                        )
-                    except (ValueError, FileNotFoundError) as exc:
-                        print(f"[warn] Skipping '{mname}': {exc}")
+                    accumulated: Dict[str, Dict[str, np.ndarray]] = {m: {} for m in valid_methods}
+                    last_ids_cpu: Dict[str, Optional[np.ndarray]] = {m: None for m in valid_methods}
 
-                valid_methods = [m for m in methods if m in policies]
-                if not valid_methods:
-                    print(f"[warn] No valid methods for atk={atk_lvl}, user={user_lvl}, skipping.")
-                    data[atk_lvl][user_lvl] = {}
-                    continue
+                    for ep in tqdm(range(args.episodes),
+                                   desc=f"episodes (offload={offload_mode})"):
+                        ep_seed = base_seed + (ep + 1) * 1000
+                        for mname in valid_methods:
+                            ep_result, final_ids = run_episode(
+                                env=env,
+                                cfg=cfg,
+                                policy=policies[mname],
+                                obs_keys=obs_keys,
+                                decision_interval=decision_interval,
+                                scale_step=args.scale_step,
+                                n_actions=n_actions,
+                                ids_cpu_min=args.ids_cpu_min,
+                                seed=ep_seed,
+                                reward_alpha=reward_alpha,
+                                reward_beta=reward_beta,
+                                reward_gamma=reward_gamma,
+                                reward_q_th=reward_q_th,
+                                initial_ids_cpu=last_ids_cpu[mname],
+                            )
+                            last_ids_cpu[mname] = final_ids
 
-                accumulated: Dict[str, Dict[str, np.ndarray]] = {m: {} for m in valid_methods}
-                last_ids_cpu: Dict[str, Optional[np.ndarray]] = {m: None for m in valid_methods}
+                            ep_ratios = ep_result["cpu_to_ids_ratio"]
+                            realloc_count = 0
+                            if ep_ratios.size > 1:
+                                realloc_count = np.sum(np.abs(np.diff(ep_ratios)) > 1e-6)
+                            ep_result["reallocations"] = np.array([realloc_count], dtype=np.float32)
 
-                for ep in tqdm(range(args.episodes), desc="episodes"):
-                    ep_seed = base_seed + (ep + 1) * 1000
+                            for k, v in ep_result.items():
+                                if k not in accumulated[mname]:
+                                    accumulated[mname][k] = v
+                                else:
+                                    accumulated[mname][k] = np.concatenate([accumulated[mname][k], v], axis=0)
+
                     for mname in valid_methods:
-                        ep_result, final_ids = run_episode(
-                            env=env,
-                            cfg=cfg,
-                            policy=policies[mname],
-                            obs_keys=obs_keys,
-                            decision_interval=decision_interval,
-                            scale_step=args.scale_step,
-                            n_actions=n_actions,
-                            ids_cpu_min=args.ids_cpu_min,
-                            seed=ep_seed,
-                            reward_alpha=reward_alpha,
-                            reward_beta=reward_beta,
-                            reward_gamma=reward_gamma,
-                            reward_q_th=reward_q_th,
-                            initial_ids_cpu=last_ids_cpu[mname],
-                        )
-                        last_ids_cpu[mname] = final_ids
-                        
-                        # Add reallocation count for this episode (number of times settled ratio changed)
-                        ep_ratios = ep_result["cpu_to_ids_ratio"]
-                        realloc_count = 0
-                        if ep_ratios.size > 1:
-                            realloc_count = np.sum(np.abs(np.diff(ep_ratios)) > 1e-6)
-                        ep_result["reallocations"] = np.array([realloc_count], dtype=np.float32)
+                        label = _make_display_label(mname, offload_mode, multi_offload)
+                        cell[label] = accumulated[mname]
 
-                        for k, v in ep_result.items():
-                            if k not in accumulated[mname]:
-                                accumulated[mname][k] = v
-                            else:
-                                accumulated[mname][k] = np.concatenate([accumulated[mname][k], v], axis=0)
+                finally:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
 
-                cell: dict = {}
-                for mname in valid_methods:
-                    label = DISPLAY_NAMES.get(mname, mname)
-                    cell[label] = accumulated[mname]
-                data[atk_lvl][user_lvl] = cell
-
-            finally:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
+            data[atk_lvl][user_lvl] = cell
 
     return data
 
@@ -420,16 +449,28 @@ def main():
     ap.add_argument("--scale_step",        type=float, default=0.5)
     ap.add_argument("--decision_interval", type=int,   default=None)
     ap.add_argument("--device",            default="cpu")
+    ap.add_argument("--offload_modes",     nargs="+", default=None,
+                    help="Offload modes to compare (e.g. none balance delay_workload full). "
+                         "Defaults to the value in the config file.")
     args = ap.parse_args()
 
     outdir  = Path(args.outdir)
     csv_path = outdir / "scenario_grid.csv"
 
+    def _build_methods_display(raw_methods: list[str], offload_modes: list[str]) -> list[str]:
+        multi_offload = len(offload_modes) > 1
+        labels = []
+        for om in offload_modes:
+            for m in raw_methods:
+                labels.append(_make_display_label(m, om, multi_offload))
+        return labels
+
     if args.dummy:
         print("[dummy mode] Generating synthetic data for layout preview...")
         methods = args.methods if args.methods else list(DEFAULT_METHODS)
-        methods_display = [DISPLAY_NAMES.get(m, m) for m in methods]
-        data  = _make_dummy_data(methods)
+        offload_modes = args.offload_modes or ["balance"]
+        methods_display = _build_methods_display(methods, offload_modes)
+        data  = _make_dummy_data(methods_display)
         means = build_means_from_data(data, methods_display)
         save_means_to_csv(means, methods_display, csv_path)
 
@@ -439,7 +480,10 @@ def main():
 
     else:
         methods = args.methods if args.methods else list(DEFAULT_METHODS)
-        methods_display = [DISPLAY_NAMES.get(m, m) for m in methods]
+        with open(args.cfg) as _f:
+            _cfg_orig = yaml.safe_load(_f)
+        offload_modes = args.offload_modes or [_cfg_orig["globals"].get("offload_mode", "balance")]
+        methods_display = _build_methods_display(methods, offload_modes)
         data  = collect_data(args)
         means = build_means_from_data(data, methods_display)
         save_means_to_csv(means, methods_display, csv_path)

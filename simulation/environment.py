@@ -285,7 +285,7 @@ class Environment:
             return no_offload(self.area_ids, W_src)
 
         if mode == "balance":
-            return balance_workload(self.area_ids, W_src, c_dst)
+            return balance_workload(self.area_ids, W_src, c_dst, cap_dst=c_dst)
 
         if mode == "cto":
             nested: Dict[str, Dict[str, float]] = {
@@ -377,16 +377,10 @@ class Environment:
 
         # Stage B: IDS offload plan
         W_ids = {aid: float(obs[aid]["total_workload_in"]) for aid in self.area_ids}
-        if self.offload_mode in ("cto", "cto_acc"):
-            c_ids = {
-                aid: float(edges[aid].ids.effective_speed_pkt_per_step(edges[aid].ids_cpu))
-                for aid in self.area_ids
-            }
-        else:
-            c_ids = {
-                aid: float(edges[aid].ids.effective_speed_pkt_per_step(edges[aid].ids_cpu))
-                for aid in self.area_ids
-            }
+        c_ids = {
+            aid: float(edges[aid].ids.effective_speed_pkt_per_step(edges[aid].ids_cpu))
+            for aid in self.area_ids
+        }
         plan_ids = self._make_offload_plan(W_ids, c_ids, stage="ids")
 
         exec_user_in: Dict[str, int] = {aid: 0 for aid in self.area_ids}
@@ -503,17 +497,13 @@ class Environment:
             c_va: Dict[str, float] = {}
             for aid in self.area_ids:
                 edge = edges[aid]
-                atk_cycles_per_ms = exec_atk_cycles[aid] / edge.slot_ms
-                if self.offload_mode in ("cto", "cto_acc"):
-                    avail_cycles = max(
-                        0.0,
-                        float(edge.va_cpu) * edge.cpu_cycle_per_ms * edge.slot_ms
-                        - exec_atk_cycles[aid],
-                    )
-                    min_det_cycles = min(edge.pipeline.det_cycles.values())
-                    c_va[aid] = avail_cycles / min_det_cycles if min_det_cycles > 0 else 0.0
-                else:
-                    c_va[aid] = max(0.0, float(edge.va_cpu) - atk_cycles_per_ms / edge.cpu_cycle_per_ms)
+                avail_cycles = max(
+                    0.0,
+                    float(edge.va_cpu) * edge.cpu_cycle_per_ms * edge.slot_ms
+                    - exec_atk_cycles[aid],
+                )
+                min_det_cycles = min(edge.pipeline.det_cycles.values())
+                c_va[aid] = avail_cycles / min_det_cycles if min_det_cycles > 0 else 0.0
             plan_va = self._make_offload_plan(W_va, c_va, stage="va")
 
             # Admitted attacks stay local — seed bw/cycles at their IDS executor
@@ -540,12 +530,9 @@ class Environment:
             c_va = {}
             for aid in self.area_ids:
                 edge = edges[aid]
-                if self.offload_mode in ("cto", "cto_acc"):
-                    avail_cycles = float(edge.va_cpu) * edge.cpu_cycle_per_ms * edge.slot_ms
-                    min_det_cycles = min(edge.pipeline.det_cycles.values())
-                    c_va[aid] = avail_cycles / min_det_cycles if min_det_cycles > 0 else 0.0
-                else:
-                    c_va[aid] = float(edge.va_cpu)
+                avail_cycles = float(edge.va_cpu) * edge.cpu_cycle_per_ms * edge.slot_ms
+                min_det_cycles = min(edge.pipeline.det_cycles.values())
+                c_va[aid] = avail_cycles / min_det_cycles if min_det_cycles > 0 else 0.0
             plan_va = self._make_offload_plan(W_va, c_va, stage="va")
 
             # Attack bw/cycles distributed to VA executors proportional to routed attack count
@@ -813,7 +800,7 @@ def test_environment_run(cfg_path: str, plot=False, decision_interval: int = 500
     env = build_env_base(cfg_path)
 
     dfs = []
-    for i in range(1):
+    for i in range(3):
         env.reset(seed=1000 + i)
 
         n_edges = len(env.edge_areas)
@@ -904,16 +891,19 @@ def test_environment_run(cfg_path: str, plot=False, decision_interval: int = 500
 
     atk_in   = all_df["attack_in_rate"].sum()
     atk_drop = all_df["attack_drop_rate"].sum()
+    user_in   = all_df["local_num_req"].sum()
     user_drop = all_df["user_drop_rate"].sum()
+    
     malicious_drop_pct = 100.0 * atk_drop / atk_in if atk_in > 0 else 0.0
+    benign_drop_pct = 100.0 * user_drop / user_in if user_in > 0 else 0.0
 
     avg_qoe = all_df["qoe_mean"].mean()
     print(f"Average QoE (qoe_mean):       {avg_qoe:.4f}")
     print(f"Average QoE (benign_col_dmg): {all_df['benign_col_dmg'].mean():.4f}")
     print(f"SLO violation rate (q_th={q_th:.2f}): {violation_rate:.4f} ({100*violation_rate:.1f}%)")
-    print(f"Benign requests dropped:      {user_drop:.0f}")
+    print(f"Benign requests dropped:      {user_drop:.0f} ({benign_drop_pct:.1f}%)")
     print(f"Malicious traffic dropped:    {atk_drop:.0f} ({malicious_drop_pct:.1f}%)")
     print(f"Plots saved to {out_dir}/")    
         
 if __name__ == "__main__":
-    test_environment_run("./configs/simulation_ma_0.yaml", plot=True, method="constant", constant_cpu=3.0)
+    test_environment_run("./configs/simulation_ma_0.yaml", plot=True, method="reactive", constant_cpu=3.0)

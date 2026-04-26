@@ -12,11 +12,22 @@ from __future__ import annotations
 
 import abc
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 
 from tbsa_offline import TBSAPolicy
+
+
+# Human-readable labels for offload modes (shared across eval scripts)
+OFFLOAD_DISPLAY_NAMES: Dict[str, str] = {
+    "none":           "No Offload",
+    "balance":        "Balance",
+    "delay_workload": "Delay-Weighted",
+    "full":           "Full Score",
+    "cto":            "CTO",
+    "cto_acc":        "CTO+Acc",
+}
 
 
 # ---------------------------------------------------------------------------

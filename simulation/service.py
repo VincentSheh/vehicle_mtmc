@@ -66,7 +66,12 @@ class IDS:
         total_in = float(user_rate + total_attack)
 
         speed = self.effective_speed_pkt_per_step(ids_cpu)
-        coverage = float(min(1.0, speed / total_attack)) if total_attack > 0 else 1.0
+        if ids_cpu <= 0:
+            coverage = 0.0
+        elif total_attack > 0:
+            coverage = float(min(1.0, speed / total_attack))
+        else:
+            coverage = 1.0
 
         # attacks: stochastic drop = Binomial(n, coverage * TPR) — symmetric with user drops
         by_type = attack_dict.get("by_type", {})

@@ -54,7 +54,21 @@ globals:
     gamma_inv: 10.0   # Benign collateral normalizer
     q_th:      0.35   # QoE shortfall threshold
 
-  offload_mode: "cto"  # "none" | "cto" | "cto_acc" | "delay_workload" | "full"
+  # Offload mode comparison:
+  #
+  #  Mode            Function                  N_star target          Offload trigger              Routing strategy                  Delay-aware  Accuracy-aware
+  #  --------------- ------------------------- --------------------- ---------------------------- --------------------------------- ------------ --------------
+  #  none            no_offload                —                     never                        all traffic stays local           no           no
+  #  balance         balance_workload          c[e] * W_tot / C_tot  always (any imbalance)       greedy, random receiver order     no           no
+  #  delay_workload  score_based_offload       c[e] * W_tot / C_tot  always (any imbalance)       proportional to inverse delay     yes          no
+  #  full            score_based_offload       c[e] * W_tot / C_tot  always (any imbalance)       proportional to delay + accuracy  yes          yes
+  #  cto             balance_workload_cto      c[e]  (absolute)      only when W[e] > c[e]        greedy, sorted ascending delay    yes          no
+  #  cto_acc         balance_workload_cto_acc  c[e]  (absolute)      only when W[e] > c[e]        greedy, sorted by delay+accuracy  yes          yes
+  #
+  #  All modes: capacity in pkts/slot (IDS) and tasks/slot (VA); balance caps receivers at c[e].
+  #  delay_workload vs cto: same trigger/target but delay_workload splits supply proportionally
+  #  across receivers by score whereas cto fills the closest receiver first (winner-takes-all).
+  offload_mode: "cto_acc"  # "none" | "balance" | "delay_workload" | "full" | "cto" | "cto_acc"
   # VA-stage attack offload mode:
   #   false (default) — admitted attacks stay at their IDS executor; VA capacity is
   #                     pre-reduced by attack load before the benign-user offload plan.
@@ -71,31 +85,22 @@ globals:
   #                  + (util_src  - util_dst)   * w4   [full only]
   offload_weights:
     w1: 1.0   # FNR accuracy improvement
-    w2: 1000.0   # FPR accuracy improvement
-    w3: 1.000  # propagation delay penalty
+    w2: 1.0   # FPR accuracy improvement
+    w3: 0.010  # propagation delay penalty (ms⁻¹); non-zero so delay_workload has a routing criterion
 
   # Accuracy-by-region matrix: [src_edge_idx][exec_edge_idx] = [FPR, FNR]
   # Row = traffic source edge, Col = inspecting/executing edge.
-  # Diagonal = local inspection accuracy (own model on own traffic).
-  # Off-diagonal = cross-edge accuracy (typically higher error due to domain shift).
-  # Order matches edge_areas list: E1=0, E2=1.
+  # Diagonal = local inspection (own model on own traffic).
+  # Designed so delay_workload and full route to different edges:
+  #   E2: close (5 ms) but high FPR (0.45) for non-local traffic  — delay_workload prefers it
+  #   E3: far  (30 ms) but low  FPR (0.01) for non-local traffic  — full prefers it
+  # Routing criterion for E1 traffic (w3=0.010, w2=1.0):
+  #   delay_workload: score(→E2) = -0.05  >  score(→E3) = -0.30   →  routes to E2  (bad FPR)
+  #   full:           raw(→E2)  = -0.40  <   raw(→E3)  = -0.21   →  routes to E3  (good FPR)
   accuracy_by_region:
-    # - [[0.0, 0.00], [0.0, 0.00], [0.0, 0.00]]   # traffic from E1: inspected at [E1, E2, E3]
-    # - [[0.0, 0.00], [0.0, 0.00], [0.0, 0.00]]   # traffic from E2: inspected at [E1, E2, E3]
-    # - [[0.0, 0.00], [0.0, 0.00], [0.0, 0.00]]   # traffic from E3: inspected at [E1, E2, E3]
-    # - [[0.0,0.0]]
-    # Raw Accuracy Matrix
-    # - [[0.0, 0.00], [0.0, 0.00], [0.0, 0.00]]   # traffic from E1: inspected at [E1, E2, E3]
-    # - [[0.0, 0.00], [0.0, 0.00], [0.0, 0.00]]   # traffic from E2: inspected at [E1, E2, E3]
-    # - [[0.0, 0.00], [0.0, 0.00], [0.0, 0.00]]   # traffic from E3: inspected at [E1, E2, E3]
-    # Validation Select Accuracy Matrix
-    - [[0.215, 0.00], [0.074, 0.00], [0.116, 0.00]]   # traffic from E1: inspected at [E1, E2, E3]
-    - [[0.325, 0.00], [0.031, 0.00], [0.049, 0.00]]   # traffic from E2: inspected at [E1, E2, E3]
-    - [[0.179, 0.00], [0.038, 0.00], [0.043, 0.00]]   # traffic from E3: inspected at [E1, E2, E3]
-    # Global Model Accuracy Matrix
-    # - [[0.184, 0.00], [0.075, 0.00], [0.065, 0.00]]   # traffic from E1: inspected at [E1, E2, E3]
-    # - [[0.184, 0.00], [0.075, 0.00], [0.065, 0.00]]   # traffic from E2: inspected at [E1, E2, E3]
-    # - [[0.184, 0.00], [0.075, 0.00], [0.065, 0.00]]   # traffic from E3: inspected at [E1, E2, E3]
+    - [[0.10, 0.00], [0.45, 0.00], [0.01, 0.00]]   # traffic from E1: inspected at [E1, E2, E3]
+    - [[0.20, 0.00], [0.10, 0.00], [0.01, 0.00]]   # traffic from E2: inspected at [E1, E2, E3]
+    - [[0.20, 0.00], [0.45, 0.00], [0.10, 0.00]]   # traffic from E3: inspected at [E1, E2, E3]
 
   # Propagation delay matrix in ms: row=source edge index, col=target edge index.
   # Order matches edge_areas list: E1=0, E2=1, E3=2. Diagonal must be 0.
@@ -103,16 +108,11 @@ globals:
   # - City-scale (intersection to intersection): 5–20 ms
   # - Metro area / across districts: 20–50 ms
   delay_ms:
-    # - [0.0,  0.0, 0.0]
-    # - [0.0,  0.0, 0.0]
-    # - [0.0, 0.0,  0.0]
-    # - [0.0,  20.0, 30.0]
-    # - [20.0,  0.0, 40.0]
-    # - [30.0, 40.0,  0.0]
-    - [0.0,  20.0, 10.0]
-    - [10.0,  0.0, 20.0]
-    - [10.0, 20.0,  0.0]
-    # - [0.0,0.0]    
+    # Asymmetric: E2 is close (5 ms), E3 is far (30 ms from E1).
+    # delay_workload prefers E2 (lower delay penalty); full overrides to E3 (accuracy wins).
+    - [0.0,   5.0,  30.0]
+    - [5.0,   0.0,  25.0]
+    - [30.0, 25.0,   0.0]
 
   video_pipeline:
     reid_latency: 20 #! Should consider batch processing
