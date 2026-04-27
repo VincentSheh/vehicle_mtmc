@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any
 
+import json
+import re
 import torch
 
 from pathlib import Path
@@ -157,17 +159,30 @@ class Environment:
             p_matrix = p_joint.reshape(n_edges, n_types)
             self._p_attack_type_matrix = p_matrix / p_matrix.sum(axis=1, keepdims=True)
             header = "  ".join(f"type_{j:02d}" for j in range(n_types))
-            print(f"\n[Attack type probabilities per edge (alpha={alpha:.3f}, fixed for this run)]")
-            print(f"{'Edge':<12}  {header}")
-            for i, edge in enumerate(self.edge_areas):
-                row = "  ".join(f"{self._p_attack_type_matrix[i, j]:.4f}" for j in range(n_types))
-                print(f"{str(edge.area_id):<12}  {row}")
+            # print(f"\n[Attack type probabilities per edge (alpha={alpha:.3f}, fixed for this run)]")
+            # print(f"{'Edge':<12}  {header}")
+            # for i, edge in enumerate(self.edge_areas):
+            #     row = "  ".join(f"{self._p_attack_type_matrix[i, j]:.4f}" for j in range(n_types))
+            #     print(f"{str(edge.area_id):<12}  {row}")
 
     def reset(self, seed):
         self.t = 0
         self.last_history = list(self.history)
         self.history.clear()
         self.final_qoe = 0
+
+        # Resample accuracy matrix (clients + run) for this episode
+        acc_mat_data = getattr(self, "_acc_mat_data", None)
+        if acc_mat_data is not None:
+            acc, _clients, _ak, _rk = _load_accuracy_matrix(
+                acc_mat_data,
+                self._acc_mat_alpha,
+                self._acc_mat_model,
+                len(self.edge_areas),
+                np.random.default_rng(seed),
+            )
+            self.acc_by_region = acc
+
         p_matrix = self._p_attack_type_matrix
         for i, edge in enumerate(self.edge_areas):
             p = p_matrix[i] if p_matrix is not None else None
@@ -613,6 +628,102 @@ def _resolve_offload_mode(g: dict) -> str:
     return "balance" if legacy else "none"
 
 
+def _load_accuracy_matrix(
+    data: dict,
+    dirichlet_alpha: float,
+    model_type: str,
+    n_edges: int,
+    rng: np.random.Generator,
+) -> Tuple[np.ndarray, List[int], str, str]:
+    """
+    Sample an acc_by_region matrix from a pre-loaded accuracy_matrix dict.
+
+    Key format in JSON:
+      "lmN->EM"  local model N evaluated on client M's test data  (model_type="lm")
+      "gm->EM"   global model evaluated on client M's test data   (model_type="gm")
+
+    acc_by_region[src_idx, exec_idx] = [FPR, FNR]
+      src_idx  = traffic origin edge   → selects client EN (whose data distribution)
+      exec_idx = IDS executor edge     → selects local model lmN (or gm)
+
+    With model_type="gm" every executor has the same FPR/FNR on a given source's data.
+    With model_type="lm" each executor uses its own personalized model.
+
+    Returns:
+      acc_by_region    : (n_edges, n_edges, 2) float32 [FPR, FNR]
+      selected_clients : 1-based client indices assigned to each edge
+      alpha_key        : matched JSON top-level key
+      run_key          : selected run index string
+    """
+    # Parse alpha values from top-level keys; match closest in log-space
+    alpha_map: Dict[float, str] = {}
+    for key in data:
+        m = re.search(r'alpha([\d.]+)', key)
+        if m:
+            alpha_map[float(m.group(1))] = key
+
+    log_target = np.log(float(dirichlet_alpha))
+    closest_alpha = min(alpha_map, key=lambda a: abs(np.log(a) - log_target))
+    alpha_key = alpha_map[closest_alpha]
+
+    # Random run
+    runs = list(data[alpha_key].keys())
+    run_key = runs[int(rng.integers(len(runs)))]
+
+    metrics  = data[alpha_key][run_key]["hybrid_mse_avg"]["testing"]
+    tpr_data: Dict[str, float] = metrics["tpr"]
+    tnr_data: Dict[str, float] = metrics["tnr"]
+
+    # Discover available client indices from target part of keys (->EN)
+    all_clients: List[int] = sorted({
+        int(m.group(1))
+        for k in tpr_data
+        for m in [re.search(r'->E(\d+)', k)]
+        if m
+    })
+
+    if n_edges > len(all_clients):
+        raise ValueError(
+            f"Requested {n_edges} edges but accuracy matrix only has "
+            f"{len(all_clients)} clients."
+        )
+
+    selected: List[int] = [int(c) for c in rng.choice(all_clients, size=n_edges, replace=False)]
+
+    # Build (n_edges, n_edges, 2) matrix
+    acc = np.zeros((n_edges, n_edges, 2), dtype=np.float32)
+    for src_i, src_c in enumerate(selected):
+        for exec_i, exec_c in enumerate(selected):
+            if model_type == "gm":
+                lookup = f"gm->E{src_c}"
+            else:
+                lookup = f"lm{exec_c}->E{src_c}"
+                if lookup not in tpr_data:      # fall back to gm when lm absent
+                    lookup = f"gm->E{src_c}"
+            tpr = float(tpr_data.get(lookup, 1.0))
+            tnr = float(tnr_data.get(lookup, 1.0))
+            acc[src_i, exec_i, 0] = 1.0 - tnr  # FPR
+            acc[src_i, exec_i, 1] = 1.0 - tpr  # FNR
+
+    client_labels = [f"E{c}" for c in selected]
+    col_w = 10
+    # header = " " * col_w + "".join(f"→{lbl:<{col_w}}" for lbl in client_labels)
+    # print(f"\n[Accuracy Matrix] dirichlet_alpha={dirichlet_alpha} → {alpha_key!r}, run={run_key}")
+    # print(f"  model_type={model_type!r}, selected clients: {client_labels}")
+    # print(f"  FPR [src→exec]:")
+    # print(f"  {header}")
+    # for src_i, lbl in enumerate(client_labels):
+    #     row = "".join(f"{acc[src_i, exec_i, 0]:<{col_w}.4f}" for exec_i in range(n_edges))
+    #     print(f"  {lbl:<{col_w}}{row}")
+    # print(f"  FNR [src→exec]:")
+    # print(f"  {header}")
+    # for src_i, lbl in enumerate(client_labels):
+    #     row = "".join(f"{acc[src_i, exec_i, 1]:<{col_w}.4f}" for exec_i in range(n_edges))
+    #     print(f"  {lbl:<{col_w}}{row}")
+
+    return acc, selected, alpha_key, run_key
+
+
 def build_env_from_cfg(cfg: dict):
     globals_cfg = load_globals(cfg)
 
@@ -720,10 +831,6 @@ def build_env_from_cfg(cfg: dict):
     else:
         delay_ms = np.where(np.eye(n, dtype=bool), 0.0, 2.0).astype(np.float32)
 
-    # Build environment
-    acc_by_region_raw = cfg["globals"].get("accuracy_by_region")
-    acc_by_region = np.array(acc_by_region_raw, dtype=np.float32) if acc_by_region_raw is not None else None
-
     env = Environment(
         edge_areas=edge_areas,
         delay_ms=delay_ms,
@@ -739,8 +846,20 @@ def build_env_from_cfg(cfg: dict):
         float(w.get("w2", 1.0)),
         float(w.get("w3", 0.01)),
     )
-    if acc_by_region is not None:
-        env.acc_by_region = acc_by_region
+
+    # Accuracy matrix: load JSON once; resample clients/run at every reset().
+    acc_mat_cfg = cfg["globals"].get("accuracy_matrix")
+    if acc_mat_cfg is not None:
+        env._acc_mat_data  = json.loads(Path(acc_mat_cfg["path"]).read_text())
+        env._acc_mat_alpha = float(
+            cfg["globals"].get("attack_sampler", {}).get("dirichlet_alpha", 1.0)
+        )
+        env._acc_mat_model = acc_mat_cfg.get("model", "lm")
+    else:
+        acc_by_region_raw = cfg["globals"].get("accuracy_by_region")
+        if acc_by_region_raw is not None:
+            env.acc_by_region = np.array(acc_by_region_raw, dtype=np.float32)
+
     env.reset(cfg["run"]["seed"])
     return env
 

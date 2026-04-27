@@ -27,7 +27,7 @@ from tqdm import tqdm
 
 from environment import build_env_base
 from train_sa_lstm import TorchRLEnvWrapper
-from method_policy import ActContext, BaselinePolicy, make_baseline_policy, OFFLOAD_DISPLAY_NAMES
+from method_policy import ActContext, BaselinePolicy, make_baseline_policy, OFFLOAD_DISPLAY_NAMES, MODEL_DISPLAY_NAMES
 from matplotlib import pyplot as plt
 
 SCALING_QUANTA = [0.5, 1.0, 1.5, 2.0]
@@ -46,6 +46,14 @@ DEFAULT_METHODS = [
     "lstm_rl",
 ]
 
+# (policy_key, offload_mode) pairs run for the proposed method
+PROPOSED_CONFIGS = [
+    ("gm", "delay_workload"),
+    ("lm", "delay_workload"),
+    ("lm", "cto"),
+    ("lm", "cto_acc"),
+]
+
 # Human-readable labels used in plots and summary table
 DISPLAY_NAMES: Dict[str, str] = {
     "no_ids":          "No IDS",
@@ -57,6 +65,8 @@ DISPLAY_NAMES: Dict[str, str] = {
     "offline_optimal": "Offline Optimal (TBSA)",
     "lstm_rl":         "LSTM RL",
     "ma_lstm_rl":      "MA LSTM RL",
+    "gm":              "Global Model",
+    "lm":              "Local Model",
     # legacy / custom names fall through to raw name
 }
 
@@ -628,14 +638,16 @@ def main():
     ap.add_argument("--tbsa_table",        default="tbsa_table_15.npz",
                     help="TBSA lookup-table path (needed when 'tbsa' is in --methods)")
     ap.add_argument("--ckpt",              default="checkpoints/singleedge/rew_32_netting_a4_rew/ckpt_best.pt",
-                    help="Checkpoint path (needed when 'lstm_rl' is in --methods)")
+                    help="Checkpoint path (needed when 'lstm_rl'/'ma_lstm_rl' is in --methods)")
     ap.add_argument("--device",            default="cpu")
     ap.add_argument("--offload_modes",     nargs="+", default=None,
-                    help="Offload modes to compare (e.g. none balance delay_workload full). "
+                    help="Offload modes to compare (ignored when --proposed_method is set; "
+                         "proposed method always runs gm+delay_workload, lm+delay_workload, lm+cto, lm+cto_acc). "
                          "Defaults to the value in the config file.")
     ap.add_argument("--proposed_method",   default=None,
-                    help="Method treated as the proposed approach; uses --offload_modes. "
-                         "All other methods use 'delay_workload'.")
+                    help="Method treated as the proposed approach; expanded to 4 configs varying "
+                         "accuracy_matrix.model (gm/lm) × offload_mode. "
+                         "All other methods use the config default acc model + delay_workload.")
     args = ap.parse_args()
 
     with open(args.cfg) as f:
@@ -663,15 +675,12 @@ def main():
     atk_lvls = ["low", "mid", "high"]
     user_lvls = ["low", "mid", "high"]
 
-    # Resolve offload modes and proposed method.
-    # Proposed method uses the configured offload mode; all other methods use delay_workload.
     cfg_offload_mode = cfg_original["globals"].get("offload_mode", "balance")
+    cfg_acc_model    = cfg_original["globals"].get("accuracy_matrix", {}).get("model", "gm")
     proposed_method: Optional[str] = args.proposed_method
     BASELINE_OFFLOAD = "delay_workload"
 
-    if proposed_method is not None:
-        proposed_offload = args.offload_modes[0] if args.offload_modes else cfg_offload_mode
-    else:
+    if proposed_method is None:
         offload_modes: List[str] = args.offload_modes if args.offload_modes else [cfg_offload_mode]
         multi_offload = len(offload_modes) > 1
 
@@ -707,34 +716,41 @@ def main():
                 print(f"[skip] No valid methods for Attack={atk_lvl}, User={user_lvl}")
                 continue
 
-            # Build (method_name, result_key, offload_mode) triples, then group by offload_mode.
+            # Build (policy_key, result_key, offload_mode, acc_model) 4-tuples.
+            # Proposed method expands to PROPOSED_CONFIGS varying acc_model × offload_mode.
+            # All other methods use the config default acc_model + delay_workload.
             if proposed_method is not None:
-                show_offload = proposed_offload != BASELINE_OFFLOAD
-                runs = [
-                    (mname,
-                     f"{mname}[{proposed_offload}]" if (mname == proposed_method and show_offload) else mname,
-                     proposed_offload if mname == proposed_method else BASELINE_OFFLOAD)
-                    for mname in valid_methods
-                ]
+                runs = []
+                for mname in valid_methods:
+                    if mname == proposed_method:
+                        for acc_model, om in PROPOSED_CONFIGS:
+                            rkey = f"{mname}[{acc_model},{om}]"
+                            runs.append((mname, rkey, om, acc_model))
+                    else:
+                        runs.append((mname, mname, BASELINE_OFFLOAD, cfg_acc_model))
             else:
                 runs = [
                     (mname,
                      f"{mname}[{om}]" if multi_offload else mname,
-                     om)
+                     om,
+                     cfg_acc_model)
                     for om in offload_modes
                     for mname in valid_methods
                 ]
 
-            offload_run_groups: Dict[str, List] = {}
-            for mname, rkey, om in runs:
-                offload_run_groups.setdefault(om, []).append((mname, rkey))
+            # Group by (offload_mode, acc_model) — each unique pair needs its own env.
+            env_groups: Dict[tuple, List] = {}
+            for policy_key, rkey, om, acc_model in runs:
+                env_groups.setdefault((om, acc_model), []).append((policy_key, rkey))
 
             results: Dict[str, Dict[str, np.ndarray]] = {}
             last_ids_cpu: Dict[str, Optional[np.ndarray]] = {}
 
-            for offload_mode, mname_rkey_pairs in offload_run_groups.items():
+            for (offload_mode, acc_model), mname_rkey_pairs in env_groups.items():
                 cfg = copy.deepcopy(cfg_base)
                 cfg["globals"]["offload_mode"] = offload_mode
+                if "accuracy_matrix" in cfg.get("globals", {}):
+                    cfg["globals"]["accuracy_matrix"]["model"] = acc_model
 
                 with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as tmp:
                     yaml.dump(cfg, tmp)
@@ -751,7 +767,7 @@ def main():
                     last_ids_cpu[rkey] = None
 
                 for ep in tqdm(range(args.episodes),
-                               desc=f"episodes ({atk_lvl}/{user_lvl}/offload={offload_mode})"):
+                               desc=f"episodes ({atk_lvl}/{user_lvl}/{acc_model}/{offload_mode})"):
                     ep_seed = base_seed + (ep + 1) * 1000
                     for mname, rkey in mname_rkey_pairs:
                         ep_result, final_ids = run_episode(
@@ -783,10 +799,17 @@ def main():
 
             def _display_label(rkey: str) -> str:
                 if "[" in rkey:
-                    mname, om = rkey.rsplit("[", 1)
-                    om = om.rstrip("]")
-                    base = DISPLAY_NAMES.get(mname, mname)
-                    ol   = OFFLOAD_DISPLAY_NAMES.get(om, om)
+                    inner = rkey[rkey.index("[")+1:].rstrip("]")
+                    if "," in inner:
+                        # proposed-method format: mname[model_key,om]
+                        model_key, om = inner.split(",", 1)
+                        base = MODEL_DISPLAY_NAMES.get(model_key, model_key)
+                        ol   = OFFLOAD_DISPLAY_NAMES.get(om, om)
+                        return f"{base} ({ol})"
+                    # legacy format: mname[om]
+                    mname = rkey[:rkey.index("[")]
+                    base  = DISPLAY_NAMES.get(mname, mname)
+                    ol    = OFFLOAD_DISPLAY_NAMES.get(inner, inner)
                     return f"{base} ({ol})"
                 return DISPLAY_NAMES.get(rkey, rkey)
 

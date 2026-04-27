@@ -88,19 +88,18 @@ globals:
     w2: 1.0   # FPR accuracy improvement
     w3: 0.010  # propagation delay penalty (ms⁻¹); non-zero so delay_workload has a routing criterion
 
-  # Accuracy-by-region matrix: [src_edge_idx][exec_edge_idx] = [FPR, FNR]
-  # Row = traffic source edge, Col = inspecting/executing edge.
-  # Diagonal = local inspection (own model on own traffic).
-  # Designed so delay_workload and full route to different edges:
-  #   E2: close (5 ms) but high FPR (0.45) for non-local traffic  — delay_workload prefers it
-  #   E3: far  (30 ms) but low  FPR (0.01) for non-local traffic  — full prefers it
-  # Routing criterion for E1 traffic (w3=0.010, w2=1.0):
-  #   delay_workload: score(→E2) = -0.05  >  score(→E3) = -0.30   →  routes to E2  (bad FPR)
-  #   full:           raw(→E2)  = -0.40  <   raw(→E3)  = -0.21   →  routes to E3  (good FPR)
-  accuracy_by_region:
-    - [[0.10, 0.00], [0.45, 0.00], [0.01, 0.00]]   # traffic from E1: inspected at [E1, E2, E3]
-    - [[0.20, 0.00], [0.10, 0.00], [0.01, 0.00]]   # traffic from E2: inspected at [E1, E2, E3]
-    - [[0.20, 0.00], [0.45, 0.00], [0.10, 0.00]]   # traffic from E3: inspected at [E1, E2, E3]
+  # Accuracy matrix loaded from federated learning evaluation results.
+  # Clients and run are resampled at every episode reset using attack_sampler.dirichlet_alpha.
+  # model: "lm" = personalized local models (cross-edge accuracy varies per executor)
+  #        "gm" = global model (all executors share the same FPR/FNR on a given source)
+  accuracy_matrix:
+    path: configs/accuracy_matrix.json
+    model: gm
+
+  # accuracy_by_region (static fallback, used when accuracy_matrix is absent):
+  #   - [[0.10, 0.00], [0.45, 0.00], [0.01, 0.00]]
+  #   - [[0.20, 0.00], [0.10, 0.00], [0.01, 0.00]]
+  #   - [[0.20, 0.00], [0.45, 0.00], [0.10, 0.00]]
 
   # Propagation delay matrix in ms: row=source edge index, col=target edge index.
   # Order matches edge_areas list: E1=0, E2=1, E3=2. Diagonal must be 0.

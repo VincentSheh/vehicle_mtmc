@@ -29,6 +29,12 @@ OFFLOAD_DISPLAY_NAMES: Dict[str, str] = {
     "cto_acc":        "CTO+Acc",
 }
 
+# Human-readable labels for model types (gm = global model, lm = local model)
+MODEL_DISPLAY_NAMES: Dict[str, str] = {
+    "gm": "Global Model",
+    "lm": "Local Model",
+}
+
 
 # ---------------------------------------------------------------------------
 # Context object passed to each policy's act() call
@@ -716,7 +722,7 @@ def make_baseline_policy(
             raise ValueError("ckpt_path must be provided for 'lstm_rl' policy")
         if obs_keys is None:
             raise ValueError("obs_keys must be provided for 'lstm_rl' policy")
-        return LSTMRLPolicy(ckpt_path=ckpt_path, obs_keys=obs_keys, device=device, greedy=False)
+        return LSTMRLPolicy(ckpt_path=ckpt_path, obs_keys=obs_keys, device=device, greedy=True)
     elif name == "ma_lstm_rl":
         if ckpt_path is None:
             raise ValueError("ckpt_path must be provided for 'ma_lstm_rl' policy")
