@@ -83,12 +83,13 @@ def _extract_mean(arrays: Dict[str, np.ndarray], key: str, transform=None) -> fl
 
 
 def _arrays_to_means(arrays: Dict[str, np.ndarray]) -> Dict[str, float]:
-    # Custom handling for attack drop to exclude non-attack periods
-    lres = arrays.get("reward_lambda_res", np.array([], dtype=np.float32))
-    atk_in = arrays.get("attack_in_rate", np.array([], dtype=np.float32))
-    if lres.size > 0 and atk_in.size == lres.size:
-        mask = atk_in > 1e-6
-        atk_drop_val = 1.0 - float(np.mean(lres[mask])) if mask.any() else 0.0
+    atk_in  = arrays.get("attack_in_rate",   np.array([], dtype=np.float32))
+    atk_drp = arrays.get("attack_drop_rate", np.array([], dtype=np.float32))
+    if atk_in.size > 0 and atk_drp.size == atk_in.size:
+        atk_pass = np.maximum(0.0, atk_in - atk_drp)
+        lres = np.divide(atk_pass, atk_in, out=np.zeros_like(atk_pass), where=atk_in > 1e-6)
+        attack_mask = atk_in > 1e-6
+        atk_drop_val = 1.0 - float(np.mean(lres[attack_mask])) if attack_mask.any() else 0.0
     else:
         atk_drop_val = np.nan
 
@@ -182,6 +183,7 @@ def _make_dummy_data(method_labels: list[str]) -> dict:
                     "reward_benign_col_dmg": np.clip(rng.normal(base_bcd,        0.02, n), 0, None).astype(np.float32),
                     "reward_lambda_res":     np.clip(rng.normal(1.0 - base_drop, 0.04, n), 0, 1   ).astype(np.float32),
                     "attack_in_rate":        np.ones(n, dtype=np.float32),
+                    "attack_drop_rate":      np.clip(rng.normal(base_drop,        0.04, n), 0, 1   ).astype(np.float32),
                     "reallocations":         np.array([rng.uniform(2, 10) for _ in range(5)], dtype=np.float32),
                 }
     return data
@@ -191,9 +193,9 @@ def _make_dummy_data(method_labels: list[str]) -> dict:
 # Real evaluation
 # ---------------------------------------------------------------------------
 
-def _make_display_label(mname: str, offload_mode: str, multi_offload: bool) -> str:
+def _make_display_label(mname: str, offload_mode: str, show_offload: bool) -> str:
     base = DISPLAY_NAMES.get(mname, mname)
-    if multi_offload:
+    if show_offload:
         ol = OFFLOAD_DISPLAY_NAMES.get(offload_mode, offload_mode)
         return f"{base} ({ol})"
     return base
@@ -212,10 +214,40 @@ def collect_data(args) -> dict:
     np.random.seed(base_seed)
 
     methods: list[str] = args.methods if args.methods else list(DEFAULT_METHODS)
+    proposed_method: Optional[str] = getattr(args, "proposed_method", None)
 
     cfg_offload_mode = cfg_original["globals"].get("offload_mode", "balance")
-    offload_modes: list[str] = args.offload_modes if args.offload_modes else [cfg_offload_mode]
-    multi_offload = len(offload_modes) > 1
+    BASELINE_OFFLOAD = "delay_workload"
+
+    # Build (offload_mode, method_name, display_label) triples.
+    # Proposed method uses the configured offload mode; all others use delay_workload.
+    if proposed_method is not None:
+        proposed_offload = args.offload_modes[0] if args.offload_modes else cfg_offload_mode
+        runs = [
+            (
+                proposed_offload if m == proposed_method else BASELINE_OFFLOAD,
+                m,
+                _make_display_label(
+                    m,
+                    proposed_offload if m == proposed_method else BASELINE_OFFLOAD,
+                    m == proposed_method and proposed_offload != BASELINE_OFFLOAD,
+                ),
+            )
+            for m in methods
+        ]
+    else:
+        offload_modes: list[str] = args.offload_modes if args.offload_modes else [cfg_offload_mode]
+        multi_offload = len(offload_modes) > 1
+        runs = [
+            (om, m, _make_display_label(m, om, multi_offload))
+            for om in offload_modes
+            for m in methods
+        ]
+
+    # Group runs by offload_mode so each env is created once per mode.
+    offload_groups: dict = {}
+    for om, mname, label in runs:
+        offload_groups.setdefault(om, []).append((mname, label))
 
     # Derive obs/reward params once from the original config
     with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as tmp_orig:
@@ -235,9 +267,10 @@ def collect_data(args) -> dict:
         if os.path.exists(tmp_orig_path):
             os.remove(tmp_orig_path)
 
-    # Build policies once (they are env-independent)
+    # Build policies once (env-independent)
+    all_method_names = list(dict.fromkeys(mname for _, mname, _ in runs))
     policies: dict = {}
-    for mname in methods:
+    for mname in all_method_names:
         tbsa_path = str(args.tbsa_table) if mname in ("tbsa", "offline_optimal") else None
         ckpt      = args.ckpt            if mname in ("lstm_rl", "ma_lstm_rl") else None
         ok_keys   = obs_keys             if mname == "lstm_rl" else None
@@ -252,7 +285,10 @@ def collect_data(args) -> dict:
         except (ValueError, FileNotFoundError) as exc:
             print(f"[warn] Skipping '{mname}': {exc}")
 
-    valid_methods = [m for m in methods if m in policies]
+    runs = [(om, mname, label) for om, mname, label in runs if mname in policies]
+    offload_groups = {}
+    for om, mname, label in runs:
+        offload_groups.setdefault(om, []).append((mname, label))
 
     data: dict = {}
     for atk_lvl in LEVELS:
@@ -262,14 +298,15 @@ def collect_data(args) -> dict:
             print(f" Evaluating: atk={atk_lvl}  user={user_lvl}")
             print("="*70)
 
-            if not valid_methods:
-                print(f"[warn] No valid methods, skipping.")
+            if not runs:
+                print("[warn] No valid methods, skipping.")
                 data[atk_lvl][user_lvl] = {}
                 continue
 
             cell: dict = {}
+            last_ids_cpu: Dict[str, Optional[np.ndarray]] = {label: None for _, _, label in runs}
 
-            for offload_mode in offload_modes:
+            for offload_mode, method_label_pairs in offload_groups.items():
                 cfg = copy.deepcopy(cfg_original)
                 cfg["globals"]["attack_sampler"]["level"] = atk_lvl
                 cfg["globals"]["user_sampler"]["synthetic"]["level"] = user_lvl
@@ -281,14 +318,12 @@ def collect_data(args) -> dict:
 
                 try:
                     env = build_env_base(tmp_path)
-
-                    accumulated: Dict[str, Dict[str, np.ndarray]] = {m: {} for m in valid_methods}
-                    last_ids_cpu: Dict[str, Optional[np.ndarray]] = {m: None for m in valid_methods}
+                    accumulated: Dict[str, Dict[str, np.ndarray]] = {label: {} for _, label in method_label_pairs}
 
                     for ep in tqdm(range(args.episodes),
                                    desc=f"episodes (offload={offload_mode})"):
                         ep_seed = base_seed + (ep + 1) * 1000
-                        for mname in valid_methods:
+                        for mname, label in method_label_pairs:
                             ep_result, final_ids = run_episode(
                                 env=env,
                                 cfg=cfg,
@@ -303,9 +338,9 @@ def collect_data(args) -> dict:
                                 reward_beta=reward_beta,
                                 reward_gamma=reward_gamma,
                                 reward_q_th=reward_q_th,
-                                initial_ids_cpu=last_ids_cpu[mname],
+                                initial_ids_cpu=last_ids_cpu[label],
                             )
-                            last_ids_cpu[mname] = final_ids
+                            last_ids_cpu[label] = final_ids
 
                             ep_ratios = ep_result["cpu_to_ids_ratio"]
                             realloc_count = 0
@@ -314,14 +349,13 @@ def collect_data(args) -> dict:
                             ep_result["reallocations"] = np.array([realloc_count], dtype=np.float32)
 
                             for k, v in ep_result.items():
-                                if k not in accumulated[mname]:
-                                    accumulated[mname][k] = v
+                                if k not in accumulated[label]:
+                                    accumulated[label][k] = v
                                 else:
-                                    accumulated[mname][k] = np.concatenate([accumulated[mname][k], v], axis=0)
+                                    accumulated[label][k] = np.concatenate([accumulated[label][k], v], axis=0)
 
-                    for mname in valid_methods:
-                        label = _make_display_label(mname, offload_mode, multi_offload)
-                        cell[label] = accumulated[mname]
+                    for _, label in method_label_pairs:
+                        cell[label] = accumulated[label]
 
                 finally:
                     if os.path.exists(tmp_path):
@@ -453,18 +487,34 @@ def main():
     ap.add_argument("--offload_modes",     nargs="+", default=None,
                     help="Offload modes to compare (e.g. none balance delay_workload full). "
                          "Defaults to the value in the config file.")
+    ap.add_argument("--proposed_method",   default=None,
+                    help="Method treated as the proposed approach; uses --offload_modes. "
+                         "All other methods use 'delay_workload'.")
     args = ap.parse_args()
 
     outdir  = Path(args.outdir)
     csv_path = outdir / "scenario_grid.csv"
 
+    BASELINE_OFFLOAD = "delay_workload"
+
     def _build_methods_display(raw_methods: list[str], offload_modes: list[str]) -> list[str]:
+        proposed = args.proposed_method
+        if proposed is not None:
+            proposed_offload = offload_modes[0] if offload_modes else "balance"
+            return [
+                _make_display_label(
+                    m,
+                    proposed_offload if m == proposed else BASELINE_OFFLOAD,
+                    m == proposed and proposed_offload != BASELINE_OFFLOAD,
+                )
+                for m in raw_methods
+            ]
         multi_offload = len(offload_modes) > 1
-        labels = []
-        for om in offload_modes:
-            for m in raw_methods:
-                labels.append(_make_display_label(m, om, multi_offload))
-        return labels
+        return [
+            _make_display_label(m, om, multi_offload)
+            for om in offload_modes
+            for m in raw_methods
+        ]
 
     if args.dummy:
         print("[dummy mode] Generating synthetic data for layout preview...")

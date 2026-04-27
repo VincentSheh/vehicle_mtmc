@@ -633,6 +633,9 @@ def main():
     ap.add_argument("--offload_modes",     nargs="+", default=None,
                     help="Offload modes to compare (e.g. none balance delay_workload full). "
                          "Defaults to the value in the config file.")
+    ap.add_argument("--proposed_method",   default=None,
+                    help="Method treated as the proposed approach; uses --offload_modes. "
+                         "All other methods use 'delay_workload'.")
     args = ap.parse_args()
 
     with open(args.cfg) as f:
@@ -660,10 +663,17 @@ def main():
     atk_lvls = ["low", "mid", "high"]
     user_lvls = ["low", "mid", "high"]
 
-    # Resolve offload modes: explicit list or fall back to config value
+    # Resolve offload modes and proposed method.
+    # Proposed method uses the configured offload mode; all other methods use delay_workload.
     cfg_offload_mode = cfg_original["globals"].get("offload_mode", "balance")
-    offload_modes: List[str] = args.offload_modes if args.offload_modes else [cfg_offload_mode]
-    multi_offload = len(offload_modes) > 1
+    proposed_method: Optional[str] = args.proposed_method
+    BASELINE_OFFLOAD = "delay_workload"
+
+    if proposed_method is not None:
+        proposed_offload = args.offload_modes[0] if args.offload_modes else cfg_offload_mode
+    else:
+        offload_modes: List[str] = args.offload_modes if args.offload_modes else [cfg_offload_mode]
+        multi_offload = len(offload_modes) > 1
 
     for atk_lvl in atk_lvls:
         for user_lvl in user_lvls:
@@ -697,12 +707,32 @@ def main():
                 print(f"[skip] No valid methods for Attack={atk_lvl}, User={user_lvl}")
                 continue
 
-            # results keyed by "{method}[{offload_mode}]" when comparing multiple modes,
-            # or just "{method}" when a single mode is evaluated.
+            # Build (method_name, result_key, offload_mode) triples, then group by offload_mode.
+            if proposed_method is not None:
+                show_offload = proposed_offload != BASELINE_OFFLOAD
+                runs = [
+                    (mname,
+                     f"{mname}[{proposed_offload}]" if (mname == proposed_method and show_offload) else mname,
+                     proposed_offload if mname == proposed_method else BASELINE_OFFLOAD)
+                    for mname in valid_methods
+                ]
+            else:
+                runs = [
+                    (mname,
+                     f"{mname}[{om}]" if multi_offload else mname,
+                     om)
+                    for om in offload_modes
+                    for mname in valid_methods
+                ]
+
+            offload_run_groups: Dict[str, List] = {}
+            for mname, rkey, om in runs:
+                offload_run_groups.setdefault(om, []).append((mname, rkey))
+
             results: Dict[str, Dict[str, np.ndarray]] = {}
             last_ids_cpu: Dict[str, Optional[np.ndarray]] = {}
 
-            for offload_mode in offload_modes:
+            for offload_mode, mname_rkey_pairs in offload_run_groups.items():
                 cfg = copy.deepcopy(cfg_base)
                 cfg["globals"]["offload_mode"] = offload_mode
 
@@ -716,16 +746,14 @@ def main():
                     if os.path.exists(tmp_cfg_path):
                         os.remove(tmp_cfg_path)
 
-                for mname in valid_methods:
-                    rkey = f"{mname}[{offload_mode}]" if multi_offload else mname
+                for mname, rkey in mname_rkey_pairs:
                     results[rkey] = {}
                     last_ids_cpu[rkey] = None
 
                 for ep in tqdm(range(args.episodes),
                                desc=f"episodes ({atk_lvl}/{user_lvl}/offload={offload_mode})"):
                     ep_seed = base_seed + (ep + 1) * 1000
-                    for mname in valid_methods:
-                        rkey = f"{mname}[{offload_mode}]" if multi_offload else mname
+                    for mname, rkey in mname_rkey_pairs:
                         ep_result, final_ids = run_episode(
                             env=env,
                             cfg=cfg,
@@ -754,7 +782,7 @@ def main():
             lvl_outdir.mkdir(parents=True, exist_ok=True)
 
             def _display_label(rkey: str) -> str:
-                if multi_offload and "[" in rkey:
+                if "[" in rkey:
                     mname, om = rkey.rsplit("[", 1)
                     om = om.rstrip("]")
                     base = DISPLAY_NAMES.get(mname, mname)
