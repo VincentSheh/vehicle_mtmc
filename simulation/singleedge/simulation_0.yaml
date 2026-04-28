@@ -19,13 +19,14 @@ globals:
   
   attack_sampler:
     n_types: 10
-    active_len_factor: 0.5
+    active_len_factor: 0.25 
+    # pattern_types: ["sinus", "pw", "expo", "yoyo"]
     pattern_types: ["sinus", "pw", "expo" ] #, "yoyo"]
     # pattern_types: ["pw"]
     # pattern_types: ["yoyo"]
     level: "default"
     lambda_level:
-      default: [7000, 18000]
+      default: [10000, 18000]
       low: [5000, 10000]
       mid: [12000, 16000]
       high: [18000, 24000]
@@ -53,7 +54,7 @@ globals:
     alpha_inv: 5.0   # QoE shortfall normalizer        (alpha = 1/alpha_inv = 10)      || 0.10
     beta_inv:  9.0   # Attack residual normalizer       (beta  = 1/beta_inv  =  5)     || 0.20
     gamma_inv: 8.0   # Benign collateral normalizer     (gamma = 1/gamma_inv ≈  8.33)  || 0.12
-    q_th:      0.35   # QoE shortfall threshold
+    q_th:      0.2   # QoE shortfall threshold
 
   video_pipeline:
     reid_latency: 20 #! Should consider batch processing

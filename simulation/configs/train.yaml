@@ -18,7 +18,7 @@ logger:
   backend: wandb
   entity: asture123-national-taiwan-university
   project_name: multiedgeids
-  exp_name: gemini_fix2_act9
+  exp_name: ma_lstm_old
   plots:
     enabled: true
     out_dir: logs/wandb_plots

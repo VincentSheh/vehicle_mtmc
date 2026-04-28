@@ -120,18 +120,21 @@ class EdgeArea:
         unique attack type.
         """
 
-        # self.ids_cpu = 0.5
-        # self.va_cpu = self.budget.cpu - self.ids_cpu
+        self.ids_cpu = 0.5
+        self.va_cpu = self.budget.cpu - self.ids_cpu
         if seed is not None:
             self.rng = np.random.default_rng(seed)
         elif not hasattr(self, "rng"):
             self.rng = np.random.default_rng()
 
+        # 2) Reset users (independent seeds)
         for i, user in enumerate(self.users):
             user_seed = int(self.rng.integers(0, 2**32))
             user.reset(seed=user_seed)
 
+        # 3) Sample a new attack type from the library for this episode
         if self.attack_type_library is not None:
+            self.attack_type_library._sample_all(self.rng)
             n = self.attack_type_library.n_types
             if p_attack_type is None:
                 concentration = np.ones(n) * self.dirichlet_alpha
@@ -388,7 +391,7 @@ class EdgeArea:
 
         # Consistency fix: pass the number of requests that survived IDS (benign_req_in)
         # to ensure that drops at uplink or compute stages result in zero quality for those requests.
-        qoe, _ = self.match_detectors_to_resolutions(upload_plan, od_plan, total_N=benign_req_in)
+        qoe, _ = self.match_detectors_to_resolutions(upload_plan, od_plan)
 
         va_cpu_utilization = min(1.0, (used_cycles + attack_cycles_per_ms + self.ids_cpu * self.cpu_cycle_per_ms) / max(total_cycles_per_ms, 1e-9))
         served_compute = int(sum(od_plan.values()))

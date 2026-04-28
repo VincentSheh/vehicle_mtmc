@@ -26,7 +26,7 @@ import yaml
 from tqdm import tqdm
 
 from environment import build_env_base
-from train_sa_lstm import TorchRLEnvWrapper
+from environment import TorchRLEnvWrapper
 from method_policy import ActContext, BaselinePolicy, make_baseline_policy, OFFLOAD_DISPLAY_NAMES
 from matplotlib import pyplot as plt
 
