@@ -1151,8 +1151,14 @@ def train(
         norm_t = env.transform[2]
         for k in ["cpu_to_ids_ratio", "ema_mom"]:
             idx = obs_keys.index(k)
-            loc   = norm_t.loc.view(n_edges, obs_dim)[:, idx].to(obs_log.device)
-            scale = norm_t.scale.view(n_edges, obs_dim)[:, idx].to(obs_log.device)
+            # If loc is [n_edges, obs_dim], we take [:, idx] to get [n_edges]
+            # If loc is [obs_dim], we take [idx] to get a scalar (broadcasts across n_edges)
+            if norm_t.loc.numel() == n_edges * obs_dim:
+                loc   = norm_t.loc.view(n_edges, obs_dim)[:, idx].to(obs_log.device)
+                scale = norm_t.scale.view(n_edges, obs_dim)[:, idx].to(obs_log.device)
+            else:
+                loc   = norm_t.loc[idx].to(obs_log.device)
+                scale = norm_t.scale[idx].to(obs_log.device)
             obs_log[..., idx] = obs[..., idx] * scale + loc
 
         global_decision_step = wandb_log_obs_steps(

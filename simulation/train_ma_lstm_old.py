@@ -34,6 +34,8 @@ from logger import wandb_init, wandb_log_obs_steps
 import wandb
 import argparse
 
+N_TEMPORAL = 2  # local_num_req, attack_in_rate fed through LSTM; rest bypass as static
+
 # =========================================================
 # Utils
 # =========================================================
@@ -605,26 +607,28 @@ class AgentRecurrentCore(nn.Module):
     in_keys = [("agents", "observation", "obs"), "is_init", ("agents", "recurrent_state_h"), ("agents", "recurrent_state_c")]
     out_keys = [("agents", "features"), ("agents", "recurrent_state_h_out"), ("agents", "recurrent_state_c_out")]
 
-    def __init__(self, n_edges: int, obs_dim: int, hidden_dim: int, device: str):
+    def __init__(self, n_edges: int, n_temporal: int, n_static: int, hidden_dim: int, device: str):
         super().__init__()
-        self.n_edges, self.obs_dim, self.hidden_dim = n_edges, obs_dim, hidden_dim
-        self.feature = FeatureNet(obs_dim, hidden_dim).to(device)
+        self.n_edges, self.n_temporal, self.n_static, self.hidden_dim = n_edges, n_temporal, n_static, hidden_dim
+        self.feature = FeatureNet(n_temporal, hidden_dim).to(device)
         self.lstm = nn.LSTMCell(hidden_dim, hidden_dim).to(device)
-        # Prevents BPTT gradients from compounding and exploding the memory gates
         for name, param in self.lstm.named_parameters():
             if "weight" in name:
                 nn.init.orthogonal_(param.data)
             elif "bias" in name:
-                param.data.fill_(0.0)        
+                param.data.fill_(0.0)
 
     def forward(self, td: TensorDictBase) -> TensorDictBase:
         obs = td.get(("agents", "observation", "obs"))
         is_init = td.get("is_init", None)
         step_mode = obs.ndim == 3
         if step_mode: obs = obs.unsqueeze(1)
-        
+
         b, t, e, d = obs.shape
         hdim = self.hidden_dim
+
+        temporal = obs[..., :self.n_temporal]   # [b, t, e, n_temporal]
+        static   = obs[..., self.n_temporal:]   # [b, t, e, n_static]
 
         if is_init is None:
             mask = torch.ones((b * e, t, 1), device=obs.device)
@@ -633,8 +637,8 @@ class AgentRecurrentCore(nn.Module):
             if is_init.shape[1] == 1 and t > 1: is_init = is_init.expand(b, t)
             mask = (~is_init).float().view(b, 1, t, 1).expand(b, e, t, 1).reshape(b * e, t, 1)
 
-        obs_be = obs.transpose(1, 2).contiguous().reshape(b * e, t, d)
-        feats_be = self.feature(obs_be)
+        temporal_be = temporal.transpose(1, 2).contiguous().reshape(b * e, t, self.n_temporal)
+        feats_be = self.feature(temporal_be)
 
         h = td.get(("agents", "recurrent_state_h"))
         c = td.get(("agents", "recurrent_state_c"))
@@ -649,10 +653,11 @@ class AgentRecurrentCore(nn.Module):
             out_h.append(h_curr)
             out_c.append(c_curr)
 
-        # Reconstruct exactly matching dimensions: [B, T, E, H]
-        feats = torch.stack(out_h, dim=1).view(b, e, t, hdim).transpose(1, 2).contiguous()
-        all_h = torch.stack(out_h, dim=1).view(b, e, t, hdim).transpose(1, 2).unsqueeze(-2).contiguous()
-        all_c = torch.stack(out_c, dim=1).view(b, e, t, hdim).transpose(1, 2).unsqueeze(-2).contiguous()
+        lstm_out = torch.stack(out_h, dim=1).view(b, e, t, hdim).transpose(1, 2).contiguous()  # [b, t, e, hdim]
+        all_h    = torch.stack(out_h, dim=1).view(b, e, t, hdim).transpose(1, 2).unsqueeze(-2).contiguous()
+        all_c    = torch.stack(out_c, dim=1).view(b, e, t, hdim).transpose(1, 2).unsqueeze(-2).contiguous()
+
+        feats = torch.cat([lstm_out, static], dim=-1)  # [b, t, e, hdim + n_static]
 
         if step_mode:
             td.set(("agents", "features"), feats[:, 0])
@@ -669,26 +674,28 @@ class CriticRecurrentCore(nn.Module):
     in_keys = [("agents", "observation", "obs"), "is_init", ("agents", "recurrent_state_h_v"), ("agents", "recurrent_state_c_v")]
     out_keys = [("agents", "vf_features"), ("agents", "recurrent_state_h_v_out"), ("agents", "recurrent_state_c_v_out")]
 
-    def __init__(self, n_edges: int, obs_dim: int, hidden_dim: int, device: str):
+    def __init__(self, n_edges: int, n_temporal: int, n_static: int, hidden_dim: int, device: str):
         super().__init__()
-        self.n_edges, self.obs_dim, self.hidden_dim = n_edges, obs_dim, hidden_dim
-        self.feature = FeatureNet(obs_dim, hidden_dim).to(device)
+        self.n_edges, self.n_temporal, self.n_static, self.hidden_dim = n_edges, n_temporal, n_static, hidden_dim
+        self.feature = FeatureNet(n_temporal, hidden_dim).to(device)
         self.lstm = nn.LSTMCell(hidden_dim, hidden_dim).to(device)
-        # Prevents BPTT gradients from compounding and exploding the memory gates
         for name, param in self.lstm.named_parameters():
             if "weight" in name:
                 nn.init.orthogonal_(param.data)
             elif "bias" in name:
                 param.data.fill_(0.0)
-                
+
     def forward(self, td: TensorDictBase) -> TensorDictBase:
         obs = td.get(("agents", "observation", "obs"))
         is_init = td.get("is_init", None)
         step_mode = obs.ndim == 3
         if step_mode: obs = obs.unsqueeze(1)
-        
+
         b, t, e, d = obs.shape
         hdim = self.hidden_dim
+
+        temporal = obs[..., :self.n_temporal]   # [b, t, e, n_temporal]
+        static   = obs[..., self.n_temporal:]   # [b, t, e, n_static]
 
         if is_init is None:
             mask = torch.ones((b * e, t, 1), device=obs.device)
@@ -697,8 +704,8 @@ class CriticRecurrentCore(nn.Module):
             if is_init.shape[1] == 1 and t > 1: is_init = is_init.expand(b, t)
             mask = (~is_init).float().view(b, 1, t, 1).expand(b, e, t, 1).reshape(b * e, t, 1)
 
-        obs_be = obs.transpose(1, 2).contiguous().reshape(b * e, t, d)
-        feats_be = self.feature(obs_be)
+        temporal_be = temporal.transpose(1, 2).contiguous().reshape(b * e, t, self.n_temporal)
+        feats_be = self.feature(temporal_be)
 
         h = td.get(("agents", "recurrent_state_h_v"))
         c = td.get(("agents", "recurrent_state_c_v"))
@@ -713,10 +720,11 @@ class CriticRecurrentCore(nn.Module):
             out_v_h.append(h_curr)
             out_v_c.append(c_curr)
 
-        # Reconstruct exactly matching dimensions: [B, T, E, H]
-        feats = torch.stack(out_v_h, dim=1).view(b, e, t, hdim).transpose(1, 2).contiguous()
-        all_h = torch.stack(out_v_h, dim=1).view(b, e, t, hdim).transpose(1, 2).unsqueeze(-2).contiguous()
-        all_c = torch.stack(out_v_c, dim=1).view(b, e, t, hdim).transpose(1, 2).unsqueeze(-2).contiguous()
+        lstm_out = torch.stack(out_v_h, dim=1).view(b, e, t, hdim).transpose(1, 2).contiguous()  # [b, t, e, hdim]
+        all_h    = torch.stack(out_v_h, dim=1).view(b, e, t, hdim).transpose(1, 2).unsqueeze(-2).contiguous()
+        all_c    = torch.stack(out_v_c, dim=1).view(b, e, t, hdim).transpose(1, 2).unsqueeze(-2).contiguous()
+
+        feats = torch.cat([lstm_out, static], dim=-1)  # [b, t, e, hdim + n_static]
 
         if step_mode:
             td.set(("agents", "vf_features"), feats[:, 0])
@@ -890,8 +898,11 @@ def train(
     obs_keys = _tmp_env.obs_keys
     raw_obs_dim = len(obs_keys)  # without agent-ID appended by AddAgentID
 
-    actor_core = AgentRecurrentCore(n_edges=n_edges, obs_dim=obs_dim, hidden_dim=hidden_dim, device=device)
-    actor_head = TensorDictModule(nn.Linear(hidden_dim, int(train_cfg["model"]["n_actions"])).to(device), in_keys=[("agents", "features")], out_keys=[("agents", "logits")])
+    n_temporal = N_TEMPORAL
+    n_static = obs_dim - n_temporal  # remaining dims including agent-ID one-hot
+
+    actor_core = AgentRecurrentCore(n_edges=n_edges, n_temporal=n_temporal, n_static=n_static, hidden_dim=hidden_dim, device=device)
+    actor_head = TensorDictModule(nn.Linear(hidden_dim + n_static, int(train_cfg["model"]["n_actions"])).to(device), in_keys=[("agents", "features")], out_keys=[("agents", "logits")])
     policy = ProbabilisticActor(
         module=TensorDictSequential(actor_core, actor_head),
         in_keys=[("agents", "logits")],
@@ -902,8 +913,8 @@ def train(
         default_interaction_type=InteractionType.RANDOM,
     )
 
-    critic_core = CriticRecurrentCore(n_edges=n_edges, obs_dim=obs_dim, hidden_dim=hidden_dim * 2, device=device)
-    critic_head = TensorDictModule(nn.Linear(hidden_dim * 2, 1).to(device), in_keys=[("agents", "vf_features")], out_keys=[("agents", "state_value")])
+    critic_core = CriticRecurrentCore(n_edges=n_edges, n_temporal=n_temporal, n_static=n_static, hidden_dim=hidden_dim * 2, device=device)
+    critic_head = TensorDictModule(nn.Linear(hidden_dim * 2 + n_static, 1).to(device), in_keys=[("agents", "vf_features")], out_keys=[("agents", "state_value")])
     value_net = TensorDictSequential(critic_core, critic_head)
     collector_policy = TensorDictSequential(policy, value_net)
 
@@ -1076,8 +1087,14 @@ def train(
             if k not in obs_keys:
                 continue
             idx = obs_keys.index(k)
-            loc   = norm_t.loc.view(n_edges, raw_obs_dim)[:, idx].to(obs_log.device)
-            scale = norm_t.scale.view(n_edges, raw_obs_dim)[:, idx].to(obs_log.device)
+            # If loc is [n_edges, raw_obs_dim], we take [:, idx] to get [n_edges]
+            # If loc is [raw_obs_dim], we take [idx] to get a scalar (broadcasts across n_edges)
+            if norm_t.loc.numel() == n_edges * raw_obs_dim:
+                loc   = norm_t.loc.view(n_edges, raw_obs_dim)[:, idx].to(obs_log.device)
+                scale = norm_t.scale.view(n_edges, raw_obs_dim)[:, idx].to(obs_log.device)
+            else:
+                loc   = norm_t.loc[idx].to(obs_log.device)
+                scale = norm_t.scale[idx].to(obs_log.device)
             obs_log[..., idx] = obs[..., idx] * scale + loc
         global_decision_step = wandb_log_obs_steps(
             obs_log, obs_keys, keep_keys={"cpu_to_ids_ratio", "ema_mom"},

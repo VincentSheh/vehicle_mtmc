@@ -18,7 +18,7 @@ logger:
   backend: wandb
   entity: asture123-national-taiwan-university
   project_name: multiedgeids
-  exp_name: ma_lstm_old
+  exp_name: ma_legacy_act3
   plots:
     enabled: true
     out_dir: logs/wandb_plots
@@ -56,7 +56,7 @@ loss:
 model:
   num_layers: 2
   hidden_dim: 64          # ActorNet / CriticNet hidden size
-  n_actions: 9             # discrete {scale down, hold, scale up}
+  n_actions: 3             # discrete {scale down, hold, scale up}
 
 
 # =========================

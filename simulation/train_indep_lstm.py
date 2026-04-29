@@ -69,24 +69,16 @@ class IndepTorchRLEnvWrapper(EnvBase):
             "ema_mom",
             "cpu_to_ids_ratio",
             "ids_cpu_utilization",
-        ]
-        
-        if self.n_edges > 1:
-            # Add multi-edge/neighbor awareness if more than 1 edge exists
-            self.obs_keys += [
-                "neighbor_ids_util",
-                "neighbor_delta",
-                "neighbor_atk_rate",
-                "prev_slo_vio",
-            ]
-
-        self.obs_keys += [
+            "neighbor_ids_util",     # zero-filled for single-edge
+            "neighbor_delta",        # zero-filled for single-edge
+            "neighbor_atk_rate",     # zero-filled for single-edge
+            "prev_slo_vio",          # local SLO signal, always valid
             "transition_ticks_norm",
             "delta_in_flight_norm",
             "queue_ahead_norm",
         ]
-        
-        self.obs_dim = len(self.obs_keys)
+
+        self.obs_dim = len(self.obs_keys)  # always 12
 
         _cfg = yaml.safe_load(Path(cfg_path).read_text(encoding="utf-8"))
         self.scaling_time_steps: List[int] = list(
@@ -379,12 +371,14 @@ class IndepTorchRLEnvWrapper(EnvBase):
                 obs[i, self.obs_keys.index("neighbor_ids_util")] = float(np.mean(nbr_utils)) if nbr_utils else 0.0
                 obs[i, self.obs_keys.index("neighbor_delta")]    = float(np.mean(nbr_deltas)) if nbr_deltas else 0.0
                 obs[i, self.obs_keys.index("neighbor_atk_rate")] = float(np.mean(nbr_atk)) if nbr_atk else 0.0
-                
-                g = df[df["area_id"] == area_id]
-                if not g.empty:
-                    last_qoe = float(g["qoe_mean"].values[-1])
-                    threshold = float(self.env.edge_areas[i].slo_threshold)
-                    obs[i, self.obs_keys.index("prev_slo_vio")] = 1.0 if last_qoe < threshold else 0.0
+
+        # 2b. SLO violation flag (local signal, valid for single- and multi-edge)
+        for i, area_id in enumerate(self.area_ids):
+            g = df[df["area_id"] == area_id]
+            if not g.empty:
+                last_qoe = float(g["qoe_mean"].values[-1])
+                threshold = float(self.env.edge_areas[i].slo_threshold)
+                obs[i, self.obs_keys.index("prev_slo_vio")] = 1.0 if last_qoe < threshold else 0.0
 
         # 3. Scaling features (always present)
         max_dur = float(self.scaling_time_steps[-1])
@@ -483,7 +477,7 @@ def orthogonal_init(m, gain=1.0):
 
 import argparse
 
-def train(env_cfg_path="./configs/simulation_ma.yaml", train_cfg_path="./configs/train.yaml", device="cuda", total_frames_override=None):
+def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/train.yaml", device="cuda", total_frames_override=None, resume_ckpt: str = None, ckpt_dir: str = None):
     with open(env_cfg_path, "r") as f:
         env_cfg = yaml.safe_load(f)
     with open(train_cfg_path, "r") as f:
@@ -508,7 +502,6 @@ def train(env_cfg_path="./configs/simulation_ma.yaml", train_cfg_path="./configs
     logger_cfg = train_cfg.setdefault("logger", {})
     if "exp_name" not in logger_cfg:
         logger_cfg["exp_name"] = "ppo_indep"
-    logger_cfg["exp_name"] += f"_{atk_lvl}_{user_lvl}"
 
     try:
         t_max = env_cfg["run"]["t_max"]
@@ -522,7 +515,8 @@ def train(env_cfg_path="./configs/simulation_ma.yaml", train_cfg_path="./configs
         num_envs = train_cfg["collector"]["num_envs"]
         decisions_per_episode = math.ceil(t_max / decision_interval)
 
-        ckpt_dir = Path("checkpoints") / run.name
+        _phase = "_phase2" if resume_ckpt else "_phase1"
+        ckpt_dir = Path(ckpt_dir) if ckpt_dir else Path("checkpoints") / _phase / run.name
         ckpt_every = 50
         best_qoe = -1e9
 
@@ -643,6 +637,17 @@ def train(env_cfg_path="./configs/simulation_ma.yaml", train_cfg_path="./configs
 
         env.reset()
 
+        if resume_ckpt:
+            ckpt = torch.load(resume_ckpt, map_location=device)
+            collector_policy.load_state_dict(ckpt["policy"])
+            value.load_state_dict(ckpt["value"])
+            # Re-init obsnorm: Phase 1 left neighbor dims at zero;
+            # Phase 2 multi-edge env will have non-zero values there.
+            env.transform.train()
+            env.transform[-1].init_stats(num_iter=100, reduce_dim=(0, 1, 2), cat_dim=0)
+            env.transform.eval()
+            print(f"[resume] Loaded weights from {resume_ckpt}, re-initialized obsnorm")
+
         for it, batch in enumerate(collector):
             assert_finite(batch, "BATCH")
             assert_finite(batch["next"], "NEXT")
@@ -748,8 +753,20 @@ def train(env_cfg_path="./configs/simulation_ma.yaml", train_cfg_path="./configs
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cfg", type=str, default="./configs/simulation_ma_0.yaml")
+    parser.add_argument("--cfg", type=str, default="./configs/simulation_0.yaml")
     parser.add_argument("--train_cfg", type=str, default="./configs/train.yaml")
     parser.add_argument("--total_frames", type=int, default=None)
+    parser.add_argument("--resume_ckpt", type=str, default=None)
+    parser.add_argument("--ckpt_dir", type=str, default=None)
     args = parser.parse_args()
-    train(env_cfg_path=args.cfg, train_cfg_path=args.train_cfg, total_frames_override=args.total_frames)
+    train(env_cfg_path=args.cfg, train_cfg_path=args.train_cfg, total_frames_override=args.total_frames, resume_ckpt=args.resume_ckpt, ckpt_dir=args.ckpt_dir)
+
+"""
+  Usage:                                                                                                                                                            
+  # Phase 1 — single-edge pretraining                                                                                                                               
+  python train_indep_lstm.py --cfg configs/simulation_0.yaml --train_cfg configs/train.yaml                                                                         
+                                                                                                                                                                    
+  # Phase 2 — multi-edge fine-tuning                                                                                                                                
+  python train_indep_lstm.py --cfg configs/simulation_ma_0.yaml --train_cfg configs/train.yaml \                                                                    
+    --resume_ckpt checkpoints/<phase1_run>/ckpt_best.pt  
+"""
