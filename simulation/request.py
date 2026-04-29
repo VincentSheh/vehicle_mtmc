@@ -32,6 +32,7 @@ class AttackTypeSpec:
     latency_per_flow: float      # ms per flow
     bw_per_flow: float           # Mbps per flow
     non_defendable_bw_const: float
+    active_len_factor: float = 0.25
 
 
 class AttackTypeLibrary:
@@ -78,6 +79,7 @@ class AttackTypeLibrary:
                 latency_per_flow=float(rng.uniform(*lat_range)),
                 bw_per_flow=float(rng.uniform(*bw_range)),
                 non_defendable_bw_const=float(cfg.get("non_defendable_bw_const", 0.0)),
+                active_len_factor=float(cfg.get("active_len_factor", 0.25)),
             ))
         self._specs = specs
 
@@ -115,6 +117,7 @@ class Attacker:
 
         self.slot_ms = slot_ms
         self.t_max = t_max
+        self.active_len_factor = spec.active_len_factor
         self.rep = 1
         self.scaling = 1
         self.z_t = 0
@@ -131,7 +134,7 @@ class Attacker:
 
         self.base_seed = seed
         self.rng = np.random.default_rng(seed)
-        self.active_len = self.t_max // 4
+        self.active_len = int(self.t_max * self.active_len_factor)
         self._init_start()
 
     def _generate_patterned_trace(self):
@@ -184,7 +187,8 @@ class Attacker:
         max_start = self.t_max - self.active_len
         # Sample start and scaling BEFORE trace generation so these are
         # identical across pattern types for the same seed.
-        self.start = int(self.rng.uniform(0, self.t_max - self.active_len))
+        # Single-edge enforce min start delay of 500.
+        self.start = int(self.rng.uniform(500, max(501, max_start)))
         self.scaling = float(self.rng.uniform(0.8, 1.4))
         self.rep = 1
         self.tau = 0

@@ -18,7 +18,7 @@ logger:
   backend: wandb
   entity: asture123-national-taiwan-university
   project_name: multiedgeids
-  exp_name: upt_lstm_i_u200_atk3_a4
+  exp_name: ma_legacy_act3
   plots:
     enabled: true
     out_dir: logs/wandb_plots
@@ -45,7 +45,7 @@ loss:
   clip_epsilon: 0.2        # matches ClipPPOLoss(clip_epsilon=0.2)
   anneal_clip_epsilon: true
   critic_coeff: 1.0
-  entropy_coeff: 1.0e-2
+  entropy_coeff: 0.002
   loss_critic_type: smooth_l1
   normalize_advantage: false  # you normalize manually
   seq_len: 32
@@ -54,9 +54,10 @@ loss:
 # Model
 # =========================
 model:
-  num_layers: 3
-  hidden_dim: 128          # ActorNet / CriticNet hidden size
+  num_layers: 2
+  hidden_dim: 64          # ActorNet / CriticNet hidden size
   n_actions: 3             # discrete {scale down, hold, scale up}
+
 
 # =========================
 # Observation normalization
