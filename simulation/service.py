@@ -88,11 +88,10 @@ class IDS:
                 type_tpr, _ = self.acc_tpr_fpr.get(str(atk_type), default_entry)
                 used_tpr = eff_tpr if tpr_override is not None else type_tpr
                 p = min(1.0, max(0.0, coverage * used_tpr))
-                n_type = int(round(float(lam)))
-                attack_drop += float(np.random.binomial(n=n_type, p=p))
+                attack_drop += p * float(lam)
         else:
             p = min(1.0, max(0.0, coverage * eff_tpr))
-            attack_drop = float(np.random.binomial(n=int(round(total_attack)), p=p))
+            attack_drop = p * total_attack
 
         attack_pass = max(0.0, total_attack - attack_drop)
 
