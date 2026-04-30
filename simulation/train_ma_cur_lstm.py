@@ -63,22 +63,21 @@ class IndepTorchRLEnvWrapper(EnvBase):
         self.decision_interval = int(decision_interval)
         self.n_actions = int(n_actions)
 
+        _ext = n_actions != 3
         self.obs_keys = [
             "local_num_req",
             "attack_in_rate",
             "ema_mom",
             "cpu_to_ids_ratio",
             "ids_cpu_utilization",
-            "neighbor_ids_util",     # zero-filled for single-edge
-            "neighbor_delta",        # zero-filled for single-edge
-            "neighbor_atk_rate",     # zero-filled for single-edge
-            "prev_slo_vio",          # local SLO signal, always valid
-            "transition_ticks_norm",
-            "delta_in_flight_norm",
-            "queue_ahead_norm",
+            "neighbor_ids_util",
+            *( ["neighbor_delta"] if _ext else [] ),
+            "neighbor_atk_rate",
+            "prev_slo_vio",
+            *( ["transition_ticks_norm", "delta_in_flight_norm", "queue_ahead_norm"] if _ext else [] ),
         ]
 
-        self.obs_dim = len(self.obs_keys)  # always 12
+        self.obs_dim = len(self.obs_keys)
 
         _cfg = yaml.safe_load(Path(cfg_path).read_text(encoding="utf-8"))
         self.scaling_time_steps: List[int] = list(
@@ -369,7 +368,8 @@ class IndepTorchRLEnvWrapper(EnvBase):
                     nbr_deltas.append(float(np.clip(delta / max(max_delta, 1e-6), -1.0, 1.0)))
 
                 obs[i, self.obs_keys.index("neighbor_ids_util")] = float(np.mean(nbr_utils)) if nbr_utils else 0.0
-                obs[i, self.obs_keys.index("neighbor_delta")]    = float(np.mean(nbr_deltas)) if nbr_deltas else 0.0
+                if "neighbor_delta" in self.obs_keys:
+                    obs[i, self.obs_keys.index("neighbor_delta")] = float(np.mean(nbr_deltas)) if nbr_deltas else 0.0
                 obs[i, self.obs_keys.index("neighbor_atk_rate")] = float(np.mean(nbr_atk)) if nbr_atk else 0.0
 
         # 2b. SLO violation flag (local signal, valid for single- and multi-edge)
@@ -380,15 +380,16 @@ class IndepTorchRLEnvWrapper(EnvBase):
                 threshold = float(self.env.edge_areas[i].slo_threshold)
                 obs[i, self.obs_keys.index("prev_slo_vio")] = 1.0 if last_qoe < threshold else 0.0
 
-        # 3. Scaling features (always present)
-        max_dur = float(self.scaling_time_steps[-1])
-        max_delta = self.scale_step * (self.n_actions - 1) / 2.0
-        for i in range(self.n_edges):
-            obs[i, self.obs_keys.index("transition_ticks_norm")] = float(self.transition_ticks_remaining[i].item()) / max(max_dur, 1.0)
-            dif = float(self.ids_cpu_target[i].item()) - float(self.ids_cpu_settled[i].item())
-            obs[i, self.obs_keys.index("delta_in_flight_norm")] = float(np.clip(dif / max(max_delta, 1e-6), -1.0, 1.0))
-            qa = float(self.ids_cpu[i].item()) - float(self.ids_cpu_target[i].item())
-            obs[i, self.obs_keys.index("queue_ahead_norm")] = float(np.clip(qa / max(max_delta, 1e-6), -1.0, 1.0))
+        # 3. Scaling features (omitted when n_actions == 3)
+        if "transition_ticks_norm" in self.obs_keys:
+            max_dur = float(self.scaling_time_steps[-1])
+            max_delta = self.scale_step * (self.n_actions - 1) / 2.0
+            for i in range(self.n_edges):
+                obs[i, self.obs_keys.index("transition_ticks_norm")] = float(self.transition_ticks_remaining[i].item()) / max(max_dur, 1.0)
+                dif = float(self.ids_cpu_target[i].item()) - float(self.ids_cpu_settled[i].item())
+                obs[i, self.obs_keys.index("delta_in_flight_norm")] = float(np.clip(dif / max(max_delta, 1e-6), -1.0, 1.0))
+                qa = float(self.ids_cpu[i].item()) - float(self.ids_cpu_target[i].item())
+                obs[i, self.obs_keys.index("queue_ahead_norm")] = float(np.clip(qa / max(max_delta, 1e-6), -1.0, 1.0))
 
         return obs
 
@@ -643,8 +644,12 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
             value.load_state_dict(ckpt["value"])
             # Re-init obsnorm: Phase 1 left neighbor dims at zero;
             # Phase 2 multi-edge env will have non-zero values there.
+            _norm = env.transform[-1]
+            _norm.loc = torch.nn.UninitializedBuffer()
+            _norm.scale = torch.nn.UninitializedBuffer()
             env.transform.train()
             env.transform[-1].init_stats(num_iter=100, reduce_dim=(0, 1, 2), cat_dim=0)
+            env.transform[-1].to(device)
             env.transform.eval()
             print(f"[resume] Loaded weights from {resume_ckpt}, re-initialized obsnorm")
 
@@ -659,7 +664,9 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
             data = batch.view(B_env * E_edges, T_batch).contiguous() # [B_total, T]
 
             # ---- per-decision-step obs logging ----
-            _obs_log = data["observation"].float().cpu() # [B, T, obs_dim]
+            _obs_log = data["observation"].float().cpu() # [B, T, obs_dim], normalized
+            _norm = env.transform[-1]
+            _obs_log = _obs_log * _norm.scale.cpu() + _norm.loc.cpu()  # de-normalize
             _B_total, _T, _D = _obs_log.shape
             for _t in range(_T):
                 _step_log = {"decision_step": global_decision_step + _t}

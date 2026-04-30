@@ -18,7 +18,8 @@ globals:
 
   attack_sampler:
     n_types: 10
-    dirichlet_alpha: 1000  # symmetric Dirichlet concentration over edges per type; higher=uniform, lower=concentrated on one edge
+    active_len_factor: 0.5
+    dirichlet_alpha: 1000.0  # symmetric Dirichlet concentration over edges per type; higher=uniform, lower=concentrated on one edge
     pattern_types: ["sinus", "pw", "expo" ] #, "yoyo"]
     # pattern_types: ["pw"]
     # pattern_types: ["yoyo"]
@@ -43,7 +44,7 @@ globals:
       kappa: 0.25 
       sigma: 8 # Before Conversion to per step request = 0.9
       mu_level:
-        default: [20.0, 200.0]
+        default: [20.0, 250.0]
         low: [10.0, 100.0]
         mid: [30.0, 150.0]
         high: [50.0, 250.0]
@@ -109,9 +110,17 @@ globals:
   delay_ms:
     # Asymmetric: E2 is close (5 ms), E3 is far (30 ms from E1).
     # delay_workload prefers E2 (lower delay penalty); full overrides to E3 (accuracy wins).
-    - [0.0,   5.0,  30.0]
-    - [5.0,   0.0,  25.0]
-    - [30.0, 25.0,   0.0]
+    # - [0.0,   5.0,  30.0]
+    # - [5.0,   0.0,  25.0]
+    # - [30.0, 25.0,   0.0]
+    - [0.0,   20.0,  20.0]
+    - [20.0,   0.0,  20.0]
+    - [20.0,  20.0,  0.0]
+    # - [0.0,  20.0,  20.0, 20.0, 20.0]
+    # - [20.0,  0.0,  20.0, 20.0, 20.0]
+    # - [20.0, 20.0,   0.0, 20.0, 20.0]
+    # - [20.0, 20.0,  20.0,  0.0, 20.0]
+    # - [20.0, 20.0,  20.0, 20.0,  0.0]
 
   video_pipeline:
     reid_latency: 20 #! Should consider batch processing
@@ -199,3 +208,29 @@ edge_areas:
       Gamma: 0.0005
 
     dirichlet_concentration: 1.0  # Dirichlet alpha for P(a|e); 1.0 = uniform over attack types
+
+
+  # - area_id: "E4"
+  #   cpu_cycle_per_ms: 3.8 #3.8GHz #3.8E6 / ms
+  #   slo_beta: 3.0
+  #   slo_threshold: 0.2
+  #   budget: { cpu: 8.0, mem: 8.0, uplink: 100 } #100Mbps
+  #   constraints:
+  #     D_Max: 250.0
+  #     MOTA_min: 0.1
+  #     Gamma: 0.0005
+
+  #   dirichlet_concentration: 1.0  # Dirichlet alpha for P(a|e); 1.0 = uniform over attack types
+
+
+  # - area_id: "E5"
+  #   cpu_cycle_per_ms: 3.8 #3.8GHz #3.8E6 / ms
+  #   slo_beta: 3.0
+  #   slo_threshold: 0.2
+  #   budget: { cpu: 8.0, mem: 8.0, uplink: 100 } #100Mbps
+  #   constraints:
+  #     D_Max: 250.0
+  #     MOTA_min: 0.1
+  #     Gamma: 0.0005
+
+  #   dirichlet_concentration: 1.0  # Dirichlet alpha for P(a|e); 1.0 = uniform over attack types

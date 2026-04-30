@@ -52,6 +52,7 @@ class ActContext:
     transition_ticks_norm: np.ndarray    # shape (n_edges,)
     delta_in_flight_norm: np.ndarray     # shape (n_edges,)
     obs_flat: Optional[np.ndarray] = None  # pre-built normalised obs for RL policies
+    queue_ahead_norm: Optional[np.ndarray] = None  # (ids_cpu - ids_cpu_target) / max_delta, shape (n_edges,)
 
 
 # ---------------------------------------------------------------------------
@@ -442,88 +443,90 @@ class LSTMRLPolicy(BaselinePolicy):
 
 
 # ---------------------------------------------------------------------------
-# Multi-Agent LSTM RL policy (loads a train_ma_lstm.py checkpoint)
+# Multi-Agent LSTM RL policy (loads a train_ma_cur_lstm.py checkpoint)
 # ---------------------------------------------------------------------------
 class MALSTMRLPolicy(BaselinePolicy):
     """
-    Wraps a multi-agent checkpoint produced by train_ma_lstm.py (AgentRecurrentCore + actor head).
+    Wraps a checkpoint produced by train_ma_cur_lstm.py
+    (SplitObsModule + LSTMModule + MergeModule + actor head).
 
     Builds per-edge observations directly from the environment history using the
-    same 11-feature layout used during MA training, runs a single joint forward
-    pass for all edges, and returns per-edge CPU targets.
+    same 12-feature layout used during training, runs a single forward pass for
+    all edges, and returns per-edge CPU targets.
     """
-    # Obs layout from EdgeIDSParallelEnv.obs_keys — fixed for all MA checkpoints
+    # Obs layout matches IndepTorchRLEnvWrapper.obs_keys in train_ma_cur_lstm.py
     _OBS_KEYS: List[str] = [
-        "ids_user_in_rate",
-        "attack_in_rate",
-        "ema_mom",
-        "cpu_to_ids_ratio",
-        "ids_cpu_utilization",
-        "neighbor_ids_util",
-        "neighbor_delta",
-        "neighbor_atk_rate",
-        "prev_slo_vio",
-        "transition_ticks_norm",
-        "delta_in_flight_norm",
+        "local_num_req",          # 0  temporal
+        "attack_in_rate",         # 1  temporal
+        "ema_mom",                # 2
+        "cpu_to_ids_ratio",       # 3
+        "ids_cpu_utilization",    # 4
+        "neighbor_ids_util",      # 5
+        "neighbor_delta",         # 6
+        "neighbor_atk_rate",      # 7
+        "prev_slo_vio",           # 8
+        "transition_ticks_norm",  # 9
+        "delta_in_flight_norm",   # 10
+        "queue_ahead_norm",       # 11
     ]
-    _OBS_DIM = 11
-    _TEMPORAL_OBS_KEYS = {"ids_user_in_rate", "attack_in_rate", "neighbor_atk_rate"}
-    # First 5 are read from history; last 6 are computed from transition/neighbor state
-    _BASE_N = 5
+    _OBS_DIM    = 12
+    _N_TEMPORAL = 2   # first N_TEMPORAL_PER_EDGE features fed through LSTM
 
     def __init__(self, ckpt_path: str, device: str = "cpu", greedy: bool = False):
         import torch
         import torch.nn as nn
-        from train_ma_lstm import AgentRecurrentCore
+        from torchrl.modules import LSTMModule
+        from tensordict.nn import TensorDictModule, TensorDictSequential
+        from train_ma_cur_lstm import SplitObsModule, MergeModule
 
-        self.device = torch.device(device)
-        self.greedy = greedy
+        self.device     = torch.device(device)
+        self.greedy     = greedy
         self.scale_step = 0.5
 
-        state = torch.load(ckpt_path, map_location=self.device, weights_only=False)
+        state     = torch.load(ckpt_path, map_location=self.device, weights_only=False)
         train_cfg = state["train_cfg"]
 
-        hidden_dim     = int(train_cfg["model"]["hidden_dim"])
-        self.n_actions = int(train_cfg["model"]["n_actions"])
+        hidden_dim      = int(train_cfg["model"]["hidden_dim"])
+        self.n_actions  = int(train_cfg["model"]["n_actions"])
         self.hidden_dim = hidden_dim
 
-        # Derive n_edges from obsnorm shape  (loc shape = n_edges * obs_dim)
-        obsnorm = state.get("obsnorm", {})
+        obsnorm    = state.get("obsnorm", {})
         _LOC_KEY   = "transforms.2.loc"
         _SCALE_KEY = "transforms.2.scale"
-        if _LOC_KEY in obsnorm:
-            self.n_edges = int(obsnorm[_LOC_KEY].shape[0]) // self._OBS_DIM
-        else:
-            env_cfg = state.get("env_cfg", {})
-            self.n_edges = max(1, len(env_cfg.get("edge_areas", [])))
+        env_cfg      = state.get("env_cfg", {})
+        self.n_edges = max(1, len(env_cfg.get("edge_areas", [])))
 
-        temporal_local_idx = [i for i, k in enumerate(self._OBS_KEYS) if k in self._TEMPORAL_OBS_KEYS]
-        static_local_idx   = [i for i, k in enumerate(self._OBS_KEYS) if k not in self._TEMPORAL_OBS_KEYS]
-        n_static       = len(static_local_idx)
-        actor_feat_dim = hidden_dim + n_static
+        temporal_idx = list(range(self._N_TEMPORAL))
+        static_idx   = list(range(self._N_TEMPORAL, self._OBS_DIM))
+        n_static     = len(static_idx)
 
-        self.actor_core = AgentRecurrentCore(
-            n_edges=self.n_edges,
-            obs_dim=self._OBS_DIM,
-            hidden_dim=hidden_dim,
-            device=str(self.device),
-            temporal_local_idx=temporal_local_idx,
-            static_local_idx=static_local_idx,
+        split_module = TensorDictModule(
+            SplitObsModule(temporal_idx, static_idx).to(self.device),
+            in_keys=["observation"], out_keys=["temporal_obs", "static_obs"],
         )
-        self.actor_head = nn.Linear(actor_feat_dim, self.n_actions).to(self.device)
+        lstm = LSTMModule(
+            input_size=self._N_TEMPORAL, hidden_size=hidden_dim,
+            in_key="temporal_obs", out_key="lstm_out", device=str(self.device),
+        )
+        merge_module = TensorDictModule(
+            MergeModule(),
+            in_keys=["lstm_out", "static_obs"], out_keys=["features_merged"],
+        )
+        self.actor_core = TensorDictSequential(split_module, lstm, merge_module).to(self.device)
+        self.actor_head = nn.Linear(hidden_dim + n_static, self.n_actions).to(self.device)
 
-        # Map checkpoint keys:
-        #   ProbabilisticActor(TDS(core, head)).state_dict() →
-        #     "module.module.0.*"        (AgentRecurrentCore)
-        #     "module.module.1.module.*" (actor head TDM's inner nn.Linear)
+        # Checkpoint produced by train_ma_cur_lstm.py:
+        #   ProbabilisticActor(TDS(shared_core, actor_head)).state_dict()
+        #     "module.0.*"        (shared_core = TDS(split, lstm, merge))
+        #     "module.1.module.*" (actor head TDM's inner nn.Linear)
         policy_sd = state["policy"]
-        CORE_PFX  = "module.module.0."
-        HEAD_PFX  = "module.module.1.module."
+        CORE_PFX  = "module.0."
+        HEAD_PFX  = "module.1.module."
         core_sd = {k[len(CORE_PFX):]: v for k, v in policy_sd.items() if k.startswith(CORE_PFX)}
         head_sd = {k[len(HEAD_PFX):]: v for k, v in policy_sd.items() if k.startswith(HEAD_PFX)}
 
         if not core_sd:
-            prefixes = sorted({".".join(k.split(".")[:3]) for k in policy_sd.keys()})
+            prefixes = sorted({".".join(k.split(".")[:2]) for k in policy_sd.keys()})
             print(f"[MALSTMRLPolicy] WARNING: no keys matched core prefix '{CORE_PFX}'; "
                   f"found prefixes: {prefixes}")
 
@@ -539,12 +542,11 @@ class MALSTMRLPolicy(BaselinePolicy):
         self.actor_core.eval()
         self.actor_head.eval()
 
-        # Observation normalisation (ObservationNorm at transform index 2)
         self.obs_loc = self.obs_scale = None
         if _LOC_KEY in obsnorm and _SCALE_KEY in obsnorm:
             self.obs_loc   = obsnorm[_LOC_KEY].detach().to(self.device)
             self.obs_scale = obsnorm[_SCALE_KEY].detach().to(self.device)
-            print(f"[MALSTMRLPolicy] ObsNorm loaded: shape={self.obs_loc.shape}, n_edges={self.n_edges}")
+            print(f"[MALSTMRLPolicy] ObsNorm loaded: numel={self.obs_loc.numel()}, n_edges={self.n_edges}")
         else:
             print("[MALSTMRLPolicy] WARNING: no obsnorm found — running WITHOUT normalisation")
 
@@ -556,7 +558,7 @@ class MALSTMRLPolicy(BaselinePolicy):
         self._c = None
 
     def _build_ma_obs(self, ctx: ActContext) -> np.ndarray:
-        """Replicate EdgeIDSParallelEnv._build_observation() from the eval-loop context."""
+        """Replicates IndepTorchRLEnvWrapper._build_observation() from the eval-loop context."""
         import pandas as pd
 
         env      = ctx.env
@@ -570,15 +572,23 @@ class MALSTMRLPolicy(BaselinePolicy):
         records = env.history[-ctx.decision_interval * n_edges:]
         df      = pd.DataFrame([m.__dict__ for m in records])
 
-        # Base 5 features read from history (indices 0-4)
+        # Base 5 features from history (indices 0-4)
+        BASE_KEYS = ["local_num_req", "attack_in_rate", "ema_mom", "cpu_to_ids_ratio", "ids_cpu_utilization"]
         for i, area_id in enumerate(area_ids):
             g = df[df["area_id"] == area_id]
             if g.empty:
                 continue
-            for j, k in enumerate(self._OBS_KEYS[:self._BASE_N]):
+            for j, k in enumerate(BASE_KEYS):
                 if k not in g.columns:
                     continue
-                obs[i, j] = float(g[k].values[-1]) if k == "cpu_to_ids_ratio" else float(np.mean(g[k].values))
+                vals = g[k].values
+                if k == "cpu_to_ids_ratio":
+                    obs[i, j] = float(vals[-1])
+                elif k == "ema_mom":
+                    vals_nz = vals[vals != 0.0]
+                    obs[i, j] = float(np.mean(vals_nz)) if len(vals_nz) > 0 else 0.0
+                else:
+                    obs[i, j] = float(np.mean(vals))
 
         # Neighbor features: ids_util (5), delta (6), atk_rate (7)
         edge_ids_util: Dict[str, float] = {}
@@ -602,7 +612,7 @@ class MALSTMRLPolicy(BaselinePolicy):
                     continue
                 nbr_utils.append(edge_ids_util[area_ids[j]])
                 nbr_atk.append(edge_atk_rate[area_ids[j]])
-                nbr_deltas.append(float(ctx.delta_in_flight_norm[j]))  # already normalised
+                nbr_deltas.append(float(ctx.delta_in_flight_norm[j]))
             obs[i, 5] = float(np.mean(nbr_utils))  if nbr_utils  else 0.0
             obs[i, 6] = float(np.mean(nbr_deltas)) if nbr_deltas else 0.0
             obs[i, 7] = float(np.mean(nbr_atk))    if nbr_atk    else 0.0
@@ -617,10 +627,11 @@ class MALSTMRLPolicy(BaselinePolicy):
             threshold = float(env.edge_areas[i].slo_threshold)
             obs[i, 8] = 1.0 if last_qoe < threshold else 0.0
 
-        # Transition state (indices 9, 10) — taken directly from ctx
+        # Transition state (indices 9, 10, 11)
         for i in range(n_edges):
             obs[i, 9]  = float(ctx.transition_ticks_norm[i])
             obs[i, 10] = float(ctx.delta_in_flight_norm[i])
+            obs[i, 11] = float(ctx.queue_ahead_norm[i]) if ctx.queue_ahead_norm is not None else 0.0
 
         return obs.reshape(-1).astype(np.float32)
 
@@ -628,41 +639,42 @@ class MALSTMRLPolicy(BaselinePolicy):
         if self.obs_loc is None:
             return obs_flat
         import torch
-        x = torch.from_numpy(obs_flat).to(self.device)
-        return ((x - self.obs_loc) / (self.obs_scale + 1e-8)).cpu().numpy()
+        n_edges = len(obs_flat) // self._OBS_DIM
+        x     = torch.from_numpy(obs_flat).to(self.device).view(n_edges, self._OBS_DIM)
+        loc   = self.obs_loc.view(-1)    # (obs_dim,) — broadcast over edges
+        scale = self.obs_scale.view(-1)
+        return ((x - loc) / (scale + 1e-8)).view(-1).cpu().numpy()
 
     def act(self, ctx: ActContext) -> tuple[Optional[np.ndarray], np.ndarray]:
         import torch
-        from tensordict import TensorDict
 
-        n_edges = len(ctx.ids_cpu)
-
+        n_edges  = len(ctx.ids_cpu)
         obs_flat = self._build_ma_obs(ctx)
         obs_norm = self._normalise(obs_flat)
 
+        obs_t = torch.from_numpy(obs_norm).float().to(self.device).view(n_edges, self._OBS_DIM)
+
         if self._h is None:
-            self._h = torch.zeros(1, n_edges, 1, self.hidden_dim, device=self.device)
-            self._c = torch.zeros(1, n_edges, 1, self.hidden_dim, device=self.device)
+            self._h = torch.zeros(1, n_edges, self.hidden_dim, device=self.device)
+            self._c = torch.zeros(1, n_edges, self.hidden_dim, device=self.device)
 
-        obs_t = torch.from_numpy(obs_norm).float().to(self.device).unsqueeze(0)  # (1, n_edges*obs_dim)
+        # actor_core is TDS(split_module, lstm_module, merge_module)
+        split_obs = self.actor_core.module[0].module   # SplitObsModule
+        nn_lstm   = self.actor_core.module[1].lstm     # nn.LSTM (batch_first=True)
 
-        td = TensorDict(
-            {
-                "observation_flat":              obs_t,
-                "is_init":                       torch.zeros(1, 1, device=self.device, dtype=torch.bool),
-                ("agents", "recurrent_state_h"): self._h,
-                ("agents", "recurrent_state_c"): self._c,
-            },
-            batch_size=[1],
-            device=self.device,
-        )
+        temporal = obs_t[..., split_obs.t_idx]   # (n_edges, N_TEMPORAL)
+        static   = obs_t[..., split_obs.s_idx]   # (n_edges, n_static)
 
+        # batch_first=True → input (n_edges, seq=1, N_TEMPORAL)
         with torch.no_grad():
-            td       = self.actor_core(td)
-            features = td.get(("agents", "features"))        # (1, n_edges, actor_feat_dim)
-            logits   = self.actor_head(features).squeeze(0)  # (n_edges, n_actions)
-            self._h  = td.get(("agents", "recurrent_state_h_out"))
-            self._c  = td.get(("agents", "recurrent_state_c_out"))
+            lstm_out, (h_new, c_new) = nn_lstm(
+                temporal.unsqueeze(1), (self._h, self._c)
+            )
+            self._h    = h_new
+            self._c    = c_new
+            lstm_out   = lstm_out.squeeze(1)                         # (n_edges, hidden_dim)
+            features   = torch.cat([lstm_out, static], dim=-1)      # (n_edges, hidden_dim+n_static)
+            logits     = self.actor_head(features)                   # (n_edges, n_actions)
 
         ids_cpu_abs = np.empty(n_edges, dtype=np.float32)
         for i in range(n_edges):
@@ -672,11 +684,9 @@ class MALSTMRLPolicy(BaselinePolicy):
             else:
                 probs  = torch.softmax(edge_logits, dim=-1)
                 action = int(torch.multinomial(probs, 1).item())
-            delta_cmd   = (action - (self.n_actions - 1) / 2.0) * self.scale_step
+            delta_cmd      = (action - (self.n_actions - 1) / 2.0) * self.scale_step
             ids_cpu_abs[i] = float(np.clip(
-                ctx.ids_cpu[i] + delta_cmd,
-                ctx.ids_cpu_min,
-                ctx.ids_cpu_max[i],
+                ctx.ids_cpu[i] + delta_cmd, ctx.ids_cpu_min, ctx.ids_cpu_max[i],
             ))
 
         return ids_cpu_abs, np.zeros(n_edges, dtype=np.int64)

@@ -1083,23 +1083,15 @@ def train(
 
         # Log per-step obs (raw obs only, not the appended agent-ID dims)
         obs = traj.get(("agents", "observation", "obs"))[..., :raw_obs_dim]
-        obs_log = obs.clone()
         norm_t = env.transform[1]
-        for k in ["cpu_to_ids_ratio", "ema_mom"]:
-            if k not in obs_keys:
-                continue
-            idx = obs_keys.index(k)
-            # If loc is [n_edges, raw_obs_dim], we take [:, idx] to get [n_edges]
-            # If loc is [raw_obs_dim], we take [idx] to get a scalar (broadcasts across n_edges)
-            if norm_t.loc.numel() == n_edges * raw_obs_dim:
-                loc   = norm_t.loc.view(n_edges, raw_obs_dim)[:, idx].to(obs_log.device)
-                scale = norm_t.scale.view(n_edges, raw_obs_dim)[:, idx].to(obs_log.device)
-            else:
-                loc   = norm_t.loc[idx].to(obs_log.device)
-                scale = norm_t.scale[idx].to(obs_log.device)
-            obs_log[..., idx] = obs[..., idx] * scale + loc
+        loc   = norm_t.loc.to(obs.device)
+        scale = norm_t.scale.to(obs.device)
+        if loc.numel() == n_edges * raw_obs_dim:
+            loc   = loc.view(n_edges, raw_obs_dim)
+            scale = scale.view(n_edges, raw_obs_dim)
+        obs_log = obs * scale + loc  # de-normalize all features
         global_decision_step = wandb_log_obs_steps(
-            obs_log, obs_keys, keep_keys={"cpu_to_ids_ratio", "ema_mom"},
+            obs_log, obs_keys, keep_keys=set(obs_keys),
             global_step_start=global_decision_step,
         )
 
