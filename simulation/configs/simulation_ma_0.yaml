@@ -77,7 +77,7 @@ globals:
   #                     is offered at full value and attack resource consumption is
   #                     distributed across VA executors after routing.
   va_attack_offload: true
-  max_prop_delay_ms: 50.0        # hard delay cutoff for modes delay_workload / full
+  max_prop_delay_ms: 200.0        # hard delay cutoff for modes delay_workload / full
 
   # Score-based offload weights (modes delay_workload / full)
   #   score(src,dst) = load_benefit - d_prop/d_max * w3
@@ -95,7 +95,7 @@ globals:
   #        "gm" = global model (all executors share the same FPR/FNR on a given source)
   accuracy_matrix:
     path: configs/accuracy_matrix.json
-    model: gm
+    model: lm
 
   # accuracy_by_region (static fallback, used when accuracy_matrix is absent):
   #   - [[0.10, 0.00], [0.45, 0.00], [0.01, 0.00]]
@@ -108,11 +108,14 @@ globals:
   # - City-scale (intersection to intersection): 5–20 ms
   # - Metro area / across districts: 20–50 ms
   delay_ms:
-    # Asymmetric: E2 is close (5 ms), E3 is far (30 ms from E1).
-    # delay_workload prefers E2 (lower delay penalty); full overrides to E3 (accuracy wins).
-    - [0.0,   5.0,  30.0]
-    - [5.0,   0.0,  25.0]
-    - [30.0, 25.0,   0.0]
+    - [0.0,   20.0,  20.0]
+    - [20.0,   0.0,  20.0]
+    - [20.0, 20.0,   0.0]  
+    # - [0.0,  20.0,  20.0, 20.0, 20.0]
+    # - [20.0,  0.0,  20.0, 20.0, 20.0]
+    # - [20.0, 20.0,   0.0, 20.0, 20.0]
+    # - [20.0, 20.0,  20.0,  0.0, 20.0]
+    # - [20.0, 20.0,  20.0, 20.0,  0.0]
 
   video_pipeline:
     reid_latency: 20 #! Should consider batch processing
@@ -200,3 +203,29 @@ edge_areas:
       Gamma: 0.0005
 
     dirichlet_concentration: 1.0  # Dirichlet alpha for P(a|e); 1.0 = uniform over attack types
+
+
+  # - area_id: "E4"
+  #   cpu_cycle_per_ms: 3.8 #3.8GHz #3.8E6 / ms
+  #   slo_beta: 3.0
+  #   slo_threshold: 0.2
+  #   budget: { cpu: 8.0, mem: 8.0, uplink: 100 } #100Mbps
+  #   constraints:
+  #     D_Max: 250.0
+  #     MOTA_min: 0.1
+  #     Gamma: 0.0005
+
+  #   dirichlet_concentration: 1.0  # Dirichlet alpha for P(a|e); 1.0 = uniform over attack types
+
+
+  # - area_id: "E5"
+  #   cpu_cycle_per_ms: 3.8 #3.8GHz #3.8E6 / ms
+  #   slo_beta: 3.0
+  #   slo_threshold: 0.2
+  #   budget: { cpu: 8.0, mem: 8.0, uplink: 100 } #100Mbps
+  #   constraints:
+  #     D_Max: 250.0
+  #     MOTA_min: 0.1
+  #     Gamma: 0.0005
+
+  #   dirichlet_concentration: 1.0  # Dirichlet alpha for P(a|e); 1.0 = uniform over attack types
