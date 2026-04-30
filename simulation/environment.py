@@ -27,6 +27,7 @@ from offload import (
     score_based_offload,
     balance_workload_cto,
     balance_workload_cto_acc,
+    balance_workload_cto_acc_inv,
     balance_with_caps_and_prop_filter,
 )
 
@@ -330,6 +331,27 @@ class Environment:
                 id_to_idx=self.id_to_idx,
             )
 
+        if mode == "cto_acc_inv":
+            nested = {
+                s: {r: float(self.prop_delay.get((s, r), 0.0)) for r in self.area_ids}
+                for s in self.area_ids
+            }
+            fnr_mat = fpr_mat = None
+            if self.acc_by_region is not None and stage == "ids":
+                fpr_mat = self.acc_by_region[:, :, 0]
+                fnr_mat = self.acc_by_region[:, :, 1]
+            w1, w2, w3 = self._offload_weights
+            return balance_workload_cto_acc_inv(
+                area_ids=self.area_ids,
+                W_src=W_src,
+                c_dst=c_dst,
+                propagation_delays=nested,
+                weights=(w1, w2, w3),
+                fnr_matrix=fnr_mat,
+                fpr_matrix=fpr_mat,
+                id_to_idx=self.id_to_idx,
+            )
+
         # modes "delay_workload" and "full" use score_based_offload
         nested = {
             s: {r: float(self.prop_delay.get((s, r), 0.0)) for r in self.area_ids}
@@ -349,6 +371,7 @@ class Environment:
             fpr_matrix=fpr_matrix,
             weights=self._offload_weights,
             id_to_idx=self.id_to_idx,
+            max_prop_delay=self._max_prop_delay_ms,
         )
 
     def _run_step_multi_edge(self, ids_cpus, overhead=0.0, disable_attack=False):
