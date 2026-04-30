@@ -1,13 +1,13 @@
 """
-Evaluate baseline and proposed methods across different FL heterogeneity levels 
-(Dirichlet alpha values) and plot results.
+Evaluate baseline and proposed methods across different edge area scales (1 to 5)
+and plot results as a grouped bar chart.
 
 Usage:
     # Dummy mode
-    python eval_heterogeneity.py --dummy
+    python eval_num_edge.py --dummy
 
     # Real evaluation
-    python eval_heterogeneity.py --cfg configs/simulation_ma_0.yaml --episodes 10
+    python eval_num_edge.py --cfg configs/simulation_ma_0.yaml --episodes 10
 """
 from __future__ import annotations
 
@@ -119,14 +119,14 @@ def _make_proposed_display_label(model_key: str, offload_mode: str) -> str:
 # CSV and State Helpers
 # ---------------------------------------------------------------------------
 
-def save_means_to_csv(means: dict, methods_display: list[str], alphas: list[float], outpath: Path):
+def save_means_to_csv(means: dict, methods_display: list[str], n_edges_list: list[int], outpath: Path):
     rows = []
-    for alpha in alphas:
+    for n_edge in n_edges_list:
         for method_label in methods_display:
-            m = means.get(alpha, {}).get(method_label, {})
+            m = means.get(n_edge, {}).get(method_label, {})
             for metric_key, metric_title in METRICS:
                 rows.append({
-                    "alpha":        alpha,
+                    "n_edge":       n_edge,
                     "method":       method_label,
                     "metric":       metric_key,
                     "metric_label": metric_title,
@@ -135,32 +135,32 @@ def save_means_to_csv(means: dict, methods_display: list[str], alphas: list[floa
     outpath.parent.mkdir(parents=True, exist_ok=True)
     with open(outpath, "w", newline="") as f:
         writer = csv.DictWriter(
-            f, fieldnames=["alpha", "method", "metric", "metric_label", "value"]
+            f, fieldnames=["n_edge", "method", "metric", "metric_label", "value"]
         )
         writer.writeheader()
         writer.writerows(rows)
     print(f"Saved: {outpath}")
 
 
-def load_means_from_csv(path: Path) -> tuple[dict, list[str], list[float]]:
+def load_means_from_csv(path: Path) -> tuple[dict, list[str], list[int]]:
     means: dict = {}
     method_order: list[str] = []
-    alphas_found: set[float] = set()
+    n_edges_found: set[int] = set()
     with open(path, newline="") as f:
         for row in csv.DictReader(f):
-            alpha, method, metric, value = (
-                float(row["alpha"]), row["method"],
+            n_edge, method, metric, value = (
+                int(row["n_edge"]), row["method"],
                 row["metric"], float(row["value"]),
             )
             if method not in method_order:
                 method_order.append(method)
-            alphas_found.add(alpha)
-            means.setdefault(alpha, {}).setdefault(method, {})[metric] = value
-    return means, method_order, sorted(list(alphas_found))
+            n_edges_found.add(n_edge)
+            means.setdefault(n_edge, {}).setdefault(method, {})[metric] = value
+    return means, method_order, sorted(list(n_edges_found))
 
 
-def _cell_is_complete(means: dict, alpha: float, methods_display: list[str]) -> bool:
-    cell = means.get(alpha, {})
+def _cell_is_complete(means: dict, n_edge: int, methods_display: list[str]) -> bool:
+    cell = means.get(n_edge, {})
     return all(
         all(
             not np.isnan(cell.get(m, {}).get(mk, np.nan))
@@ -173,21 +173,19 @@ def _cell_is_complete(means: dict, alpha: float, methods_display: list[str]) -> 
 # Dummy Data
 # ---------------------------------------------------------------------------
 
-def _make_dummy_data(method_labels: list[str], alphas: list[float]) -> dict:
+def _make_dummy_data(method_labels: list[str], n_edges_list: list[int]) -> dict:
     rng = np.random.default_rng(0)
     data: dict = {}
-    for i, alpha in enumerate(alphas):
-        data[alpha] = {}
-        # dummy values vary monotonically with log(alpha)
-        log_alpha = np.log10(alpha)
+    for i, n_edge in enumerate(n_edges_list):
+        data[n_edge] = {}
         for k, label in enumerate(method_labels):
             n = 50
-            # Higher alpha (more IID) -> better performance (lower metrics)
-            base_slo  = np.clip(0.2 - 0.04 * log_alpha + 0.02 * k, 0.01, 1)
-            base_bcd  = np.clip(0.1 - 0.02 * log_alpha + 0.01 * k, 0.005, 1)
-            base_leak = np.clip(0.4 - 0.08 * log_alpha + 0.03 * k, 0.02, 1)
+            # Higher n_edge -> slightly better offloading potential -> lower metrics
+            base_slo  = np.clip(0.15 - 0.01 * n_edge + 0.02 * k, 0.01, 1)
+            base_bcd  = np.clip(0.08 - 0.005 * n_edge + 0.01 * k, 0.005, 1)
+            base_leak = np.clip(0.30 - 0.02 * n_edge + 0.03 * k, 0.02, 1)
             
-            data[alpha][label] = {
+            data[n_edge][label] = {
                 "qoe_vio_rate":          np.clip(rng.normal(base_slo,        0.02, n), 0, 1   ).astype(np.float32),
                 "reward_benign_col_dmg": np.clip(rng.normal(base_bcd,        0.01, n), 0, None).astype(np.float32),
                 "reward_lambda_res":     np.clip(rng.normal(base_leak,       0.03, n), 0, 1   ).astype(np.float32),
@@ -201,7 +199,7 @@ def _make_dummy_data(method_labels: list[str], alphas: list[float]) -> dict:
 # Collection
 # ---------------------------------------------------------------------------
 
-def collect_data(args, alphas: list[float], done_alphas: set[float] | None = None, cell_callback=None) -> dict:
+def collect_data(args, n_edges_list: list[int], done_n_edges: set[int] | None = None, cell_callback=None) -> dict:
     from eval_baselines import run_episode
     from environment import build_env_base
     from train_sa_lstm import TorchRLEnvWrapper
@@ -285,19 +283,19 @@ def collect_data(args, alphas: list[float], done_alphas: set[float] | None = Non
         env_groups.setdefault((om, acc_model), []).append((mname, label))
 
     data: dict = {}
-    for alpha in alphas:
-        if done_alphas and alpha in done_alphas:
-            print(f"\n[resume] Skipping alpha={alpha} (already complete)")
-            data[alpha] = {}
+    for n_edge in n_edges_list:
+        if done_n_edges and n_edge in done_n_edges:
+            print(f"\n[resume] Skipping n_edge={n_edge} (already complete)")
+            data[n_edge] = {}
             continue
 
         print(f"\n{'='*70}")
-        print(f" Evaluating: alpha={alpha}")
+        print(f" Evaluating: n_edge={n_edge}")
         print("="*70)
 
         if not runs:
             print("[warn] No valid methods, skipping.")
-            data[alpha] = {}
+            data[n_edge] = {}
             continue
 
         cell: dict = {}
@@ -305,7 +303,18 @@ def collect_data(args, alphas: list[float], done_alphas: set[float] | None = Non
 
         for (offload_mode, acc_model), method_label_pairs in env_groups.items():
             cfg = copy.deepcopy(cfg_original)
-            cfg["globals"]["attack_sampler"]["dirichlet_alpha"] = alpha
+            
+            # Scale Edge Areas
+            base_area = cfg["edge_areas"][0]
+            cfg["edge_areas"] = []
+            for i in range(n_edge):
+                area = copy.deepcopy(base_area)
+                area["area_id"] = f"E{i+1}"
+                cfg["edge_areas"].append(area)
+            
+            # Update Delay Matrix (20ms default cross-edge delay)
+            cfg["globals"]["delay_ms"] = [[0.0 if i == j else 20.0 for j in range(n_edge)] for i in range(n_edge)]
+            
             cfg["globals"]["offload_mode"] = offload_mode
             if "accuracy_matrix" in cfg.get("globals", {}):
                 cfg["globals"]["accuracy_matrix"]["model"] = acc_model
@@ -359,9 +368,9 @@ def collect_data(args, alphas: list[float], done_alphas: set[float] | None = Non
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
 
-        data[alpha] = cell
+        data[n_edge] = cell
         if cell_callback is not None:
-            cell_callback(alpha, cell)
+            cell_callback(n_edge, cell)
 
     return data
 
@@ -369,51 +378,47 @@ def collect_data(args, alphas: list[float], done_alphas: set[float] | None = Non
 # Plotting
 # ---------------------------------------------------------------------------
 
-def plot_heterogeneity_bar(
+def plot_num_edge(
     means: dict,
     methods_display: list[str],
-    alphas: list[float],
+    n_edges_list: list[int],
     outpath: Path,
     proposed_label: str | None = None,
 ):
-    # Reverse alpha order: highest alpha (lowest heterogeneity) first
-    alphas_plot = sorted(alphas, reverse=True)
     n_rows = len(METRICS)
     fig, axes = plt.subplots(n_rows, 1, figsize=(10, 4 * n_rows), sharex=True, squeeze=False)
 
     cmap = plt.get_cmap("tab10")
     colors = {m: cmap(i % 10) for i, m in enumerate(methods_display)}
 
-    x = np.arange(len(alphas_plot))
+    x = np.arange(len(n_edges_list))
     width = 0.8 / len(methods_display)
 
     for row_i, (metric_key, metric_title) in enumerate(METRICS):
         ax = axes[row_i][0]
 
         for i, method_label in enumerate(methods_display):
-            vals = [means.get(a, {}).get(method_label, {}).get(metric_key, np.nan) for a in alphas_plot]
+            vals = [means.get(n_edge, {}).get(method_label, {}).get(metric_key, np.nan) for n_edge in n_edges_list]
             pos = x + (i - len(methods_display)/2 + 0.5) * width
             rects = ax.bar(pos, vals, width, color=colors[method_label], label=method_label, alpha=0.8)
 
             # Annotate gap relative to proposed_label
             if proposed_label and method_label != proposed_label:
-                for j, alpha in enumerate(alphas_plot):
-                    ref_val = means.get(alpha, {}).get(proposed_label, {}).get(metric_key, np.nan)
+                for j, n_edge in enumerate(n_edges_list):
+                    ref_val = means.get(n_edge, {}).get(proposed_label, {}).get(metric_key, np.nan)
                     val = vals[j]
                     if not np.isnan(ref_val) and not np.isnan(val):
                         gap = val - ref_val
-                        # Absolute performance gap. For percentages, show as e.g. +5.2%
                         if metric_key in ("slo_vio", "atk_leak", "bcd"):
                             text = f"{gap:+.1%}"
                         else:
                             text = f"{gap:+.1f}"
                         
-                        # Position text above the bar
                         ax.text(pos[j], val + 0.01 * ax.get_ylim()[1], text, 
                                 ha='center', va='bottom', fontsize=8, rotation=45)
 
         ax.set_xticks(x)
-        ax.set_xticklabels([str(a) for a in alphas_plot])
+        ax.set_xticklabels([str(n) for n in n_edges_list])
 
         if metric_key in ("slo_vio", "atk_leak", "bcd"):
             ax.yaxis.set_major_formatter(
@@ -425,7 +430,7 @@ def plot_heterogeneity_bar(
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
 
-    axes[-1][0].set_xlabel("Heterogeneity (Dirichlet α) — Reversed", fontsize=11)
+    axes[-1][0].set_xlabel("Number of Edge Areas", fontsize=11)
     
     handles, labels = axes[0][0].get_legend_handles_labels()
     fig.legend(
@@ -438,68 +443,13 @@ def plot_heterogeneity_bar(
         title_fontsize=10,
     )
 
-    fig.suptitle("Performance vs FL Heterogeneity (Grouped Bar Chart)", fontsize=14, fontweight="bold", y=1.01)
+    fig.suptitle("Performance vs Number of Edge Areas (Grouped Bar Chart)", fontsize=14, fontweight="bold", y=1.01)
     fig.tight_layout()
 
     outpath.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(outpath, dpi=150, bbox_inches="tight")
     print(f"Saved: {outpath}")
     plt.close(fig)
-
-
-def plot_heterogeneity_line(
-    means: dict,
-    methods_display: list[str],
-    alphas: list[float],
-    outpath: Path,
-):
-    alphas_plot = sorted(alphas)
-    n_rows = len(METRICS)
-    fig, axes = plt.subplots(n_rows, 1, figsize=(10, 4 * n_rows), sharex=True, squeeze=False)
-
-    cmap = plt.get_cmap("tab10")
-    colors = {m: cmap(i % 10) for i, m in enumerate(methods_display)}
-    markers = ["o", "s", "D", "^", "v", "<", ">", "p", "*", "H"]
-
-    for row_i, (metric_key, metric_title) in enumerate(METRICS):
-        ax = axes[row_i][0]
-        for i, method_label in enumerate(methods_display):
-            vals = [means.get(a, {}).get(method_label, {}).get(metric_key, np.nan) for a in alphas_plot]
-            ax.plot(alphas_plot, vals, label=method_label, color=colors[method_label], 
-                    marker=markers[i % len(markers)], markersize=6, linewidth=2, alpha=0.8)
-
-        ax.set_xscale("log")
-        if metric_key in ("slo_vio", "atk_leak", "bcd"):
-            ax.yaxis.set_major_formatter(
-                matplotlib.ticker.PercentFormatter(xmax=1.0, decimals=0)
-            )
-
-        ax.set_title(metric_title, fontsize=12, fontweight="bold")
-        ax.grid(True, which="both", linestyle="--", alpha=0.4)
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-
-    axes[-1][0].set_xlabel("Heterogeneity (Dirichlet α) - Log Scale", fontsize=11)
-    
-    handles, labels = axes[0][0].get_legend_handles_labels()
-    fig.legend(
-        handles, labels,
-        loc="center left",
-        bbox_to_anchor=(1.02, 0.5),
-        frameon=True,
-        fontsize=10,
-        title="Method",
-        title_fontsize=10,
-    )
-
-    fig.suptitle("Performance vs FL Heterogeneity (Line Chart)", fontsize=14, fontweight="bold", y=1.01)
-    fig.tight_layout()
-
-    outpath.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(outpath, dpi=150, bbox_inches="tight")
-    print(f"Saved: {outpath}")
-    plt.close(fig)
-
 
 # ---------------------------------------------------------------------------
 # Main
@@ -511,7 +461,7 @@ def main():
     ap.add_argument("--cfg",               default="configs/simulation_ma_0.yaml")
     ap.add_argument("--methods",           nargs="+", default=None)
     ap.add_argument("--episodes",          type=int,   default=10)
-    ap.add_argument("--outdir",            default="eval_out_hetero/")
+    ap.add_argument("--outdir",            default="eval_out_num_edge/")
     ap.add_argument("--dummy",             action="store_true")
     ap.add_argument("--ckpt",              default="checkpoints/_singleedge/a4_sf20_atk3_a18_default_default/ckpt_best.pt")
     ap.add_argument("--tbsa_table",        default="tbsa_table.npz")
@@ -520,33 +470,19 @@ def main():
     ap.add_argument("--decision_interval", type=int,   default=None)
     ap.add_argument("--device",            default="cpu")
     ap.add_argument("--offload_modes",     nargs="+", default=None)
-    ap.add_argument("--proposed_method",   default="lstm_rl")
-    ap.add_argument("--alphas",            nargs="+", type=float, default=None)
+    ap.add_argument("--proposed_method",   default=None)
+    ap.add_argument("--n_edges",           nargs="+", type=int, default=[1, 2, 3, 4, 5])
     ap.add_argument("--proposed_label",    default=None, help="The label of the proposed method for gap annotations")
     args = ap.parse_args()
 
     outdir  = Path(args.outdir)
-    csv_path = outdir / "heterogeneity.csv"
+    csv_path = outdir / "num_edge.csv"
     BASELINE_OFFLOAD = "delay_workload"
 
     with open(args.cfg) as f:
         cfg_orig = yaml.safe_load(f)
 
-    # Resolve Alphas
-    if args.alphas:
-        alphas = sorted(args.alphas)
-    else:
-        matrix_path = cfg_orig["globals"]["accuracy_matrix"]["path"]
-        with open(matrix_path) as f:
-            matrix_data = json.load(f)
-        alpha_set = set()
-        for key in matrix_data:
-            m = re.search(r'alpha([\d.]+)', key)
-            if m:
-                alpha_set.add(float(m.group(1)))
-        alphas = sorted(list(alpha_set))
-        if not alphas:
-            alphas = [0.2, 0.5, 1.0, 10.0, 100.0, 1000.0]
+    n_edges_list = sorted(args.n_edges)
 
     def _build_methods_display(raw_methods: list[str], offload_modes: list[str]) -> list[str]:
         proposed = args.proposed_method
@@ -574,49 +510,46 @@ def main():
 
     proposed_label = args.proposed_label
     if proposed_label is None and args.proposed_method is not None:
-        # Default to the most advanced proposed config (usually last)
         proposed_label = methods_display[-1]
 
     if args.dummy:
         print("[dummy mode] Generating synthetic data...")
-        data  = _make_dummy_data(methods_display, alphas)
-        means = {a: {label: _arrays_to_means(arrs) for label, arrs in data[a].items()} for a in alphas}
-        save_means_to_csv(means, methods_display, alphas, csv_path)
+        data  = _make_dummy_data(methods_display, n_edges_list)
+        means = {n: {label: _arrays_to_means(arrs) for label, arrs in data[n].items()} for n in n_edges_list}
+        save_means_to_csv(means, methods_display, n_edges_list, csv_path)
     else:
         accumulated_means: dict = {}
-        done_alphas: set[float] = set()
+        done_n_edges: set[int] = set()
         if csv_path.exists():
             try:
                 accumulated_means, _, _ = load_means_from_csv(csv_path)
-                for a in alphas:
-                    if _cell_is_complete(accumulated_means, a, methods_display):
-                        done_alphas.add(a)
-                if len(done_alphas) == len(alphas):
-                    print(f"[replot] All {len(alphas)} alphas complete in {csv_path} — skipping simulation.")
-                    plot_heterogeneity_bar(accumulated_means, methods_display, alphas, outdir / "heterogeneity_bar.png", proposed_label=proposed_label)
-                    plot_heterogeneity_line(accumulated_means, methods_display, alphas, outdir / "heterogeneity_line.png")
+                for n in n_edges_list:
+                    if _cell_is_complete(accumulated_means, n, methods_display):
+                        done_n_edges.add(n)
+                if len(done_n_edges) == len(n_edges_list):
+                    print(f"[replot] All {len(n_edges_list)} scaling steps complete in {csv_path} — skipping simulation.")
+                    plot_num_edge(accumulated_means, methods_display, n_edges_list, outdir / "num_edge.png", proposed_label=proposed_label)
                     return
-                elif done_alphas:
-                    print(f"[resume] {len(done_alphas)}/{len(alphas)} alphas already complete, resuming...")
+                elif done_n_edges:
+                    print(f"[resume] {len(done_n_edges)}/{len(n_edges_list)} scaling steps already complete, resuming...")
             except Exception as exc:
                 print(f"[warn] Could not load {csv_path}: {exc} — starting fresh")
                 accumulated_means = {}
-                done_alphas = set()
+                done_n_edges = set()
 
-        def _on_cell_done(alpha: float, cell_data: dict):
-            accumulated_means[alpha] = {
+        def _on_cell_done(n_edge: int, cell_data: dict):
+            accumulated_means[n_edge] = {
                 label: _arrays_to_means(arrays)
                 for label, arrays in cell_data.items()
             }
-            save_means_to_csv(accumulated_means, methods_display, alphas, csv_path)
-            n_done = sum(_cell_is_complete(accumulated_means, a, methods_display) for a in alphas)
-            print(f"[checkpoint] {n_done}/{len(alphas)} alphas saved (alpha={alpha} done)")
+            save_means_to_csv(accumulated_means, methods_display, n_edges_list, csv_path)
+            n_done = sum(_cell_is_complete(accumulated_means, n, methods_display) for n in n_edges_list)
+            print(f"[checkpoint] {n_done}/{len(n_edges_list)} steps saved (n_edge={n_edge} done)")
 
-        collect_data(args, alphas, done_alphas=done_alphas, cell_callback=_on_cell_done)
+        collect_data(args, n_edges_list, done_n_edges=done_n_edges, cell_callback=_on_cell_done)
         means = accumulated_means
 
-    plot_heterogeneity_bar(means, methods_display, alphas, outdir / "heterogeneity_bar.png", proposed_label=proposed_label)
-    plot_heterogeneity_line(means, methods_display, alphas, outdir / "heterogeneity_line.png")
+    plot_num_edge(means, methods_display, n_edges_list, outdir / "num_edge.png", proposed_label=proposed_label)
 
 
 if __name__ == "__main__":

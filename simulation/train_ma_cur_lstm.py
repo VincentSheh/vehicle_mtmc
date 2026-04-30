@@ -659,7 +659,9 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
             data = batch.view(B_env * E_edges, T_batch).contiguous() # [B_total, T]
 
             # ---- per-decision-step obs logging ----
-            _obs_log = data["observation"].float().cpu() # [B, T, obs_dim]
+            _obs_log = data["observation"].float().cpu() # [B, T, obs_dim], normalized
+            _norm = env.transform[-1]
+            _obs_log = _obs_log * _norm.scale.cpu() + _norm.loc.cpu()  # de-normalize
             _B_total, _T, _D = _obs_log.shape
             for _t in range(_T):
                 _step_log = {"decision_step": global_decision_step + _t}
@@ -764,9 +766,9 @@ if __name__ == "__main__":
 """
   Usage:                                                                                                                                                            
   # Phase 1 — single-edge pretraining                                                                                                                               
-  python train_ma_cur_lstm.py --cfg configs/simulation_0.yaml --train_cfg configs/train.yaml                                                                         
+  python train_indep_lstm.py --cfg configs/simulation_0.yaml --train_cfg configs/train.yaml                                                                         
                                                                                                                                                                     
   # Phase 2 — multi-edge fine-tuning                                                                                                                                
-  python train_ma_cur_lstm.py --cfg configs/simulation_ma_0.yaml --train_cfg configs/train.yaml \                                                                    
+  python train_indep_lstm.py --cfg configs/simulation_ma_0.yaml --train_cfg configs/train.yaml \                                                                    
     --resume_ckpt checkpoints/<phase1_run>/ckpt_best.pt  
 """
