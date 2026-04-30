@@ -53,11 +53,11 @@ DISPLAY_NAMES: Dict[str, str] = {
 }
 
 DEFAULT_METHODS = [
-    "no_ids",
-    "static_low",
-    "static_high",
-    "autoscale_def",
-    "offline_optimal",
+    # "no_ids",
+    # "static_low",
+    # "static_high",
+    # "autoscale_def",
+    # "offline_optimal",
 ]
 
 # (policy_key, offload_mode) pairs run for the proposed method

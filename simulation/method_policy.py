@@ -451,26 +451,27 @@ class MALSTMRLPolicy(BaselinePolicy):
     (SplitObsModule + LSTMModule + MergeModule + actor head).
 
     Builds per-edge observations directly from the environment history using the
-    same 12-feature layout used during training, runs a single forward pass for
-    all edges, and returns per-edge CPU targets.
+    same feature layout used during training (9 features for n_actions=3, 12 for
+    n_actions!=3), runs a single forward pass for all edges, and returns per-edge
+    CPU targets.
     """
-    # Obs layout matches IndepTorchRLEnvWrapper.obs_keys in train_ma_cur_lstm.py
-    _OBS_KEYS: List[str] = [
-        "local_num_req",          # 0  temporal
-        "attack_in_rate",         # 1  temporal
-        "ema_mom",                # 2
-        "cpu_to_ids_ratio",       # 3
-        "ids_cpu_utilization",    # 4
-        "neighbor_ids_util",      # 5
-        "neighbor_delta",         # 6
-        "neighbor_atk_rate",      # 7
-        "prev_slo_vio",           # 8
-        "transition_ticks_norm",  # 9
-        "delta_in_flight_norm",   # 10
-        "queue_ahead_norm",       # 11
-    ]
-    _OBS_DIM    = 12
     _N_TEMPORAL = 2   # first N_TEMPORAL_PER_EDGE features fed through LSTM
+
+    @staticmethod
+    def _make_obs_keys(n_actions: int) -> List[str]:
+        _ext = n_actions != 3
+        return [
+            "local_num_req",
+            "attack_in_rate",
+            "ema_mom",
+            "cpu_to_ids_ratio",
+            "ids_cpu_utilization",
+            "neighbor_ids_util",
+            *( ["neighbor_delta"] if _ext else [] ),
+            "neighbor_atk_rate",
+            "prev_slo_vio",
+            *( ["transition_ticks_norm", "delta_in_flight_norm", "queue_ahead_norm"] if _ext else [] ),
+        ]
 
     def __init__(self, ckpt_path: str, device: str = "cpu", greedy: bool = False):
         import torch
@@ -490,6 +491,9 @@ class MALSTMRLPolicy(BaselinePolicy):
         self.n_actions  = int(train_cfg["model"]["n_actions"])
         self.hidden_dim = hidden_dim
 
+        self._obs_keys = self._make_obs_keys(self.n_actions)
+        self._obs_dim  = len(self._obs_keys)
+
         obsnorm    = state.get("obsnorm", {})
         _LOC_KEY   = "transforms.2.loc"
         _SCALE_KEY = "transforms.2.scale"
@@ -497,7 +501,7 @@ class MALSTMRLPolicy(BaselinePolicy):
         self.n_edges = max(1, len(env_cfg.get("edge_areas", [])))
 
         temporal_idx = list(range(self._N_TEMPORAL))
-        static_idx   = list(range(self._N_TEMPORAL, self._OBS_DIM))
+        static_idx   = list(range(self._N_TEMPORAL, self._obs_dim))
         n_static     = len(static_idx)
 
         split_module = TensorDictModule(
@@ -508,6 +512,7 @@ class MALSTMRLPolicy(BaselinePolicy):
             input_size=self._N_TEMPORAL, hidden_size=hidden_dim,
             in_key="temporal_obs", out_key="lstm_out", device=str(self.device),
         )
+        print(f"[MALSTMRLPolicy] n_actions={self.n_actions}, obs_dim={self._obs_dim}, obs_keys={self._obs_keys}")
         merge_module = TensorDictModule(
             MergeModule(),
             in_keys=["lstm_out", "static_obs"], out_keys=["features_merged"],
@@ -564,7 +569,7 @@ class MALSTMRLPolicy(BaselinePolicy):
         env      = ctx.env
         n_edges  = len(ctx.ids_cpu)
         area_ids = [e.area_id for e in env.edge_areas]
-        obs      = np.zeros((n_edges, self._OBS_DIM), dtype=np.float32)
+        obs      = np.zeros((n_edges, self._obs_dim), dtype=np.float32)
 
         if not env.history:
             return obs.reshape(-1)
@@ -572,15 +577,16 @@ class MALSTMRLPolicy(BaselinePolicy):
         records = env.history[-ctx.decision_interval * n_edges:]
         df      = pd.DataFrame([m.__dict__ for m in records])
 
-        # Base 5 features from history (indices 0-4)
+        # Base 5 features from history
         BASE_KEYS = ["local_num_req", "attack_in_rate", "ema_mom", "cpu_to_ids_ratio", "ids_cpu_utilization"]
         for i, area_id in enumerate(area_ids):
             g = df[df["area_id"] == area_id]
             if g.empty:
                 continue
-            for j, k in enumerate(BASE_KEYS):
-                if k not in g.columns:
+            for k in BASE_KEYS:
+                if k not in g.columns or k not in self._obs_keys:
                     continue
+                j    = self._obs_keys.index(k)
                 vals = g[k].values
                 if k == "cpu_to_ids_ratio":
                     obs[i, j] = float(vals[-1])
@@ -590,7 +596,7 @@ class MALSTMRLPolicy(BaselinePolicy):
                 else:
                     obs[i, j] = float(np.mean(vals))
 
-        # Neighbor features: ids_util (5), delta (6), atk_rate (7)
+        # Neighbor features
         edge_ids_util: Dict[str, float] = {}
         edge_atk_rate: Dict[str, float] = {}
         for area_id in area_ids:
@@ -605,6 +611,7 @@ class MALSTMRLPolicy(BaselinePolicy):
                 edge_atk_rate[area_id] = float(np.mean(
                     g["attack_in_rate"].values if "attack_in_rate" in g.columns else [0.0]))
 
+        _has_delta = "neighbor_delta" in self._obs_keys
         for i, area_id in enumerate(area_ids):
             nbr_utils, nbr_deltas, nbr_atk = [], [], []
             for j in range(n_edges):
@@ -613,25 +620,28 @@ class MALSTMRLPolicy(BaselinePolicy):
                 nbr_utils.append(edge_ids_util[area_ids[j]])
                 nbr_atk.append(edge_atk_rate[area_ids[j]])
                 nbr_deltas.append(float(ctx.delta_in_flight_norm[j]))
-            obs[i, 5] = float(np.mean(nbr_utils))  if nbr_utils  else 0.0
-            obs[i, 6] = float(np.mean(nbr_deltas)) if nbr_deltas else 0.0
-            obs[i, 7] = float(np.mean(nbr_atk))    if nbr_atk    else 0.0
+            obs[i, self._obs_keys.index("neighbor_ids_util")] = float(np.mean(nbr_utils)) if nbr_utils else 0.0
+            obs[i, self._obs_keys.index("neighbor_atk_rate")] = float(np.mean(nbr_atk))   if nbr_atk   else 0.0
+            if _has_delta:
+                obs[i, self._obs_keys.index("neighbor_delta")] = float(np.mean(nbr_deltas)) if nbr_deltas else 0.0
 
-        # prev_slo_vio (index 8)
+        # prev_slo_vio
+        _slo_idx = self._obs_keys.index("prev_slo_vio")
         for i, area_id in enumerate(area_ids):
             g = df[df["area_id"] == area_id]
             if g.empty:
-                obs[i, 8] = 0.0
+                obs[i, _slo_idx] = 0.0
                 continue
             last_qoe  = float(g["qoe_mean"].values[-1]) if "qoe_mean" in g.columns else 0.0
             threshold = float(env.edge_areas[i].slo_threshold)
-            obs[i, 8] = 1.0 if last_qoe < threshold else 0.0
+            obs[i, _slo_idx] = 1.0 if last_qoe < threshold else 0.0
 
-        # Transition state (indices 9, 10, 11)
-        for i in range(n_edges):
-            obs[i, 9]  = float(ctx.transition_ticks_norm[i])
-            obs[i, 10] = float(ctx.delta_in_flight_norm[i])
-            obs[i, 11] = float(ctx.queue_ahead_norm[i]) if ctx.queue_ahead_norm is not None else 0.0
+        # Transition state (only present for n_actions != 3)
+        if "transition_ticks_norm" in self._obs_keys:
+            for i in range(n_edges):
+                obs[i, self._obs_keys.index("transition_ticks_norm")] = float(ctx.transition_ticks_norm[i])
+                obs[i, self._obs_keys.index("delta_in_flight_norm")]  = float(ctx.delta_in_flight_norm[i])
+                obs[i, self._obs_keys.index("queue_ahead_norm")]      = float(ctx.queue_ahead_norm[i]) if ctx.queue_ahead_norm is not None else 0.0
 
         return obs.reshape(-1).astype(np.float32)
 
@@ -639,8 +649,8 @@ class MALSTMRLPolicy(BaselinePolicy):
         if self.obs_loc is None:
             return obs_flat
         import torch
-        n_edges = len(obs_flat) // self._OBS_DIM
-        x     = torch.from_numpy(obs_flat).to(self.device).view(n_edges, self._OBS_DIM)
+        n_edges = len(obs_flat) // self._obs_dim
+        x     = torch.from_numpy(obs_flat).to(self.device).view(n_edges, self._obs_dim)
         loc   = self.obs_loc.view(-1)    # (obs_dim,) — broadcast over edges
         scale = self.obs_scale.view(-1)
         return ((x - loc) / (scale + 1e-8)).view(-1).cpu().numpy()
@@ -652,7 +662,7 @@ class MALSTMRLPolicy(BaselinePolicy):
         obs_flat = self._build_ma_obs(ctx)
         obs_norm = self._normalise(obs_flat)
 
-        obs_t = torch.from_numpy(obs_norm).float().to(self.device).view(n_edges, self._OBS_DIM)
+        obs_t = torch.from_numpy(obs_norm).float().to(self.device).view(n_edges, self._obs_dim)
 
         if self._h is None:
             self._h = torch.zeros(1, n_edges, self.hidden_dim, device=self.device)
