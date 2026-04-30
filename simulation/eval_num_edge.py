@@ -391,6 +391,10 @@ def plot_num_edge(
     cmap = plt.get_cmap("tab10")
     colors = {m: cmap(i % 10) for i, m in enumerate(methods_display)}
 
+    if not methods_display:
+        print("[warn] plot_num_edge: no methods to plot, skipping.")
+        return
+
     x = np.arange(len(n_edges_list))
     width = 0.8 / len(methods_display)
 
@@ -470,7 +474,7 @@ def main():
     ap.add_argument("--decision_interval", type=int,   default=None)
     ap.add_argument("--device",            default="cpu")
     ap.add_argument("--offload_modes",     nargs="+", default=None)
-    ap.add_argument("--proposed_method",   default=None)
+    ap.add_argument("--proposed_method",   default="lstm_rl")
     ap.add_argument("--n_edges",           nargs="+", type=int, default=[1, 2, 3, 4, 5])
     ap.add_argument("--proposed_label",    default=None, help="The label of the proposed method for gap annotations")
     args = ap.parse_args()
@@ -507,6 +511,12 @@ def main():
         methods.append(args.proposed_method)
     offload_modes = args.offload_modes or [cfg_orig["globals"].get("offload_mode", "balance")]
     methods_display = _build_methods_display(methods, offload_modes)
+
+    if not methods_display:
+        ap.error(
+            "No methods to evaluate. Pass --methods and/or --proposed_method, "
+            "or populate DEFAULT_METHODS in the script."
+        )
 
     proposed_label = args.proposed_label
     if proposed_label is None and args.proposed_method is not None:

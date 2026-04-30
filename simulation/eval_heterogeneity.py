@@ -63,6 +63,7 @@ DEFAULT_METHODS = [
 # (policy_key, offload_mode) pairs run for the proposed method
 PROPOSED_CONFIGS = [
     ("gm", "delay_workload"),
+    ("gm", "cto"),
     ("lm", "delay_workload"),
     ("lm", "cto"),
     ("lm", "cto_acc"),

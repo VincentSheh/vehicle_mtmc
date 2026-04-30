@@ -469,6 +469,9 @@ def run_episode(
         )
         cpu_util = _cpu_util(env, decision_interval)
 
+        queue_ahead_norm = np.clip(
+            (ids_cpu - ids_cpu_target) / max(max_delta, 1e-6), -1.0, 1.0
+        )
         ctx = ActContext(
             env=env,
             ids_cpu=ids_cpu.copy(),   # current queue position
@@ -480,6 +483,7 @@ def run_episode(
             transition_ticks_norm=ticks_norm,
             delta_in_flight_norm=dif_norm,
             obs_flat=obs_flat,
+            queue_ahead_norm=queue_ahead_norm,
         )
 
         ids_cpu_abs, delta = policy.act(ctx)

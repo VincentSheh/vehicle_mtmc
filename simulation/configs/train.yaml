@@ -18,7 +18,7 @@ logger:
   backend: wandb
   entity: asture123-national-taiwan-university
   project_name: multiedgeids
-  exp_name: phase1_act3
+  exp_name: ma_indep_act3_nodelta_u250
   plots:
     enabled: true
     out_dir: logs/wandb_plots
