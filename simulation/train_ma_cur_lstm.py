@@ -567,7 +567,7 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
         )
         
         env.transform.train()
-        env.transform[-1].init_stats(num_iter=100, reduce_dim=(0, 1, 2), cat_dim=0)
+        env.transform[-1].init_stats(num_iter=100, reduce_dim=(0, 1), cat_dim=0)
         env.transform.eval()
 
         split_module = TensorDictModule(
@@ -648,7 +648,7 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
             _norm.loc = torch.nn.UninitializedBuffer()
             _norm.scale = torch.nn.UninitializedBuffer()
             env.transform.train()
-            env.transform[-1].init_stats(num_iter=100, reduce_dim=(0, 1, 2), cat_dim=0)
+            env.transform[-1].init_stats(num_iter=100, reduce_dim=(0, 1), cat_dim=0)
             env.transform[-1].to(device)
             env.transform.eval()
             print(f"[resume] Loaded weights from {resume_ckpt}, re-initialized obsnorm")

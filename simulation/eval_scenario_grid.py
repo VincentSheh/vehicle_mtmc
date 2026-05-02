@@ -1,23 +1,5 @@
 """
 Evaluate baseline policies across 3 attack × 3 user levels and plot a 3×3 grid.
-
-Two plot versions are produced:
-  scenario_grid_by_user.png   — rows = attack level, x-axis = user level
-  scenario_grid_by_attack.png — rows = user level,   x-axis = attack level
-
-If scenario_grid.csv already exists in --outdir the simulation is skipped and
-the plots are regenerated from the saved values.
-
-Usage:
-    # Dummy mode — layout preview with random data
-    python eval_scenario_grid.py --dummy
-
-    # Real evaluation
-    python eval_scenario_grid.py --cfg configs/simulation_0.yaml --episodes 10
-
-    # Subset of methods
-    python eval_scenario_grid.py --methods no_ids autoscale_def lstm_rl --episodes 5
-   
 """
 from __future__ import annotations
 
@@ -27,7 +9,7 @@ import csv
 import os
 import tempfile
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import matplotlib
 matplotlib.use("Agg")
@@ -37,585 +19,187 @@ import numpy as np
 import yaml
 from tqdm import tqdm
 
-from method_policy import OFFLOAD_DISPLAY_NAMES, MODEL_DISPLAY_NAMES
+from environment import build_env_base
+from eval_common import (
+    BaseEvaluator, 
+    METRICS, 
+    PROPOSED_CONFIGS,
+    OFFLOAD_DISPLAY_NAMES,
+    MODEL_DISPLAY_NAMES
+)
 
 LEVELS = ["low", "mid", "high"]
 LEVEL_LABELS = {"low": "Low", "mid": "Mid", "high": "High"}
 
-METRICS = [
-    ("slo_vio",  "SLO Violation Rate"),
-    ("bcd",      "Benign Collateral Damage"),
-    ("atk_drop", "Attack Drop %"),
-    ("realloc",  "Avg. Reallocations"),
-]
+class ScenarioGridEvaluator(BaseEvaluator):
+    def mutate_cfg(self, cfg: dict, atk_lvl: str, user_lvl: str, offload_mode: str, acc_model: str) -> dict:
+        cfg_mut = copy.deepcopy(cfg)
+        cfg_mut["globals"]["attack_sampler"]["level"] = atk_lvl
+        cfg_mut["globals"]["user_sampler"]["synthetic"]["level"] = user_lvl
+        cfg_mut["globals"]["offload_mode"] = offload_mode
+        if "accuracy_matrix" in cfg_mut.get("globals", {}):
+            cfg_mut["globals"]["accuracy_matrix"]["model"] = acc_model
+        return cfg_mut
 
-DISPLAY_NAMES: Dict[str, str] = {
-    "no_ids":          "No IDS",
-    "static_low":      "Static Low",
-    "static_balanced": "Static Balanced",
-    "static_high":     "Static High",
-    "autoscale_app":   "Autoscale (App)",
-    "autoscale_def":   "Autoscale (Def)",
-    "offline_optimal": "TBSA Optimal",
-    "lstm_rl":         "LSTM RL",
-    "ma_lstm_rl":      "MA LSTM RL",
-    "gm":              "Global Model",
-    "lm":              "Local Model",
-}
+    def run(self):
+        methods = self.get_methods()
+        policies = self.build_policies(methods)
+        
+        cfg_offload_mode = self.cfg_original["globals"].get("offload_mode", "balance")
+        cfg_acc_model = self.cfg_original["globals"].get("accuracy_matrix", {}).get("model", "gm")
+        proposed_method = self.args.proposed_method
+        BASELINE_OFFLOAD = "delay_workload"
 
-
-DEFAULT_METHODS = [
-    "no_ids",
-    "static_low",
-    "static_high",
-    "autoscale_def",
-    "offline_optimal",
-    # "lstm_rl",
-]
-
-# (policy_key, offload_mode) pairs run for the proposed method
-PROPOSED_CONFIGS = [
-    ("gm", "delay_workload"),
-    ("lm", "delay_workload"),
-    ("lm", "cto"),
-    ("lm", "cto_acc"),
-]
-
-
-# ---------------------------------------------------------------------------
-# Metric extraction from raw arrays
-# ---------------------------------------------------------------------------
-
-def _extract_mean(arrays: Dict[str, np.ndarray], key: str, transform=None) -> float:
-    vals = arrays.get(key, np.array([], dtype=np.float32))
-    if transform is not None:
-        vals = transform(vals)
-    return float(np.mean(vals)) if vals.size > 0 else np.nan
-
-
-def _arrays_to_means(arrays: Dict[str, np.ndarray]) -> Dict[str, float]:
-    atk_in  = arrays.get("attack_in_rate",   np.array([], dtype=np.float32))
-    atk_drp = arrays.get("attack_drop_rate", np.array([], dtype=np.float32))
-    if atk_in.size > 0 and atk_drp.size == atk_in.size:
-        atk_pass = np.maximum(0.0, atk_in - atk_drp)
-        lres = np.divide(atk_pass, atk_in, out=np.zeros_like(atk_pass), where=atk_in > 1e-6)
-        attack_mask = atk_in > 1e-6
-        atk_drop_val = 1.0 - float(np.mean(lres[attack_mask])) if attack_mask.any() else 0.0
-    else:
-        atk_drop_val = np.nan
-
-    return {
-        "slo_vio":  _extract_mean(arrays, "qoe_vio_rate"),
-        "bcd":      _extract_mean(arrays, "reward_benign_col_dmg"),
-        "atk_drop": atk_drop_val,
-        "realloc":  _extract_mean(arrays, "reallocations"),
-    }
-
-
-# ---------------------------------------------------------------------------
-# Means dict helpers  (means[atk_lvl][user_lvl][method_label][metric_key])
-# ---------------------------------------------------------------------------
-
-def build_means_from_data(data: dict, methods_display: list[str]) -> dict:
-    means: dict = {}
-    for atk_lvl in LEVELS:
-        means[atk_lvl] = {}
-        for user_lvl in LEVELS:
-            means[atk_lvl][user_lvl] = {}
-            for method_label in methods_display:
-                arrays = data.get(atk_lvl, {}).get(user_lvl, {}).get(method_label, {})
-                means[atk_lvl][user_lvl][method_label] = _arrays_to_means(arrays)
-    return means
-
-
-def _cell_is_complete(means: dict, atk: str, user: str, methods_display: list[str]) -> bool:
-    cell = means.get(atk, {}).get(user, {})
-    return all(
-        all(
-            not np.isnan(cell.get(m, {}).get(mk, np.nan))
-            for mk, _ in METRICS
-        )
-        for m in methods_display
-    )
-
-
-def load_means_from_csv(path: Path) -> tuple[dict, list[str]]:
-    """Return (means dict, ordered list of method labels found in CSV)."""
-    means: dict = {a: {u: {} for u in LEVELS} for a in LEVELS}
-    method_order: list[str] = []
-    with open(path, newline="") as f:
-        for row in csv.DictReader(f):
-            atk, user, method, metric, value = (
-                row["atk_level"], row["user_level"],
-                row["method"], row["metric"], float(row["value"]),
-            )
-            if method not in method_order:
-                method_order.append(method)
-            means[atk][user].setdefault(method, {})[metric] = value
-    return means, method_order
-
-
-def save_means_to_csv(means: dict, methods_display: list[str], outpath: Path):
-    rows = []
-    metric_label_map = dict(METRICS)
-    for atk_lvl in LEVELS:
-        for user_lvl in LEVELS:
-            for method_label in methods_display:
-                m = means.get(atk_lvl, {}).get(user_lvl, {}).get(method_label, {})
-                for metric_key, metric_title in METRICS:
-                    rows.append({
-                        "atk_level":    atk_lvl,
-                        "user_level":   user_lvl,
-                        "method":       method_label,
-                        "metric":       metric_key,
-                        "metric_label": metric_title,
-                        "value":        m.get(metric_key, float("nan")),
-                    })
-    outpath.parent.mkdir(parents=True, exist_ok=True)
-    with open(outpath, "w", newline="") as f:
-        writer = csv.DictWriter(
-            f, fieldnames=["atk_level", "user_level", "method", "metric", "metric_label", "value"]
-        )
-        writer.writeheader()
-        writer.writerows(rows)
-    print(f"Saved: {outpath}")
-
-
-# ---------------------------------------------------------------------------
-# Dummy data generation
-# ---------------------------------------------------------------------------
-
-def _make_dummy_data(method_labels: list[str]) -> dict:
-    """Returns data[atk_lvl][user_lvl][method_label] = {raw_key: array}.
-    Accepts pre-built display labels (already include offload mode suffix when applicable).
-    """
-    rng = np.random.default_rng(0)
-    data: dict = {}
-    for i, atk_lvl in enumerate(LEVELS):
-        data[atk_lvl] = {}
-        for j, user_lvl in enumerate(LEVELS):
-            data[atk_lvl][user_lvl] = {}
-            for k, label in enumerate(method_labels):
-                n = 50
-                base_slo  = 0.05 + 0.15 * i + 0.05 * k + 0.03 * j
-                base_bcd  = 0.02 + 0.08 * i + 0.02 * k - 0.01 * j
-                base_drop = 0.90 - 0.10 * i - 0.05 * k + 0.03 * j
-                data[atk_lvl][user_lvl][label] = {
-                    "qoe_vio_rate":          np.clip(rng.normal(base_slo,        0.04, n), 0, 1   ).astype(np.float32),
-                    "reward_benign_col_dmg": np.clip(rng.normal(base_bcd,        0.02, n), 0, None).astype(np.float32),
-                    "reward_lambda_res":     np.clip(rng.normal(1.0 - base_drop, 0.04, n), 0, 1   ).astype(np.float32),
-                    "attack_in_rate":        np.ones(n, dtype=np.float32),
-                    "attack_drop_rate":      np.clip(rng.normal(base_drop,        0.04, n), 0, 1   ).astype(np.float32),
-                    "reallocations":         np.array([rng.uniform(2, 10) for _ in range(5)], dtype=np.float32),
-                }
-    return data
-
-
-# ---------------------------------------------------------------------------
-# Real evaluation
-# ---------------------------------------------------------------------------
-
-def _make_display_label(mname: str, offload_mode: str, show_offload: bool) -> str:
-    base = DISPLAY_NAMES.get(mname, mname)
-    if show_offload:
-        ol = OFFLOAD_DISPLAY_NAMES.get(offload_mode, offload_mode)
-        return f"{base} ({ol})"
-    return base
-
-
-def _make_proposed_display_label(model_key: str, offload_mode: str) -> str:
-    """Label for one of the proposed-method configs (always shows both model and offload)."""
-    base = MODEL_DISPLAY_NAMES.get(model_key, model_key)
-    ol   = OFFLOAD_DISPLAY_NAMES.get(offload_mode, offload_mode)
-    return f"{base} ({ol})"
-
-
-def collect_data(args, done_cells: set | None = None, cell_callback=None) -> dict:
-    from eval_baselines import run_episode
-    from environment import build_env_base
-    from train_sa_lstm import TorchRLEnvWrapper
-    from method_policy import make_baseline_policy
-
-    with open(args.cfg) as f:
-        cfg_original = yaml.safe_load(f)
-
-    base_seed = int(cfg_original["run"]["seed"])
-    np.random.seed(base_seed)
-
-    methods: list[str] = list(args.methods) if args.methods else list(DEFAULT_METHODS)
-    proposed_method: Optional[str] = getattr(args, "proposed_method", None)
-    if proposed_method is not None and proposed_method not in methods:
-        methods.append(proposed_method)
-
-    cfg_offload_mode = cfg_original["globals"].get("offload_mode", "balance")
-    cfg_acc_model    = cfg_original["globals"].get("accuracy_matrix", {}).get("model", "gm")
-    BASELINE_OFFLOAD = "delay_workload"
-
-    # Build (offload_mode, acc_model, policy_key, display_label) 4-tuples.
-    # Proposed method expands to PROPOSED_CONFIGS varying acc_model × offload_mode.
-    # All other methods use the config default acc_model + delay_workload.
-    if proposed_method is not None:
+        # Build runs: (policy_key, label, offload_mode, acc_model)
         runs = []
         for m in methods:
-            if m == proposed_method:
-                for acc_model, om in PROPOSED_CONFIGS:
-                    label = _make_proposed_display_label(acc_model, om)
-                    runs.append((om, acc_model, m, label))
+            if m not in policies: continue
+            if proposed_method and m == proposed_method:
+                for amod, om in PROPOSED_CONFIGS:
+                    runs.append((m, self.make_proposed_display_label(m, amod, om), om, amod))
             else:
-                label = _make_display_label(m, BASELINE_OFFLOAD, False)
-                runs.append((BASELINE_OFFLOAD, cfg_acc_model, m, label))
-    else:
-        offload_modes: list[str] = args.offload_modes if args.offload_modes else [cfg_offload_mode]
-        multi_offload = len(offload_modes) > 1
-        runs = [
-            (om, cfg_acc_model, m, _make_display_label(m, om, multi_offload))
-            for om in offload_modes
-            for m in methods
-        ]
+                runs.append((m, self.make_display_label(m, BASELINE_OFFLOAD, False), BASELINE_OFFLOAD, cfg_acc_model))
 
-    # Group by (offload_mode, acc_model) — each unique pair needs its own env.
-    env_groups: dict = {}
-    for om, acc_model, mname, label in runs:
-        env_groups.setdefault((om, acc_model), []).append((mname, label))
+        methods_display = [r[1] for r in runs]
+        csv_path = self.outdir / "scenario_grid.csv"
 
-    # Derive obs/reward params once from the original config
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as tmp_orig:
-        yaml.dump(cfg_original, tmp_orig)
-        tmp_orig_path = tmp_orig.name
-    try:
-        decision_interval = args.decision_interval or int(cfg_original["globals"]["decision_interval"])
-        _wrapper     = TorchRLEnvWrapper(cfg_path=tmp_orig_path, decision_interval=decision_interval, device="cpu")
-        obs_keys     = _wrapper.obs_keys
-        reward_alpha = _wrapper.reward_alpha
-        reward_beta  = _wrapper.reward_beta
-        reward_gamma = _wrapper.reward_gamma
-        reward_q_th  = _wrapper.reward_q_th
-        n_actions    = _wrapper.n_actions
-        del _wrapper
-    finally:
-        if os.path.exists(tmp_orig_path):
-            os.remove(tmp_orig_path)
+        if self.args.replot:
+            print(f"[replot] Loading data from {csv_path}...")
+            accumulated_means, _ = self._load_existing_results(csv_path, methods_display)
+            plot_grid(accumulated_means, methods_display, self.outdir / "scenario_grid_by_user.png", x_dim="user")
+            plot_grid(accumulated_means, methods_display, self.outdir / "scenario_grid_by_attack.png", x_dim="attack")
+            return
 
-    # Build policies once (env-independent)
-    all_policy_keys = list(dict.fromkeys(mname for _, _, mname, _ in runs))
-    policies: dict = {}
-    for mname in all_policy_keys:
-        tbsa_path = str(args.tbsa_table) if mname in ("tbsa", "offline_optimal") else None
-        ckpt      = args.ckpt            if mname in ("lstm_rl", "ma_lstm_rl") else None
-        ok_keys   = obs_keys             if mname == "lstm_rl" else None
+        accumulated_means, done_cells = self._load_existing_results(csv_path, methods_display)
+
+        if len(done_cells) == 9:
+            print(f"[replot] All 9 cells complete.")
+        else:
+            # Group by (om, acc_model)
+            groups = {}
+            for pkey, label, om, amod in runs:
+                groups.setdefault((om, amod), []).append((pkey, label))
+
+            for atk in LEVELS:
+                for user in LEVELS:
+                    if (atk, user) in done_cells: continue
+                    print(f"\n>>> Evaluating: atk={atk} user={user}")
+                    
+                    # Load what we have for this cell
+                    cell_means = accumulated_means[atk][user]
+
+                    for (om, amod), pkey_label_pairs in groups.items():
+                        # Skip env build if all methods in group are done
+                        if all(lbl in cell_means for _, lbl in pkey_label_pairs):
+                            continue
+
+                        cfg = self.mutate_cfg(self.cfg_original, atk, user, om, amod)
+                        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as tmp:
+                            yaml.dump(cfg, tmp)
+                            tmp_path = tmp.name
+                        try:
+                            env = build_env_base(tmp_path)
+                            for pkey, label in pkey_label_pairs:
+                                if label in cell_means:
+                                    print(f"  [skip] {label} (already in CSV)")
+                                    continue
+                                res, _ = self.run_simulation(env, cfg, policies[pkey], label)
+                                cell_means[label] = self.extract_metrics(res)
+                        finally:
+                            if os.path.exists(tmp_path): os.remove(tmp_path)
+                    
+                    accumulated_means[atk][user] = cell_means
+                    self._save_to_csv(csv_path, accumulated_means, methods_display)
+
+        plot_grid(accumulated_means, methods_display, self.outdir / "scenario_grid_by_user.png", x_dim="user")
+        plot_grid(accumulated_means, methods_display, self.outdir / "scenario_grid_by_attack.png", x_dim="attack")
+
+    def _load_existing_results(self, path, methods_display):
+        means = {a: {u: {} for u in LEVELS} for a in LEVELS}
+        done = set()
+        if not path.exists(): return means, done
         try:
-            policies[mname] = make_baseline_policy(
-                mname,
-                tbsa_table_path=tbsa_path,
-                ckpt_path=ckpt,
-                obs_keys=ok_keys,
-                device=args.device,
-            )
-        except (ValueError, FileNotFoundError) as exc:
-            print(f"[warn] Skipping '{mname}': {exc}")
+            with open(path, newline="") as f:
+                for row in csv.DictReader(f):
+                    atk, user, method, metric, value = row["atk_level"], row["user_level"], row["method"], row["metric"], float(row["value"])
+                    means[atk][user].setdefault(method, {})[metric] = value
+            for a in LEVELS:
+                for u in LEVELS:
+                    if all(m in means[a][u] and all(mk in means[a][u][m] for mk, _ in METRICS) for m in methods_display):
+                        done.add((a, u))
+        except Exception as e: print(f"[warn] Failed to load CSV: {e}")
+        return means, done
 
-    runs = [(om, acc_model, mname, label) for om, acc_model, mname, label in runs if mname in policies]
-    env_groups = {}
-    for om, acc_model, mname, label in runs:
-        env_groups.setdefault((om, acc_model), []).append((mname, label))
+    def _save_to_csv(self, path, means, methods_display):
+        rows = []
+        for a in LEVELS:
+            for u in LEVELS:
+                if not means[a][u]: continue
+                for m_label in methods_display:
+                    m_data = means[a][u].get(m_label, {})
+                    for mk, mt in METRICS:
+                        rows.append({"atk_level": a, "user_level": u, "method": m_label, "metric": mk, "metric_label": mt, "value": m_data.get(mk, np.nan)})
+        with open(path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["atk_level", "user_level", "method", "metric", "metric_label", "value"])
+            writer.writeheader()
+            writer.writerows(rows)
 
-    data: dict = {}
-    for atk_lvl in LEVELS:
-        data[atk_lvl] = {}
-        for user_lvl in LEVELS:
-            if done_cells and (atk_lvl, user_lvl) in done_cells:
-                print(f"\n[resume] Skipping {atk_lvl}/{user_lvl} (already complete)")
-                data[atk_lvl][user_lvl] = {}
-                continue
-
-            print(f"\n{'='*70}")
-            print(f" Evaluating: atk={atk_lvl}  user={user_lvl}")
-            print("="*70)
-
-            if not runs:
-                print("[warn] No valid methods, skipping.")
-                data[atk_lvl][user_lvl] = {}
-                continue
-
-            cell: dict = {}
-            last_ids_cpu: Dict[str, Optional[np.ndarray]] = {label: None for _, _, _, label in runs}
-
-            for (offload_mode, acc_model), method_label_pairs in env_groups.items():
-                cfg = copy.deepcopy(cfg_original)
-                cfg["globals"]["attack_sampler"]["level"] = atk_lvl
-                cfg["globals"]["user_sampler"]["synthetic"]["level"] = user_lvl
-                cfg["globals"]["offload_mode"] = offload_mode
-                if "accuracy_matrix" in cfg.get("globals", {}):
-                    cfg["globals"]["accuracy_matrix"]["model"] = acc_model
-
-                with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as tmp:
-                    yaml.dump(cfg, tmp)
-                    tmp_path = tmp.name
-
-                try:
-                    env = build_env_base(tmp_path)
-                    accumulated: Dict[str, Dict[str, np.ndarray]] = {label: {} for _, label in method_label_pairs}
-
-                    for ep in tqdm(range(args.episodes),
-                                   desc=f"episodes ({acc_model}/{offload_mode})"):
-                        ep_seed = base_seed + (ep + 1) * 1000
-                        for mname, label in method_label_pairs:
-                            ep_result, final_ids = run_episode(
-                                env=env,
-                                cfg=cfg,
-                                policy=policies[mname],
-                                obs_keys=obs_keys,
-                                decision_interval=decision_interval,
-                                scale_step=args.scale_step,
-                                n_actions=n_actions,
-                                ids_cpu_min=args.ids_cpu_min,
-                                seed=ep_seed,
-                                reward_alpha=reward_alpha,
-                                reward_beta=reward_beta,
-                                reward_gamma=reward_gamma,
-                                reward_q_th=reward_q_th,
-                                initial_ids_cpu=last_ids_cpu[label],
-                            )
-                            last_ids_cpu[label] = final_ids
-
-                            ep_ratios = ep_result["cpu_to_ids_ratio"]
-                            realloc_count = 0
-                            if ep_ratios.size > 1:
-                                realloc_count = np.sum(np.abs(np.diff(ep_ratios)) > 1e-6)
-                            ep_result["reallocations"] = np.array([realloc_count], dtype=np.float32)
-
-                            for k, v in ep_result.items():
-                                if k not in accumulated[label]:
-                                    accumulated[label][k] = v
-                                else:
-                                    accumulated[label][k] = np.concatenate([accumulated[label][k], v], axis=0)
-
-                    for _, label in method_label_pairs:
-                        cell[label] = accumulated[label]
-
-                finally:
-                    if os.path.exists(tmp_path):
-                        os.remove(tmp_path)
-
-            data[atk_lvl][user_lvl] = cell
-            if cell_callback is not None:
-                cell_callback(atk_lvl, user_lvl, cell)
-
-    return data
-
-
-# ---------------------------------------------------------------------------
-# Plotting
-# ---------------------------------------------------------------------------
-
-def plot_grid(
-    means: dict,
-    methods_display: list[str],
-    outpath: Path,
-    x_dim: str,          # "user" or "attack"
-):
-    """
-    x_dim="user":   rows = attack levels, x-axis = user levels
-    x_dim="attack": rows = user levels,   x-axis = attack levels
-    """
+def plot_grid(means, methods_display, outpath, x_dim):
     if x_dim == "user":
         row_levels, x_levels = LEVELS, LEVELS
         row_prefix, x_label  = "Atk:", "User Level"
-        get_val = lambda means, row_lvl, x_lvl, mk: (
-            means.get(row_lvl, {}).get(x_lvl, {}).get(method_label, {}).get(mk, np.nan)
-        )
+        get_val = lambda m, r, x, mk: m.get(r, {}).get(x, {}).get(method_label, {}).get(mk, np.nan)
     else:
         row_levels, x_levels = LEVELS, LEVELS
         row_prefix, x_label  = "User:", "Attack Level"
-        get_val = lambda means, row_lvl, x_lvl, mk: (
-            means.get(x_lvl, {}).get(row_lvl, {}).get(method_label, {}).get(mk, np.nan)
-        )
+        get_val = lambda m, r, x, mk: m.get(x, {}).get(r, {}).get(method_label, {}).get(mk, np.nan)
 
     n_rows, n_cols = len(row_levels), len(METRICS)
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 4 * n_rows),
-                             sharex=False, squeeze=False)
-
-    cmap = plt.get_cmap("tab10")
-    colors    = {m: cmap(i % 10) for i, m in enumerate(methods_display)}
-    markers   = ["o", "s", "^", "D", "v", "P", "*", "X"]
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 4 * n_rows), squeeze=False)
+    colors = {m: plt.cm.tab10(i % 10) for i, m in enumerate(methods_display)}
+    markers = ["o", "s", "^", "D", "v", "P", "*", "X"]
     marker_map = {m: markers[i % len(markers)] for i, m in enumerate(methods_display)}
-
-    x_pos    = np.arange(len(x_levels))
-    x_labels = [LEVEL_LABELS[l] for l in x_levels]
+    x_pos = np.arange(len(x_levels))
 
     for row_i, row_lvl in enumerate(row_levels):
-        for col_j, (metric_key, metric_title) in enumerate(METRICS):
+        for col_j, (mk, mt) in enumerate(METRICS):
             ax = axes[row_i][col_j]
-
             for method_label in methods_display:
-                vals = [get_val(means, row_lvl, x_lvl, metric_key) for x_lvl in x_levels]
-                ax.plot(
-                    x_pos, vals,
-                    f"-{marker_map[method_label]}",
-                    color=colors[method_label],
-                    label=method_label,
-                    linewidth=1.5,
-                    markersize=6,
-                )
-
+                vals = [get_val(means, row_lvl, xl, mk) for xl in x_levels]
+                ax.plot(x_pos, vals, f"-{marker_map[method_label]}", color=colors[method_label], label=method_label, linewidth=1.5, markersize=6)
+            
             ax.set_xticks(x_pos)
-            ax.set_xticklabels(x_labels)
-            ax.set_xlim(-0.4, len(x_levels) - 0.6)
-
-            if metric_key in ("slo_vio", "atk_drop"):
-                ax.yaxis.set_major_formatter(
-                    matplotlib.ticker.PercentFormatter(xmax=1.0, decimals=0)
-                )
-
-            if row_i == 0:
-                ax.set_title(metric_title, fontsize=12, fontweight="bold")
-            if col_j == 0:
-                ax.set_ylabel(f"{row_prefix} {LEVEL_LABELS[row_lvl]}", fontsize=11)
-            if row_i == n_rows - 1:
-                ax.set_xlabel(x_label, fontsize=10)
-
+            ax.set_xticklabels([LEVEL_LABELS[l] for l in x_levels])
+            if mk in ("slo_vio", "atk_drop"): ax.yaxis.set_major_formatter(matplotlib.ticker.PercentFormatter(xmax=1.0, decimals=0))
+            if row_i == 0: ax.set_title(mt, fontsize=12, fontweight="bold")
+            if col_j == 0: ax.set_ylabel(f"{row_prefix} {LEVEL_LABELS[row_lvl]}", fontsize=11)
+            if row_i == n_rows - 1: ax.set_xlabel(x_label, fontsize=10)
             ax.grid(axis="y", linestyle="--", alpha=0.4)
-            ax.spines["top"].set_visible(False)
-            ax.spines["right"].set_visible(False)
 
-    handles, labels = axes[0][0].get_legend_handles_labels()
-    fig.legend(
-        handles, labels,
-        loc="center right",
-        bbox_to_anchor=(1.0, 0.5),
-        frameon=True,
-        fontsize=10,
-        title="Method",
-        title_fontsize=10,
-    )
-
-    title = (
-        "Performance vs User Level (per Attack Level)"
-        if x_dim == "user"
-        else "Performance vs Attack Level (per User Level)"
-    )
-    fig.suptitle(title, fontsize=14, fontweight="bold", y=1.01)
-    fig.tight_layout(rect=[0, 0, 0.84, 1.0])
-
-    outpath.parent.mkdir(parents=True, exist_ok=True)
+    fig.legend(*axes[0][0].get_legend_handles_labels(), loc="center right", bbox_to_anchor=(1.0, 0.5), title="Method")
+    plt.tight_layout(rect=[0, 0, 0.84, 1.0])
     fig.savefig(outpath, dpi=150, bbox_inches="tight")
-    print(f"Saved: {outpath}")
-    plt.close(fig)
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+    plt.close()
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--cfg",               default="configs/simulation_ma_0.yaml")
-    ap.add_argument("--methods",           nargs="+", default=None)
-    ap.add_argument("--episodes",          type=int,   default=10)
-    ap.add_argument("--outdir",            default="eval_out/scenario_grid")
-    ap.add_argument("--dummy",             action="store_true",
-                    help="Use random data; skip simulation for layout verification")
-    ap.add_argument("--ckpt",              default="checkpoints/_singleedge/a4_sf20_atk3_a18_default_default/ckpt_best.pt")
-    ap.add_argument("--tbsa_table",        default="tbsa_table.npz")
-    ap.add_argument("--ids_cpu_min",       type=float, default=0.5)
-    ap.add_argument("--scale_step",        type=float, default=0.5)
-    ap.add_argument("--decision_interval", type=int,   default=None)
-    ap.add_argument("--device",            default="cpu")
-    ap.add_argument("--offload_modes",     nargs="+", default=None,
-                    help="Offload modes to compare (ignored when --proposed_method is set; "
-                         "proposed method always runs gm+delay_workload, lm+delay_workload, lm+cto, lm+cto_acc). "
-                         "Defaults to the value in the config file.")
-    ap.add_argument("--proposed_method",   default=None,
-                    help="Method treated as the proposed approach; expanded to 4 configs: "
-                         "gm+delay_workload, lm+delay_workload, lm+cto, lm+cto_acc. "
-                         "All other methods use delay_workload.")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--cfg", default="configs/simulation_ma_0.yaml")
+    ap.add_argument("--methods", nargs="+", default=None)
+    ap.add_argument("--episodes", type=int, default=10)
+    ap.add_argument("--outdir", default="eval_out/scenario_grid")
+    ap.add_argument("--ckpt", default="checkpoints/_singleedge/a4_sf20_atk3_a18_default_default/ckpt_best.pt")
+    ap.add_argument("--tbsa_table", default="tbsa_table.npz")
+    ap.add_argument("--ids_cpu_min", type=float, default=0.5)
+    ap.add_argument("--scale_step", type=float, default=0.5)
+    ap.add_argument("--decision_interval", type=int, default=None)
+    ap.add_argument("--device", default="cpu")
+    ap.add_argument("--offload_modes", nargs="+", default=None)
+    ap.add_argument("--proposed_method", default=None)
+    ap.add_argument("--replot", action="store_true")
     args = ap.parse_args()
 
-    outdir  = Path(args.outdir)
-    csv_path = outdir / "scenario_grid.csv"
-
-    BASELINE_OFFLOAD = "delay_workload"
-
-    def _build_methods_display(raw_methods: list[str], offload_modes: list[str]) -> list[str]:
-        proposed = args.proposed_method
-        if proposed is not None:
-            labels = []
-            for m in raw_methods:
-                if m == proposed:
-                    for model_key, om in PROPOSED_CONFIGS:
-                        labels.append(_make_proposed_display_label(model_key, om))
-                else:
-                    labels.append(_make_display_label(m, BASELINE_OFFLOAD, False))
-            return labels
-        multi_offload = len(offload_modes) > 1
-        return [
-            _make_display_label(m, om, multi_offload)
-            for om in offload_modes
-            for m in raw_methods
-        ]
-
-    if args.dummy:
-        print("[dummy mode] Generating synthetic data for layout preview...")
-        methods = list(args.methods) if args.methods else list(DEFAULT_METHODS)
-        if args.proposed_method and args.proposed_method not in methods:
-            methods.append(args.proposed_method)
-        offload_modes = args.offload_modes or ["balance"]
-        methods_display = _build_methods_display(methods, offload_modes)
-        data  = _make_dummy_data(methods_display)
-        means = build_means_from_data(data, methods_display)
-        save_means_to_csv(means, methods_display, csv_path)
-
-    else:
-        methods = list(args.methods) if args.methods else list(DEFAULT_METHODS)
-        if args.proposed_method and args.proposed_method not in methods:
-            methods.append(args.proposed_method)
-        with open(args.cfg) as _f:
-            _cfg_orig = yaml.safe_load(_f)
-        offload_modes = args.offload_modes or [_cfg_orig["globals"].get("offload_mode", "balance")]
-        methods_display = _build_methods_display(methods, offload_modes)
-
-        # Load partial results and find which cells are already complete
-        accumulated_means: dict = {a: {u: {} for u in LEVELS} for a in LEVELS}
-        done_cells: set = set()
-        if csv_path.exists():
-            try:
-                accumulated_means, _ = load_means_from_csv(csv_path)
-                for atk in LEVELS:
-                    for user in LEVELS:
-                        if _cell_is_complete(accumulated_means, atk, user, methods_display):
-                            done_cells.add((atk, user))
-                if len(done_cells) == 9:
-                    print(f"[replot] All 9 cells complete in {csv_path} — skipping simulation.")
-                    means = accumulated_means
-                    plot_grid(means, methods_display, outdir / "scenario_grid_by_user.png",   x_dim="user")
-                    plot_grid(means, methods_display, outdir / "scenario_grid_by_attack.png", x_dim="attack")
-                    return
-                elif done_cells:
-                    print(f"[resume] {len(done_cells)}/9 cells already complete, resuming...")
-            except Exception as exc:
-                print(f"[warn] Could not load {csv_path}: {exc} — starting fresh")
-                accumulated_means = {a: {u: {} for u in LEVELS} for a in LEVELS}
-                done_cells = set()
-
-        def _on_cell_done(atk_lvl: str, user_lvl: str, cell_data: dict):
-            accumulated_means[atk_lvl][user_lvl] = {
-                label: _arrays_to_means(arrays)
-                for label, arrays in cell_data.items()
-            }
-            save_means_to_csv(accumulated_means, methods_display, csv_path)
-            n_done = sum(
-                _cell_is_complete(accumulated_means, a, u, methods_display)
-                for a in LEVELS for u in LEVELS
-            )
-            print(f"[checkpoint] {n_done}/9 cells saved ({atk_lvl}/{user_lvl} done)")
-
-        collect_data(args, done_cells=done_cells, cell_callback=_on_cell_done)
-        means = accumulated_means
-
-    plot_grid(means, methods_display, outdir / "scenario_grid_by_user.png",   x_dim="user")
-    plot_grid(means, methods_display, outdir / "scenario_grid_by_attack.png", x_dim="attack")
-
+    evaluator = ScenarioGridEvaluator(args)
+    evaluator.run()
 
 if __name__ == "__main__":
     main()

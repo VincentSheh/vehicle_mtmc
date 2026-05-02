@@ -53,6 +53,7 @@ class ActContext:
     delta_in_flight_norm: np.ndarray     # shape (n_edges,)
     obs_flat: Optional[np.ndarray] = None  # pre-built normalised obs for RL policies
     queue_ahead_norm: Optional[np.ndarray] = None  # (ids_cpu - ids_cpu_target) / max_delta, shape (n_edges,)
+    cpu_utils: Optional[np.ndarray] = None # per-edge CPU utilisation, shape (n_edges,)
 
 
 # ---------------------------------------------------------------------------
@@ -121,12 +122,14 @@ class ReactivePolicy(BaselinePolicy):
 
     def act(self, ctx: ActContext) -> tuple[Optional[np.ndarray], np.ndarray]:
         n_edges = len(ctx.ids_cpu)
-        if ctx.cpu_util >= self.high_threshold:
-            delta = np.ones(n_edges, dtype=np.int64)
-        elif ctx.cpu_util <= self.low_threshold:
-            delta = -np.ones(n_edges, dtype=np.int64)
-        else:
-            delta = np.zeros(n_edges, dtype=np.int64)
+        utils = ctx.cpu_utils if ctx.cpu_utils is not None else np.full(n_edges, ctx.cpu_util)
+        
+        delta = np.zeros(n_edges, dtype=np.int64)
+        for i in range(n_edges):
+            if utils[i] >= self.high_threshold:
+                delta[i] = 1
+            elif utils[i] <= self.low_threshold:
+                delta[i] = -1
         return None, delta
 
 
@@ -140,20 +143,22 @@ class AppAutoscalePolicy(BaselinePolicy):
 
     def act(self, ctx: ActContext) -> tuple[Optional[np.ndarray], np.ndarray]:
         import pandas as pd
-        n   = len(ctx.ids_cpu)
-        env = ctx.env
-        va_util = 0.0
+        n_edges = len(ctx.ids_cpu)
+        env     = ctx.env
+        delta   = np.zeros(n_edges, dtype=np.int64)
+        
         if env.history:
-            records = env.history[-ctx.decision_interval * n:]
+            records = env.history[-ctx.decision_interval * n_edges:]
             df = pd.DataFrame([m.__dict__ for m in records])
             if "va_cpu_utilization" in df.columns:
-                va_util = float(np.mean(df["va_cpu_utilization"].values))
-        if va_util >= self.high_threshold:
-            delta = np.ones(n, dtype=np.int64)
-        elif va_util <= self.low_threshold:
-            delta = -np.ones(n, dtype=np.int64)
-        else:
-            delta = np.zeros(n, dtype=np.int64)
+                for i, edge in enumerate(env.edge_areas):
+                    g = df[df["area_id"] == edge.area_id]
+                    if g.empty: continue
+                    va_util = float(np.mean(g["va_cpu_utilization"].values))
+                    if va_util >= self.high_threshold:
+                        delta[i] = 1
+                    elif va_util <= self.low_threshold:
+                        delta[i] = -1
         return None, delta
 
 
@@ -165,23 +170,28 @@ class TBSAWrapperPolicy(BaselinePolicy):
         self._tbsa = tbsa
 
     def act(self, ctx: ActContext) -> tuple[Optional[np.ndarray], np.ndarray]:
+        import pandas as pd
         n_edges = len(ctx.ids_cpu)
         env = ctx.env
+        ids_cpu_abs = np.empty(n_edges, dtype=np.float32)
 
         if env.history:
-            last_records = env.history[-n_edges:]
-            last_attack = float(np.mean([r.attack_drop_rate for r in last_records]))
-            last_req = float(np.mean([r.local_num_req for r in last_records]))
-        else:
-            last_attack = 0.0
-            last_req = 0.0
+            records = env.history[-ctx.decision_interval * n_edges:]
+            df = pd.DataFrame([m.__dict__ for m in records])
+            for i, edge in enumerate(env.edge_areas):
+                g = df[df["area_id"] == edge.area_id]
+                if g.empty:
+                    last_attack, last_req = 0.0, 0.0
+                else:
+                    last_attack = float(np.mean(g["attack_drop_rate"].values if "attack_drop_rate" in g.columns else [0.0]))
+                    last_req    = float(np.mean(g["local_num_req"].values if "local_num_req" in g.columns else [0.0]))
 
-        target_cpu = self._tbsa.select_ids_cpu(last_attack, last_req)
-        ids_cpu_abs = np.clip(
-            np.full(n_edges, target_cpu, dtype=np.float32),
-            ctx.ids_cpu_min,
-            ctx.ids_cpu_max,
-        )
+                target_cpu = self._tbsa.select_ids_cpu(last_attack, last_req)
+                ids_cpu_abs[i] = np.clip(target_cpu, ctx.ids_cpu_min, ctx.ids_cpu_max[i])
+        else:
+            # Initial step or empty history
+            ids_cpu_abs = np.clip(np.full(n_edges, 0.5, dtype=np.float32), ctx.ids_cpu_min, ctx.ids_cpu_max)
+
         return ids_cpu_abs, np.zeros(n_edges, dtype=np.int64)
 
 
@@ -483,6 +493,7 @@ class MALSTMRLPolicy(BaselinePolicy):
         self.device     = torch.device(device)
         self.greedy     = greedy
         self.scale_step = 0.5
+        self.is_phase1  = "phase1" in str(ckpt_path).lower()
 
         state     = torch.load(ckpt_path, map_location=self.device, weights_only=False)
         train_cfg = state["train_cfg"]
@@ -491,8 +502,56 @@ class MALSTMRLPolicy(BaselinePolicy):
         self.n_actions  = int(train_cfg["model"]["n_actions"])
         self.hidden_dim = hidden_dim
 
-        self._obs_keys = self._make_obs_keys(self.n_actions)
-        self._obs_dim  = len(self._obs_keys)
+        # Robustly remap policy weights to handle nested sequential/PA prefixes.
+        # Checkpoint (from train_ma_cur_lstm.py) uses: PA(TDS(shared_core, actor_head))
+        # where shared_core is another TDS(split, lstm, merge).
+        # Sample checkpoint key: module.0.module.0.module.0.module.t_idx
+        # Target actor_core key: module.0.module.t_idx
+        policy_sd = state["policy"]
+        core_sd = {}
+        head_sd = {}
+        for k, v in policy_sd.items():
+            if k.startswith("module.0.module.0."):
+                # Core keys: strip the PA and outer TDS prefix
+                nk = k[len("module.0.module.0."):]
+                core_sd[nk] = v
+            elif k.startswith("module.0.module.1.module."):
+                # Head keys: strip the PA, outer TDS, and TDM prefixes
+                nk = k[len("module.0.module.1.module."):]
+                head_sd[nk] = v
+            elif k.startswith("module.1.module."): # fallback for single-nested PA
+                nk = k[len("module.1.module."):]
+                head_sd[nk] = v
+            elif k.startswith("module.0."): # fallback for single-nested PA
+                nk = k[len("module.0."):]
+                core_sd[nk] = v
+
+        _head_w = head_sd.get("weight")
+        if _head_w is not None:
+            # actor head shape: (n_actions, hidden_dim + n_static)
+            obs_dim_from_weights = self._N_TEMPORAL + (int(_head_w.shape[1]) - hidden_dim)
+            # find the obs_keys layout whose length matches
+            _matched = False
+            for _na in (3, 5, 7, 9):
+                _cand = self._make_obs_keys(_na)
+                if len(_cand) == obs_dim_from_weights:
+                    self._obs_keys = _cand
+                    self._obs_dim  = obs_dim_from_weights
+                    _matched = True
+                    break
+            if not _matched:
+                # unknown layout — fall back to n_actions from train_cfg
+                self._obs_keys = self._make_obs_keys(self.n_actions)
+                self._obs_dim  = len(self._obs_keys)
+                print(f"[MALSTMRLPolicy] WARNING: actor head implies obs_dim={obs_dim_from_weights} "
+                      f"but no known layout matches; falling back to n_actions={self.n_actions}")
+            elif obs_dim_from_weights != len(self._make_obs_keys(self.n_actions)):
+                print(f"[MALSTMRLPolicy] train_cfg n_actions={self.n_actions} implies obs_dim="
+                      f"{len(self._make_obs_keys(self.n_actions))}, but actor head implies "
+                      f"obs_dim={obs_dim_from_weights}; using weights")
+        else:
+            self._obs_keys = self._make_obs_keys(self.n_actions)
+            self._obs_dim  = len(self._obs_keys)
 
         obsnorm    = state.get("obsnorm", {})
         _LOC_KEY   = "transforms.2.loc"
@@ -520,19 +579,9 @@ class MALSTMRLPolicy(BaselinePolicy):
         self.actor_core = TensorDictSequential(split_module, lstm, merge_module).to(self.device)
         self.actor_head = nn.Linear(hidden_dim + n_static, self.n_actions).to(self.device)
 
-        # Checkpoint produced by train_ma_cur_lstm.py:
-        #   ProbabilisticActor(TDS(shared_core, actor_head)).state_dict()
-        #     "module.0.*"        (shared_core = TDS(split, lstm, merge))
-        #     "module.1.module.*" (actor head TDM's inner nn.Linear)
-        policy_sd = state["policy"]
-        CORE_PFX  = "module.0."
-        HEAD_PFX  = "module.1.module."
-        core_sd = {k[len(CORE_PFX):]: v for k, v in policy_sd.items() if k.startswith(CORE_PFX)}
-        head_sd = {k[len(HEAD_PFX):]: v for k, v in policy_sd.items() if k.startswith(HEAD_PFX)}
-
         if not core_sd:
             prefixes = sorted({".".join(k.split(".")[:2]) for k in policy_sd.keys()})
-            print(f"[MALSTMRLPolicy] WARNING: no keys matched core prefix '{CORE_PFX}'; "
+            print(f"[MALSTMRLPolicy] WARNING: no core keys matched (shared_core prefix 'module.0.'); "
                   f"found prefixes: {prefixes}")
 
         missing, unexpected = self.actor_core.load_state_dict(core_sd, strict=False)
@@ -551,7 +600,14 @@ class MALSTMRLPolicy(BaselinePolicy):
         if _LOC_KEY in obsnorm and _SCALE_KEY in obsnorm:
             self.obs_loc   = obsnorm[_LOC_KEY].detach().to(self.device)
             self.obs_scale = obsnorm[_SCALE_KEY].detach().to(self.device)
-            print(f"[MALSTMRLPolicy] ObsNorm loaded: numel={self.obs_loc.numel()}, n_edges={self.n_edges}")
+            _numel = self.obs_loc.numel()
+            if _numel == 1:
+                print(f"[MALSTMRLPolicy] ObsNorm loaded: scalar stats (reduce_dim=(0,1,2) training), broadcasting over obs_dim={self._obs_dim}")
+            elif _numel == self._obs_dim:
+                print(f"[MALSTMRLPolicy] ObsNorm loaded: per-feature stats, obs_dim={self._obs_dim}")
+            else:
+                print(f"[MALSTMRLPolicy] WARNING: obs_loc numel={_numel} != obs_dim={self._obs_dim} "
+                      f"— stale checkpoint from different obs layout; normalisation will be skipped")
         else:
             print("[MALSTMRLPolicy] WARNING: no obsnorm found — running WITHOUT normalisation")
 
@@ -597,33 +653,42 @@ class MALSTMRLPolicy(BaselinePolicy):
                     obs[i, j] = float(np.mean(vals))
 
         # Neighbor features
-        edge_ids_util: Dict[str, float] = {}
-        edge_atk_rate: Dict[str, float] = {}
-        for area_id in area_ids:
-            g = df[df["area_id"] == area_id]
-            if g.empty:
-                edge_ids_util[area_id] = 0.0
-                edge_atk_rate[area_id] = 0.0
-            else:
-                edge_ids_util[area_id] = float(np.clip(
-                    np.mean(g["ids_cpu_utilization"].values if "ids_cpu_utilization" in g.columns else [0.0]),
-                    0.0, 1.0))
-                edge_atk_rate[area_id] = float(np.mean(
-                    g["attack_in_rate"].values if "attack_in_rate" in g.columns else [0.0]))
+        if self.is_phase1:
+            # Phase 1 models were trained in single-edge envs where neighbor features were always 0.
+            # When evaluating in multi-edge, we zero them out to avoid "observation noise" 
+            # that the policy hasn't seen before.
+            obs[:, self._obs_keys.index("neighbor_ids_util")] = 0.0
+            obs[:, self._obs_keys.index("neighbor_atk_rate")] = 0.0
+            if "neighbor_delta" in self._obs_keys:
+                obs[:, self._obs_keys.index("neighbor_delta")] = 0.0
+        else:
+            edge_ids_util: Dict[str, float] = {}
+            edge_atk_rate: Dict[str, float] = {}
+            for area_id in area_ids:
+                g = df[df["area_id"] == area_id]
+                if g.empty:
+                    edge_ids_util[area_id] = 0.0
+                    edge_atk_rate[area_id] = 0.0
+                else:
+                    edge_ids_util[area_id] = float(np.clip(
+                        np.mean(g["ids_cpu_utilization"].values if "ids_cpu_utilization" in g.columns else [0.0]),
+                        0.0, 1.0))
+                    edge_atk_rate[area_id] = float(np.mean(
+                        g["attack_in_rate"].values if "attack_in_rate" in g.columns else [0.0]))
 
-        _has_delta = "neighbor_delta" in self._obs_keys
-        for i, area_id in enumerate(area_ids):
-            nbr_utils, nbr_deltas, nbr_atk = [], [], []
-            for j in range(n_edges):
-                if j == i:
-                    continue
-                nbr_utils.append(edge_ids_util[area_ids[j]])
-                nbr_atk.append(edge_atk_rate[area_ids[j]])
-                nbr_deltas.append(float(ctx.delta_in_flight_norm[j]))
-            obs[i, self._obs_keys.index("neighbor_ids_util")] = float(np.mean(nbr_utils)) if nbr_utils else 0.0
-            obs[i, self._obs_keys.index("neighbor_atk_rate")] = float(np.mean(nbr_atk))   if nbr_atk   else 0.0
-            if _has_delta:
-                obs[i, self._obs_keys.index("neighbor_delta")] = float(np.mean(nbr_deltas)) if nbr_deltas else 0.0
+            _has_delta = "neighbor_delta" in self._obs_keys
+            for i, area_id in enumerate(area_ids):
+                nbr_utils, nbr_deltas, nbr_atk = [], [], []
+                for j in range(n_edges):
+                    if j == i:
+                        continue
+                    nbr_utils.append(edge_ids_util[area_ids[j]])
+                    nbr_atk.append(edge_atk_rate[area_ids[j]])
+                    nbr_deltas.append(float(ctx.delta_in_flight_norm[j]))
+                obs[i, self._obs_keys.index("neighbor_ids_util")] = float(np.mean(nbr_utils)) if nbr_utils else 0.0
+                obs[i, self._obs_keys.index("neighbor_atk_rate")] = float(np.mean(nbr_atk))   if nbr_atk   else 0.0
+                if _has_delta:
+                    obs[i, self._obs_keys.index("neighbor_delta")] = float(np.mean(nbr_deltas)) if nbr_deltas else 0.0
 
         # prev_slo_vio
         _slo_idx = self._obs_keys.index("prev_slo_vio")
@@ -651,8 +716,12 @@ class MALSTMRLPolicy(BaselinePolicy):
         import torch
         n_edges = len(obs_flat) // self._obs_dim
         x     = torch.from_numpy(obs_flat).to(self.device).view(n_edges, self._obs_dim)
-        loc   = self.obs_loc.view(-1)    # (obs_dim,) — broadcast over edges
+        loc   = self.obs_loc.view(-1)    # (obs_dim,) or scalar — both broadcast over edges
         scale = self.obs_scale.view(-1)
+        # numel==1: scalar stats from reduce_dim=(0,1,2) training — broadcast is correct.
+        # numel!=1 and !=obs_dim: truly stale checkpoint from a different obs layout; skip.
+        if loc.numel() != 1 and loc.numel() != self._obs_dim:
+            return obs_flat
         return ((x - loc) / (scale + 1e-8)).view(-1).cpu().numpy()
 
     def act(self, ctx: ActContext) -> tuple[Optional[np.ndarray], np.ndarray]:

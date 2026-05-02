@@ -19,7 +19,7 @@ globals:
   attack_sampler:
     n_types: 10
     active_len_factor: 0.5
-    dirichlet_alpha: 1.0  # symmetric Dirichlet concentration over edges per type; higher=uniform, lower=concentrated on one edge
+    dirichlet_alpha: 1000.0  # symmetric Dirichlet concentration over edges per type; higher=uniform, lower=concentrated on one edge
     pattern_types: ["sinus", "pw", "expo" ] #, "yoyo"]
     # pattern_types: ["pw"]
     # pattern_types: ["yoyo"]
@@ -45,8 +45,8 @@ globals:
       sigma: 8 # Before Conversion to per step request = 0.9
       mu_level:
         default: [20.0, 250.0]
-        low: [30.0, 150.0]
-        mid: [40.0, 200.0]
+        low: [10.0, 100.0]
+        mid: [30.0, 150.0]
         high: [50.0, 250.0]
 
   reward:

@@ -1,13 +1,12 @@
 """
 Compare offload modes on a fixed policy using configs/simulation_ma_0.yaml.
 
-Each offload mode runs --episodes episodes with the same seeds and policy.
-Results are plotted and a summary table is printed.
+Each (model, offload_mode) pair in MODEL_OFFLOAD_PAIRS runs --episodes episodes
+with the same seeds and policy. Results are plotted and a summary table is printed.
 
 Usage:
     python compare_offload.py
     python compare_offload.py --cfg configs/simulation_ma_0.yaml --episodes 5
-    python compare_offload.py --modes none balance delay_workload cto cto_acc full
     python compare_offload.py --policy autoscale_def --atk_level high --user_level high
     python compare_offload.py --policy tbsa --tbsa_table_path tbsa_table.pkl
     python compare_offload.py --policy lstm_rl --ckpt_path checkpoints/run/ckpt_iter_000100.pt
@@ -19,7 +18,7 @@ import copy
 import os
 import tempfile
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import yaml
@@ -27,14 +26,24 @@ from tqdm import tqdm
 
 from environment import build_env_base
 from train_sa_lstm import TorchRLEnvWrapper
-from method_policy import OFFLOAD_DISPLAY_NAMES, make_baseline_policy
+from method_policy import OFFLOAD_DISPLAY_NAMES, MODEL_DISPLAY_NAMES, make_baseline_policy
 from eval_baselines import (
     run_episode,
     plot_ts_continuous,
     plot_qoe_vio_bars,
 )
 
-ALL_MODES = ["none", "balance", "delay_workload", "cto", "cto_acc", "full"]
+# ---------------------------------------------------------------------------
+# Edit these pairs to select which (model, offload_mode) combinations to run.
+# Comment out rows to skip them.
+# ---------------------------------------------------------------------------
+MODEL_OFFLOAD_PAIRS: List[Tuple[str, str]] = [
+    ("gm", "delay_workload"),
+    ("lm", "delay_workload"),
+    ("gm", "cto"),
+    ("lm", "cto"),
+    ("lm", "cto_acc"),
+]
 
 
 def _build_env(cfg: dict, offload_mode: str, acc_model: Optional[str]) -> object:
@@ -59,10 +68,6 @@ def main():
     ap.add_argument("--episodes", type=int, default=10)
     ap.add_argument("--policy",   default="autoscale_def",
                     help="Baseline policy to use (same for all modes)")
-    ap.add_argument("--modes",    nargs="+", default=ALL_MODES,
-                    help="Offload modes to compare")
-    ap.add_argument("--acc_model", default=None,
-                    help="Override accuracy_matrix.model (gm|lm). Defaults to config value.")
     ap.add_argument("--atk_level",  default=None,
                     help="Override attack_sampler.level (low|mid|high|default)")
     ap.add_argument("--user_level", default=None,
@@ -83,7 +88,6 @@ def main():
     np.random.seed(base_seed)
 
     decision_interval = args.decision_interval or int(cfg_original["globals"]["decision_interval"])
-    acc_model = args.acc_model or cfg_original["globals"].get("accuracy_matrix", {}).get("model", "gm")
 
     _wrapper     = TorchRLEnvWrapper(cfg_path=args.cfg, decision_interval=decision_interval, device="cpu")
     obs_keys     = _wrapper.obs_keys
@@ -103,8 +107,9 @@ def main():
 
     atk_lvl  = args.atk_level  or cfg_base["globals"].get("attack_sampler",  {}).get("level",  "default")
     user_lvl = args.user_level or cfg_base["globals"].get("user_sampler", {}).get("synthetic", {}).get("level", "default")
-    print(f"Attack level: {atk_lvl}  |  User level: {user_lvl}  |  Acc model: {acc_model}")
-    print(f"Policy: {args.policy}  |  Modes: {args.modes}\n")
+    pairs_str = ", ".join(f"{m}/{om}" for m, om in MODEL_OFFLOAD_PAIRS)
+    print(f"Attack level: {atk_lvl}  |  User level: {user_lvl}")
+    print(f"Policy: {args.policy}  |  Pairs: {pairs_str}\n")
 
     try:
         policy = make_baseline_policy(
@@ -120,13 +125,15 @@ def main():
     results: Dict[str, Dict[str, np.ndarray]] = {}
     area_ids: List[str] = []
 
-    for mode in args.modes:
+    for acc_model, mode in MODEL_OFFLOAD_PAIRS:
         env = _build_env(cfg_base, mode, acc_model)
         if not area_ids:
             area_ids = [e.area_id for e in env.edge_areas]
 
-        label = OFFLOAD_DISPLAY_NAMES.get(mode, mode)
-        print(f"Running mode: {mode} ({label})")
+        model_name = MODEL_DISPLAY_NAMES.get(acc_model, acc_model)
+        offload_name = OFFLOAD_DISPLAY_NAMES.get(mode, mode)
+        label = f"{model_name} ({offload_name})"
+        print(f"Running: {label}")
         mode_results: Dict[str, np.ndarray] = {}
         last_ids_cpu = None
 
@@ -169,14 +176,13 @@ def main():
               f"{'Atk Drop%':>10} {'λ_res':>10} {'BCD':>10} {'Reward':>10}")
     print("\n" + header)
     print("-" * len(header))
-    for mode, label in [(m, OFFLOAD_DISPLAY_NAMES.get(m, m)) for m in args.modes]:
+    for label in [f"{MODEL_DISPLAY_NAMES.get(m, m)} ({OFFLOAD_DISPLAY_NAMES.get(om, om)})" for m, om in MODEL_OFFLOAD_PAIRS]:
         r = results.get(label)
         if r is None:
             continue
         qoe_raw = r["qoe"]
         vio_rate = float(np.mean(r["qoe_vio_rate"]))
-        penalty  = float(np.exp(-3.0 * vio_rate))
-        avg_qoe  = float(np.mean(qoe_raw)) * penalty
+        avg_qoe  = float(np.mean(qoe_raw))
         atk_in   = float(r["attack_in_rate"].sum())
         atk_drp  = float(r["attack_drop_rate"].sum())
         atk_pct  = atk_drp / atk_in if atk_in > 1e-6 else 0.0

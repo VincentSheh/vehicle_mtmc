@@ -728,8 +728,8 @@ def _load_accuracy_matrix(
             acc[src_i, exec_i, 0] = 1.0 - tnr  # FPR
             acc[src_i, exec_i, 1] = 1.0 - tpr  # FNR
 
-    client_labels = [f"E{c}" for c in selected]
-    col_w = 10
+    # client_labels = [f"E{c}" for c in selected]
+    # col_w = 10
     # header = " " * col_w + "".join(f"→{lbl:<{col_w}}" for lbl in client_labels)
     # print(f"\n[Accuracy Matrix] dirichlet_alpha={dirichlet_alpha} → {alpha_key!r}, run={run_key}")
     # print(f"  model_type={model_type!r}, selected clients: {client_labels}")
