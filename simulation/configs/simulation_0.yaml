@@ -45,7 +45,7 @@ globals:
       kappa: 0.25 
       sigma: 8 # Before Conversion to per step request = 0.9
       mu_level:
-        default: [50.0, 250.0]
+        default: [20.0, 250.0]
         low: [10.0, 100.0]
         mid: [30.0, 150.0]
         high: [50.0, 250.0]

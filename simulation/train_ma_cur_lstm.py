@@ -168,9 +168,10 @@ class IndepTorchRLEnvWrapper(EnvBase):
         torch.manual_seed(episode_seed)
         self.env.reset(episode_seed)
 
-        self.ids_cpu = torch.zeros(self.n_edges, device=self.device)
+        # Restore current CPU allocation to environment (persist across episodes)
         for i, e in enumerate(self.env.edge_areas):
-            self.ids_cpu[i] = e.ids_cpu
+            e.ids_cpu = float(self.ids_cpu[i].item())
+            e.va_cpu = e.budget.cpu - e.ids_cpu
 
         self.ids_cpu_settled = self.ids_cpu.clone()
         self.ids_cpu_target = self.ids_cpu.clone()
