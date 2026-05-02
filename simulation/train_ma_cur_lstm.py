@@ -39,8 +39,8 @@ N_TEMPORAL_PER_EDGE = 2
 
 class IndepTorchRLEnvWrapper(EnvBase):
     """
-    Independent Multi-Agent (IMA) TorchRL EnvBase wrapper.
-    Treats each edge as an independent agent sharing a single batch dimension.
+    Independent Multi-Agent (IMA/CMA) TorchRL EnvBase wrapper.
+    Treats each edge as an agent sharing a single batch dimension.
     """
 
     def __init__(
@@ -50,9 +50,11 @@ class IndepTorchRLEnvWrapper(EnvBase):
         n_actions: int = 9,
         seed: int = 0,
         device: str | torch.device = "cpu",
+        mode: str = "ima",
     ):
         self.env = build_env_base(cfg_path)
         self.n_edges = len(self.env.edge_areas)
+        self.mode = mode
         
         # Batch size is [n_edges] so agents are treated as independent parallel environments
         super().__init__(device=torch.device(device), batch_size=torch.Size([self.n_edges]))
@@ -269,8 +271,8 @@ class IndepTorchRLEnvWrapper(EnvBase):
 
             self.env.step(ids_cpu_eff.tolist(), step_overhead.tolist())
             
-            # IMA reward computation per edge
-            r_dict = self._build_ima_reward()
+            # Multi-agent reward computation
+            r_dict = self._compute_reward()
             total_reward += r_dict["reward"]
             comp_lres += r_dict["lres"]
             comp_bcd += r_dict["bcd"]
@@ -314,6 +316,42 @@ class IndepTorchRLEnvWrapper(EnvBase):
             batch_size=self.batch_size,
             device=self.device,
         )
+
+    def _compute_reward(self) -> dict:
+        r_dict = self._build_ima_reward()
+        if self.mode == "cma":
+            # Centralized reward: average components across all agents.
+            # Matching train_ma_lstm.py's behavior for lres.
+            avg_bcd  = float(r_dict["bcd"].mean().item())
+            avg_qsf  = float(r_dict["qsf"].mean().item())
+            avg_vio  = float(r_dict["vio"].mean().item())
+
+            # For lres, we need to know which ones were actually under attack
+            # lres_vec contains ratios; we only mean those where attack_in_rate > 1e-6
+            last_block = self.env.history[-self.n_edges:]
+            mask = torch.zeros(self.n_edges, dtype=torch.bool, device=self.device)
+            for i, aid in enumerate(self.area_ids):
+                for record in reversed(last_block):
+                    if record.area_id == aid:
+                        if record.attack_in_rate > 1e-6:
+                            mask[i] = True
+                        break
+            
+            if mask.any():
+                avg_lres = float(r_dict["lres"][mask].mean().item())
+            else:
+                avg_lres = 0.0
+            
+            # Recompute shared reward
+            shared_rew = -(self.reward_alpha * avg_qsf + self.reward_beta * avg_lres + self.reward_gamma * avg_bcd)
+            
+            r_dict["reward"] = torch.full_like(r_dict["reward"], shared_rew)
+            r_dict["lres"]   = torch.full_like(r_dict["lres"],   avg_lres)
+            r_dict["bcd"]    = torch.full_like(r_dict["bcd"],    avg_bcd)
+            r_dict["qsf"]    = torch.full_like(r_dict["qsf"],    avg_qsf)
+            r_dict["vio"]    = torch.full_like(r_dict["vio"],    avg_vio)
+            
+        return r_dict
 
     def _build_observation(self) -> torch.Tensor:
         obs = torch.zeros((self.n_edges, self.obs_dim), dtype=torch.float32, device=self.device)
@@ -478,7 +516,7 @@ def orthogonal_init(m, gain=1.0):
 
 import argparse
 
-def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/train.yaml", device="cuda", total_frames_override=None, resume_ckpt: str = None, ckpt_dir: str = None):
+def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/train.yaml", device="cuda", total_frames_override=None, resume_ckpt: str = None, ckpt_dir: str = None, mode: str = "ima"):
     with open(env_cfg_path, "r") as f:
         env_cfg = yaml.safe_load(f)
     with open(train_cfg_path, "r") as f:
@@ -502,12 +540,12 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
 
     logger_cfg = train_cfg.setdefault("logger", {})
     if "exp_name" not in logger_cfg:
-        logger_cfg["exp_name"] = "ppo_indep"
+        logger_cfg["exp_name"] = f"ppo_ma_{mode}"
 
     try:
         t_max = env_cfg["run"]["t_max"]
         run = wandb_init(env_cfg, train_cfg)
-        wandb.config.update({"env/atk_level": atk_lvl, "env/user_level": user_lvl}, allow_val_change=True)
+        wandb.config.update({"env/atk_level": atk_lvl, "env/user_level": user_lvl, "mode": mode}, allow_val_change=True)
 
         torch.manual_seed(env_cfg["run"]["seed"])
         np.random.seed(env_cfg["run"]["seed"])
@@ -531,6 +569,7 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
             seed=env_cfg["run"]["seed"],
             device=device,
             decision_interval=decision_interval,
+            mode=mode,
         )
         n_edges = base_env.n_edges
         obs_dim = base_env.obs_dim
@@ -553,6 +592,7 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
                 seed=seed_offset,
                 device="cpu",
                 decision_interval=decision_interval,
+                mode=mode,
             )
 
         penv = ParallelEnv(num_envs, [make_env(1000 + i) for i in range(num_envs)], device="cpu")
@@ -567,7 +607,13 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
         )
         
         env.transform.train()
-        env.transform[-1].init_stats(num_iter=100, reduce_dim=(0, 1), cat_dim=0)
+        # FIX: include n_edges dimension in reduce_dim if it's causing issues.
+        # But (0, 1) should reduce num_envs and n_edges.
+        # If cat_dim=0 with num_iter=100 results in [100, 4, 3, 12].
+        # reduce_dim=(0, 1) -> reduces 100 and 4. Result [3, 12].
+        # Try reduce_dim=(0, 1, 2) if it prepends? No.
+        # Let's try reduce_dim=(0, 1, 2) where 0=num_iter, 1=num_envs, 2=n_edges.
+        env.transform[-1].init_stats(num_iter=100, reduce_dim=(0, 1, 2), cat_dim=0)
         env.transform.eval()
 
         split_module = TensorDictModule(
@@ -648,7 +694,7 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
             _norm.loc = torch.nn.UninitializedBuffer()
             _norm.scale = torch.nn.UninitializedBuffer()
             env.transform.train()
-            env.transform[-1].init_stats(num_iter=100, reduce_dim=(0, 1), cat_dim=0)
+            env.transform[-1].init_stats(num_iter=100, reduce_dim=(0, 1, 2), cat_dim=0)
             env.transform[-1].to(device)
             env.transform.eval()
             print(f"[resume] Loaded weights from {resume_ckpt}, re-initialized obsnorm")
@@ -765,15 +811,19 @@ if __name__ == "__main__":
     parser.add_argument("--total_frames", type=int, default=None)
     parser.add_argument("--resume_ckpt", type=str, default=None)
     parser.add_argument("--ckpt_dir", type=str, default=None)
+    parser.add_argument("--mode", type=str, default="ima", choices=["ima", "cma"])
     args = parser.parse_args()
-    train(env_cfg_path=args.cfg, train_cfg_path=args.train_cfg, total_frames_override=args.total_frames, resume_ckpt=args.resume_ckpt, ckpt_dir=args.ckpt_dir)
+    train(env_cfg_path=args.cfg, train_cfg_path=args.train_cfg, total_frames_override=args.total_frames, resume_ckpt=args.resume_ckpt, ckpt_dir=args.ckpt_dir, mode=args.mode)
 
 """
-  Usage:                                                                                                                                                            
-  # Phase 1 — single-edge pretraining                                                                                                                               
-  python train_indep_lstm.py --cfg configs/simulation_0.yaml --train_cfg configs/train.yaml                                                                         
-                                                                                                                                                                    
-  # Phase 2 — multi-edge fine-tuning                                                                                                                                
-  python train_indep_lstm.py --cfg configs/simulation_ma_0.yaml --train_cfg configs/train.yaml \                                                                    
-    --resume_ckpt checkpoints/<phase1_run>/ckpt_best.pt  
+  Usage:
+  # Independent Multi-Agent (IMA) mode
+  python train_ma_cur_lstm.py --mode ima --cfg configs/simulation_ma_0.yaml
+
+  # Centralized Multi-Agent (CMA) mode
+  python train_ma_cur_lstm.py --mode cma --cfg configs/simulation_ma_0.yaml
+
+  # Phase 2 — fine-tuning with checkpoint
+  python train_ma_cur_lstm.py --mode cma --cfg configs/simulation_ma_0.yaml \
+    --resume_ckpt checkpoints/_phase1/<run_name>/ckpt_best.pt
 """

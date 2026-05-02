@@ -28,17 +28,18 @@ from method_policy import (
 SCALING_QUANTA = [0.5, 1.0, 1.5, 2.0]
 
 DEFAULT_METHODS = [
-    "no_ids",
-    "static_low",
-    "static_high",
-    "autoscale_def",
-    "offline_optimal",
+    # "no_ids",
+    # "static_low",
+    # "static_high",
+    # "autoscale_def",
+    # "offline_optimal",
 ]
 
 PROPOSED_CONFIGS = [
     ("gm", "delay_workload"),
-    ("gm", "cto"),
+    # ("gm", "cto"),
     ("lm", "delay_workload"),
+    # ("lm", "cto_acc_inv"),
     ("lm", "cto"),
     ("lm", "cto_acc"),
 ]

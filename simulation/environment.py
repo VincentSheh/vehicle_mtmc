@@ -206,10 +206,14 @@ class Environment:
             ids_cpus=[0.0] * len(self.edge_areas),
             overhead=overhead,
             disable_attack=True,
+            forced_mode="cto",
         )
 
         # 2. restore pre-step state
         self._restore_edges(snapshot)
+
+        # Observe arrivals for weighting and logging
+        obs = {e.area_id: e.observe_arrivals(self.t) for e in self.edge_areas}
 
         # 3. real pass from same pre-step state
         real_cache = self._run_step_multi_edge(
@@ -219,8 +223,8 @@ class Environment:
         )
 
         edges_by_id = {e.area_id: e for e in self.edge_areas}
-        # Weight QoE by original (pre-IDS) user count so FPR-dropped users pull weight
-        tot_req = sum(int(real_cache[aid].get("original_user_in", real_cache[aid].get("local_num_request", 0))) for aid in self.area_ids)
+        # tot_req should be the total users arriving across all edges in this slot (source-centric)
+        tot_req = sum(int(obs[aid]["user_req_in"]) for aid in self.area_ids)
         total_cpu_to_ids_ratio = sum(
             edges_by_id[aid].ids_cpu / edges_by_id[aid].budget.cpu for aid in self.area_ids
         )
@@ -236,8 +240,15 @@ class Environment:
             cache = real_cache[aid]
             cache_ideal = ideal_cache[aid]
             ids_out = cache["ids_out"]
-            n = int(cache.get("original_user_in", cache.get("local_num_request", 0)))
-            qoe_weighted = float(cache["qoe"]) * (n / tot_req) if tot_req > 0 else float(cache["qoe"])
+            
+            # n is the number of users who originated at this edge
+            n = int(obs[aid]["user_req_in"])
+            # Since we can't easily map executor QoE back to sources without per-flow tracking,
+            # we use the executor's QoE as a proxy for global performance. 
+            # FIX: If we want to evaluate offloading, we must use the executor's QoE 
+            # but weight it by the work it actually performed.
+            n_executed = int(cache.get("original_user_in", 0))
+            qoe_weighted = float(cache["qoe"]) * (n_executed / tot_req) if tot_req > 0 else float(cache["qoe"])
 
             self.history.append(
                 StepMetrics(
@@ -294,9 +305,10 @@ class Environment:
         W_src: Dict[str, float],
         c_dst: Dict[str, float],
         stage: str = "ids",
+        forced_mode: Optional[str] = None,
     ) -> OffloadPlan:
         """Dispatch to the correct offload function based on self.offload_mode."""
-        mode = self.offload_mode
+        mode = forced_mode if forced_mode is not None else self.offload_mode
         if mode == "none":
             return no_offload(self.area_ids, W_src)
 
@@ -374,7 +386,7 @@ class Environment:
             max_prop_delay=self._max_prop_delay_ms,
         )
 
-    def _run_step_multi_edge(self, ids_cpus, overhead=0.0, disable_attack=False):
+    def _run_step_multi_edge(self, ids_cpus, overhead=0.0, disable_attack=False, forced_mode: Optional[str] = None):
         """Two-stage IDS→VA offload step. Preserves single-edge overhead logic."""
         edges = {e.area_id: e for e in self.edge_areas}
         self._edges_by_id = edges  # cache for _make_offload_plan
@@ -419,7 +431,7 @@ class Environment:
             aid: float(edges[aid].ids.effective_speed_pkt_per_step(edges[aid].ids_cpu))
             for aid in self.area_ids
         }
-        plan_ids = self._make_offload_plan(W_ids, c_ids, stage="ids")
+        plan_ids = self._make_offload_plan(W_ids, c_ids, stage="ids", forced_mode=forced_mode)
 
         exec_user_in: Dict[str, int] = {aid: 0 for aid in self.area_ids}
         exec_atk_in:  Dict[str, int] = {aid: 0 for aid in self.area_ids}
@@ -441,7 +453,7 @@ class Environment:
             for dst, n_sent in plan_ids.flow.get(src, {}).items():
                 n_sent_f = float(n_sent)
                 nu = int(round(n_sent_f * u / tot))
-                na = int(round(n_sent_f * a / tot))
+                na = int(n_sent_f) - nu
                 exec_user_in[dst] += nu
                 exec_atk_in[dst]  += na
                 if src == dst:
@@ -542,7 +554,7 @@ class Environment:
                 )
                 min_det_cycles = min(edge.pipeline.det_cycles.values())
                 c_va[aid] = avail_cycles / min_det_cycles if min_det_cycles > 0 else 0.0
-            plan_va = self._make_offload_plan(W_va, c_va, stage="va")
+            plan_va = self._make_offload_plan(W_va, c_va, stage="va", forced_mode=forced_mode)
 
             # Admitted attacks stay local — seed bw/cycles at their IDS executor
             va_atk_bw_mb:  Dict[str, float] = {aid: float(exec_atk_bw_mb[aid])  for aid in self.area_ids}
@@ -571,7 +583,7 @@ class Environment:
                 avail_cycles = float(edge.va_cpu) * edge.cpu_cycle_per_ms * edge.slot_ms
                 min_det_cycles = min(edge.pipeline.det_cycles.values())
                 c_va[aid] = avail_cycles / min_det_cycles if min_det_cycles > 0 else 0.0
-            plan_va = self._make_offload_plan(W_va, c_va, stage="va")
+            plan_va = self._make_offload_plan(W_va, c_va, stage="va", forced_mode=forced_mode)
 
             # Attack bw/cycles distributed to VA executors proportional to routed attack count
             va_atk_bw_mb  = {aid: 0.0 for aid in self.area_ids}
@@ -585,7 +597,7 @@ class Environment:
                 for dst, n_sent in plan_va.flow.get(src, {}).items():
                     n_sent_f = float(n_sent)
                     nu = int(round(n_sent_f * u / tot))
-                    na = int(round(n_sent_f * a / tot))
+                    na = int(n_sent_f) - nu
                     va_user_in[dst] += nu
                     va_atk_in[dst]  += na
                     va_original_user_in[dst] += int(round(float(nu) / max(ids_pass_rate, 1e-9)))

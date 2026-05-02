@@ -228,6 +228,9 @@ def balance_workload_cto_acc(
             d_prop = float(propagation_delays[s][r])
             delay_penalty = d_prop * w3
 
+            # Improvement (acc) calculation with TPR/TNR (higher is better):
+            # acc = (Local_Rate - Remote_Rate)
+            # If Remote is BETTER, acc is NEGATIVE.
             acc = 0.0
             if (fnr_matrix is not None and fpr_matrix is not None
                     and si is not None and id_to_idx is not None):
@@ -237,10 +240,10 @@ def balance_workload_cto_acc(
                     + (float(fpr_matrix[si, si]) - float(fpr_matrix[si, ri])) * w2
                 )
 
-            # cost = delay_penalty - acc:
+            # cost = delay_penalty + acc:
+            # Since acc is negative for better remotes, adding it REDUCES cost.
             # lower cost = better link (closer + more accurate)
-            # with w1=w2=0 this reduces to ascending delay, identical to plain cto
-            cost = delay_penalty - acc
+            cost = delay_penalty + acc
             scored_links.append((cost, s, r))
 
     random.shuffle(scored_links)
@@ -304,20 +307,23 @@ def balance_workload_cto_acc_inv(
             d_prop = float(propagation_delays[s][r])
             delay_penalty = d_prop * w3
 
+            # Improvement (acc) calculation with TPR/TNR (higher is better):
+            # acc = (Local_Rate - Remote_Rate)
+            # If Remote is BETTER, acc is NEGATIVE.
             acc = 0.0
             if (fnr_matrix is not None and fpr_matrix is not None
                     and si is not None and id_to_idx is not None):
                 ri = id_to_idx[r]
-                # Inverse accuracy: reward FNR/FPR degradation
+                # Inverse accuracy: reward degradation (higher local - remote)
                 acc = (
                     (float(fnr_matrix[si, si]) - float(fnr_matrix[si, ri])) * w1
                     + (float(fpr_matrix[si, si]) - float(fpr_matrix[si, ri])) * w2
                 )
 
-            # cost = delay_penalty + acc:
-            # higher acc (better remote) INCREASES cost
-            # lower acc (worse remote) DECREASES cost
-            cost = delay_penalty + acc
+            # cost = delay_penalty - acc:
+            # Since acc is negative for better remotes, subtracting it INCREASES cost.
+            # higher cost = better remote is penalized (inverse behavior)
+            cost = delay_penalty - acc
             scored_links.append((cost, s, r))
 
     random.shuffle(scored_links)
@@ -368,16 +374,6 @@ def score_based_offload(
     cap_dst: Optional[Dict[Any, float]] = None,
     max_prop_delay: float = 1e9,
 ) -> OffloadPlan:
-    """
-    Score-based offload (modes c / d): same redistribution target and link
-    scoring as balance_workload_cto_acc, but each sender splits its supply
-    proportionally to receiver scores rather than greedily in sorted order.
-
-    max_prop_delay: hard upper bound on propagation delay (same units as
-    propagation_delays).  Receivers beyond this threshold are excluded, so
-    tasks that cannot reach any eligible receiver stay local rather than
-    being shipped somewhere they would arrive too late.
-    """
     w1, w2, w3 = weights
 
     W_tot = float(sum(W_src[e] for e in area_ids))
@@ -388,15 +384,18 @@ def score_based_offload(
         return _build_plan(flow, area_ids)
 
     C_tot = float(sum(c_dst[e] for e in area_ids))
-    if C_tot > EPS:
-        N_star = {e: float(c_dst[e]) * (W_tot / C_tot) for e in area_ids}
-    else:
-        N_star = {e: 0.0 for e in area_ids}
-    # cap each edge at its own capacity to prevent overcapacity when W_tot > C_tot
-    N_star = {e: min(N_star[e], float(c_dst[e])) for e in area_ids}
 
-    supply    = {e: max(0.0, W[e] - N_star[e]) for e in area_ids}
-    demand    = {e: max(0.0, N_star[e] - W[e]) for e in area_ids}
+    # ── FIX: capacity-weighted fair share as target ──────────────────────────
+    if C_tot > EPS:
+        fair_share = {e: float(c_dst[e]) * (W_tot / C_tot) for e in area_ids}
+    else:
+        fair_share = {e: W_tot / len(area_ids) for e in area_ids}
+
+    # ── FIX: use raw capacity as the offload trigger ─────────────────────────
+    supply = {e: max(0.0, W[e] - float(c_dst[e])) for e in area_ids}
+    demand = {e: max(0.0, float(c_dst[e]) - W[e]) for e in area_ids}
+    # ─────────────────────────────────────────────────────────────────────────
+
     senders   = [e for e in area_ids if supply[e] > EPS]
     receivers = [e for e in area_ids if demand[e] > EPS]
 
@@ -404,29 +403,28 @@ def score_based_offload(
     rem_supply = {e: supply[e] for e in senders}
     rem_demand = {e: demand[e] for e in receivers}
 
+    actual_spare = {r: demand[r] for r in receivers}
+
     for src in senders:
         si      = id_to_idx[src] if id_to_idx is not None else None
         to_move = rem_supply[src]
         if to_move <= EPS:
             continue
 
-        # True overflow: tasks that will be dropped if kept local.
-        # Voluntary supply: excess only because of the proportional N_star target.
+        # ── FIX: overloaded means exceeding raw capacity ────
         is_overloaded = W[src] > float(c_dst[src]) + EPS
+        # ────────────────────────────────────────────────────
 
         raw: Dict[Any, float] = {}
         eff_cap: Dict[Any, float] = {}
         for r in receivers:
-            if r == src or rem_demand.get(r, 0.0) <= EPS:
+            if r == src:
                 continue
             d_prop = float(propagation_delays[src][r])
             if d_prop > max_prop_delay:
                 continue
-            # Discount receiver's spare capacity by the fraction of the delay
-            # budget consumed in transit — tasks arriving near max_prop_delay
-            # leave almost no processing time and are likely to be dropped.
             discount = max(0.0, 1.0 - d_prop / max_prop_delay)
-            cap = max(0.0, (float(c_dst[r]) - W[r]) * discount)
+            cap = max(0.0, actual_spare[r] * discount)
             if cap <= EPS:
                 continue
             eff_cap[r] = cap
@@ -439,30 +437,28 @@ def score_based_offload(
                     (float(fnr_matrix[si, si]) - float(fnr_matrix[si, ri])) * w1
                     + (float(fpr_matrix[si, si]) - float(fpr_matrix[si, ri])) * w2
                 )
-            raw[r] = acc - delay_penalty
+            # raw = (Remote_Rate - Local_Rate) - delay_penalty
+            # This ensures better remote nodes have higher scores.
+            raw[r] = -acc - delay_penalty
 
         if not raw:
             continue
 
         if is_overloaded:
-            # Overflow MUST leave — use shifted scores so the best available
-            # receiver always gets traffic even if all options are costly.
             min_sc = min(raw.values())
             pos = {r: (sc - min_sc + EPS) for r, sc in raw.items()}
         else:
-            # Voluntary offload — only worth doing when the accuracy gain
-            # outweighs the propagation delay penalty (positive net score).
             pos = {r: sc for r, sc in raw.items() if sc > 0.0}
 
         total = sum(pos.values())
-        if total <= EPS:
+        if total < EPS:
             continue
 
         items = list(pos.items())
         random.shuffle(items)
         sorted_items = sorted(items, key=lambda kv: -kv[1])
         for r, p in sorted_items:
-            if p <= EPS or to_move <= EPS:
+            if p < EPS or to_move <= EPS:
                 break
             ceiling = min(eff_cap.get(r, 0.0), rem_demand.get(r, 0.0))
             share = min((p / total) * rem_supply[src], ceiling, to_move)
@@ -471,26 +467,26 @@ def score_based_offload(
             flow_float[src][src] -= share
             flow_float[src][r]    = flow_float[src].get(r, 0.0) + share
             to_move              -= share
+            actual_spare[r]      -= share
             rem_demand[r]        -= share
             eff_cap[r]           -= share
 
-        # Drain any supply stranded by demand/capacity caps in the proportional pass
         if to_move > EPS:
             for r, _ in sorted_items:
                 if to_move <= EPS:
                     break
-                ceiling = min(eff_cap.get(r, 0.0), rem_demand.get(r, 0.0))
+                ceiling = eff_cap.get(r, 0.0)
                 extra = min(ceiling, to_move)
                 if extra <= EPS:
                     continue
                 flow_float[src][src] -= extra
                 flow_float[src][r]    = flow_float[src].get(r, 0.0) + extra
                 to_move              -= extra
-                rem_demand[r]        -= extra
+                actual_spare[r]      -= extra
+                rem_demand[r]        = max(0.0, rem_demand.get(r, 0.0) - extra)
                 eff_cap[r]           -= extra
 
     return _build_plan(_round_and_conserve(flow_float, W), area_ids)
-
 
 # ---------------------------------------------------------------------------
 # Backward-compat alias (called by old environment code paths)
