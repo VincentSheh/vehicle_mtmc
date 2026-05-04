@@ -1,6 +1,6 @@
 run:
   t_max: 30000
-  seed: 22
+  seed: 23
 
 eval:
   episode: 30
@@ -18,20 +18,22 @@ globals:
 
   attack_sampler:
     n_types: 10
-    dirichlet_alpha: 1000.0  # symmetric Dirichlet concentration over edges per type; higher=uniform, lower=concentrated on one edge
+    active_len_factor: 0.5
+    dirichlet_alpha: 100.0  # symmetric Dirichlet concentration over edges per type; higher=uniform, lower=concentrated on one edge
     pattern_types: ["sinus", "pw", "expo" ] #, "yoyo"]
     # pattern_types: ["pw"]
     # pattern_types: ["yoyo"]
     level: "default"
     lambda_level:
       default: [10000, 18000]
+      # default: [0, 0]
       low: [5000, 10000]
       mid: [12000, 16000]
       high: [18000, 24000]
-    noise_std:        [0.05, 0.1]
+    noise_std:        [0.05, 0.10]
     t_cycle_min:      [300, 500]     # seconds (lower bound on cycle duration)
     t_cycle_delta:    [300, 800]   # seconds added to t_min to get t_max
-    latency_per_flow: [2, 4]      # ms per flow  (latency_per_flow * 1000 * va_cpu / lambda_base)
+    latency_per_flow: [2,4]      # ms per flow  (latency_per_flow * 1000 * va_cpu / lambda_base)
     bw_per_flow:      [0.0, 0.0]   # Mbps per flow
     # bw_per_flow:      [0.15, 0.30]   # Mbps per flow
     non_defendable_bw_const: 0.0
@@ -43,16 +45,16 @@ globals:
       kappa: 0.25 
       sigma: 8 # Before Conversion to per step request = 0.9
       mu_level:
-        default: [20.0, 200.0]
+        default: [50.0, 250.0]
         low: [10.0, 100.0]
         mid: [30.0, 150.0]
         high: [50.0, 250.0]
 
   reward:
-    alpha_inv: 5.0   # QoE shortfall normalizer   
-    beta_inv:  9.0   # Attack residual normalizer  
-    gamma_inv: 8.0   # Benign collateral normalizer
-    q_th:      0.2   # QoE shortfall threshold
+    alpha_inv: 11.0   # QoE shortfall normalizer   
+    beta_inv:  1.0   # Attack residual normalizer  
+    gamma_inv: 10.0   # Benign collateral normalizer
+    q_th:      0.35   # QoE shortfall threshold
 
   # Offload mode comparison:
   #
@@ -68,7 +70,7 @@ globals:
   #  All modes: capacity in pkts/slot (IDS) and tasks/slot (VA); balance caps receivers at c[e].
   #  delay_workload vs cto: same trigger/target but delay_workload splits supply proportionally
   #  across receivers by score whereas cto fills the closest receiver first (winner-takes-all).
-  offload_mode: "cto"  # "none" | "balance" | "delay_workload" | "full" | "cto" | "cto_acc"
+  offload_mode: "delay_workload"  # "none" | "balance" | "delay_workload" | "full" | "cto" | "cto_acc"
   # VA-stage attack offload mode:
   #   false (default) — admitted attacks stay at their IDS executor; VA capacity is
   #                     pre-reduced by attack load before the benign-user offload plan.
@@ -76,7 +78,7 @@ globals:
   #                     is offered at full value and attack resource consumption is
   #                     distributed across VA executors after routing.
   va_attack_offload: true
-  max_prop_delay_ms: 50.0        # hard delay cutoff for modes delay_workload / full
+  max_prop_delay_ms: 200.0        # hard delay cutoff for modes delay_workload / full
 
   # Score-based offload weights (modes delay_workload / full)
   #   score(src,dst) = load_benefit - d_prop/d_max * w3
@@ -86,13 +88,15 @@ globals:
   offload_weights:
     w1: 1.0   # FNR accuracy improvement
     w2: 1.0   # FPR accuracy improvement
-    w3: 0.0  # propagation delay penalty (ms⁻¹); non-zero so delay_workload has a routing criterion
+    w3: 0.010  # propagation delay penalty (ms⁻¹); non-zero so delay_workload has a routing criterion
 
-  # Accuracy-by-region matrix: [src_edge_idx][exec_edge_idx] = [FPR, FNR]
-  # Row = traffic source edge, Col = inspecting/executing edge.
-  # Diagonal = local inspection (own model on own traffic).
-  accuracy_by_region:
-    - [[0.0, 0.0]]
+  # Accuracy matrix loaded from federated learning evaluation results.
+  # Clients and run are resampled at every episode reset using attack_sampler.dirichlet_alpha.
+  # model: "lm" = personalized local models (cross-edge accuracy varies per executor)
+  #        "gm" = global model (all executors share the same FPR/FNR on a given source)
+  accuracy_matrix:
+    path: configs/accuracy_matrix.json
+    model: gm
 
   # Propagation delay matrix in ms: row=source edge index, col=target edge index.
   delay_ms:

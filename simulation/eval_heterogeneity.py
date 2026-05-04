@@ -43,7 +43,7 @@ class HeterogeneityEvaluator(BaseEvaluator):
     def run(self):
         # Resolve Alphas
         if self.args.alphas:
-            alphas = sorted(self.args.alphas, reverse=True)
+            alphas = sorted(self.args.alphas)
         else:
             matrix_path = self.cfg_original["globals"]["accuracy_matrix"]["path"]
             with open(matrix_path) as f:
@@ -52,7 +52,7 @@ class HeterogeneityEvaluator(BaseEvaluator):
             for key in matrix_data:
                 m = re.search(r'alpha([\d.]+)', key)
                 if m: alpha_set.add(float(m.group(1)))
-            alphas = sorted(list(alpha_set), reverse=True) or [1000.0, 100.0, 10.0, 1.0, 0.5, 0.2]
+            alphas = sorted(list(alpha_set)) or [0.2, 0.5, 1.0, 10.0, 100.0, 1000.0]
 
         methods = self.get_methods()
         policies = self.build_policies(methods)
@@ -102,8 +102,9 @@ class HeterogeneityEvaluator(BaseEvaluator):
                 cell_means = accumulated_means.get(alpha, {})
 
                 for (om, amod), pkey_label_pairs in groups.items():
-                    # Skip env build if all methods in group are done
-                    if all(lbl in cell_means for _, lbl in pkey_label_pairs):
+                    # Skip env build if all methods in group are done with enough episodes
+                    if all(lbl in cell_means and cell_means[lbl].get("n_episodes", 0) >= self.args.episodes 
+                           for _, lbl in pkey_label_pairs):
                         continue
 
                     cfg = self.mutate_cfg(self.cfg_original, alpha, om, amod)
@@ -113,10 +114,10 @@ class HeterogeneityEvaluator(BaseEvaluator):
                     try:
                         env = build_env_base(tmp_path)
                         for pkey, label in pkey_label_pairs:
-                            if label in cell_means:
-                                print(f"  [skip] {label} (already in CSV)")
+                            if label in cell_means and cell_means[label].get("n_episodes", 0) >= self.args.episodes:
+                                print(f"  [skip] {label} (already enough episodes in CSV)")
                                 continue
-                            res, _ = self.run_simulation(env, cfg, policies[pkey], label)
+                            res, _ = self.run_simulation(env, cfg, policies[pkey], label, cache_key=f"{label}_a{alpha}")
                             cell_means[label] = self.extract_metrics(res)
                     finally:
                         if os.path.exists(tmp_path): os.remove(tmp_path)
@@ -136,8 +137,20 @@ class HeterogeneityEvaluator(BaseEvaluator):
                     alpha, method, metric, value = float(row["alpha"]), row["method"], row["metric"], float(row["value"])
                     means.setdefault(alpha, {}).setdefault(method, {})[metric] = value
             for a in alphas:
-                if a in means and all(m in means[a] and all(mk in means[a][m] for mk, _ in METRICS) for m in methods_display):
-                    done.add(a)
+                if a in means:
+                    all_methods_done = True
+                    for m in methods_display:
+                        if m not in means[a]:
+                            all_methods_done = False
+                            break
+                        # Check if all metrics are present AND if n_episodes matches
+                        metrics_present = all(mk in means[a][m] for mk, _ in METRICS)
+                        eps_match = means[a][m].get("n_episodes", 0) >= self.args.episodes
+                        if not (metrics_present and eps_match):
+                            all_methods_done = False
+                            break
+                    if all_methods_done:
+                        done.add(a)
         except Exception as e: print(f"[warn] Failed to load CSV: {e}")
         return means, done
 
@@ -149,13 +162,15 @@ class HeterogeneityEvaluator(BaseEvaluator):
                 m_data = means[alpha].get(m_label, {})
                 for mk, mt in METRICS:
                     rows.append({"alpha": alpha, "method": m_label, "metric": mk, "metric_label": mt, "value": m_data.get(mk, np.nan)})
+                # Save n_episodes explicitly
+                rows.append({"alpha": alpha, "method": m_label, "metric": "n_episodes", "metric_label": "Num Episodes", "value": m_data.get("n_episodes", self.args.episodes)})
         with open(path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=["alpha", "method", "metric", "metric_label", "value"])
             writer.writeheader()
             writer.writerows(rows)
 
 def plot_heterogeneity_bar(means, methods_display, alphas, outpath, proposed_label=None):
-    alphas_plot = sorted(alphas, reverse=True)
+    alphas_plot = sorted(alphas)
     n_rows = len(METRICS)
     fig, axes = plt.subplots(n_rows, 1, figsize=(10, 4 * n_rows), sharex=True, squeeze=False)
     colors = {m: plt.cm.tab10(i % 10) for i, m in enumerate(methods_display)}
@@ -182,14 +197,14 @@ def plot_heterogeneity_bar(means, methods_display, alphas, outpath, proposed_lab
         ax.set_title(mt, fontsize=12, fontweight="bold")
         ax.grid(axis='y', linestyle="--", alpha=0.4)
 
-    axes[-1][0].set_xlabel("Heterogeneity (Dirichlet α) — Reversed")
+    axes[-1][0].set_xlabel("Heterogeneity (Dirichlet α)")
     fig.legend(*axes[0][0].get_legend_handles_labels(), loc="center left", bbox_to_anchor=(1.02, 0.5), title="Method")
     plt.tight_layout()
     fig.savefig(outpath, dpi=150, bbox_inches="tight")
     plt.close()
 
 def plot_heterogeneity_line(means, methods_display, alphas, outpath):
-    alphas_plot = sorted(alphas, reverse=True)
+    alphas_plot = sorted(alphas)
     n_rows = len(METRICS)
     fig, axes = plt.subplots(n_rows, 1, figsize=(10, 4 * n_rows), sharex=True, squeeze=False)
     colors = {m: plt.cm.tab10(i % 10) for i, m in enumerate(methods_display)}
@@ -202,12 +217,11 @@ def plot_heterogeneity_line(means, methods_display, alphas, outpath):
             ax.plot(alphas_plot, vals, label=m_label, color=colors[m_label], marker=markers[i % len(markers)], markersize=6, linewidth=2, alpha=0.8)
         
         ax.set_xscale("log")
-        ax.invert_xaxis()
         if mk in ("slo_vio", "atk_leak", "bcd"): ax.yaxis.set_major_formatter(matplotlib.ticker.PercentFormatter(xmax=1.0, decimals=0))
         ax.set_title(mt, fontsize=12, fontweight="bold")
         ax.grid(True, which="both", linestyle="--", alpha=0.4)
 
-    axes[-1][0].set_xlabel("Heterogeneity (Dirichlet α) - Log Scale (Reversed)")
+    axes[-1][0].set_xlabel("Heterogeneity (Dirichlet α) - Log Scale")
     fig.legend(*axes[0][0].get_legend_handles_labels(), loc="center left", bbox_to_anchor=(1.02, 0.5), title="Method")
     plt.tight_layout()
     fig.savefig(outpath, dpi=150, bbox_inches="tight")

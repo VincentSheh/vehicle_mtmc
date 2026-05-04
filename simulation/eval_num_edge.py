@@ -97,8 +97,9 @@ class NumEdgeEvaluator(BaseEvaluator):
                 cell_means = accumulated_means.get(n_edge, {})
                 
                 for (om, amod), pkey_label_pairs in groups.items():
-                    # If all methods in this group (om, amod) are already in cell_means, skip env build
-                    if all(lbl in cell_means for _, lbl in pkey_label_pairs):
+                    # If all methods in this group (om, amod) are done with enough episodes, skip
+                    if all(lbl in cell_means and cell_means[lbl].get("n_episodes", 0) >= self.args.episodes 
+                           for _, lbl in pkey_label_pairs):
                         continue
 
                     cfg = self.mutate_cfg(self.cfg_original, n_edge, om, amod)
@@ -108,10 +109,10 @@ class NumEdgeEvaluator(BaseEvaluator):
                     try:
                         env = build_env_base(tmp_path)
                         for pkey, label in pkey_label_pairs:
-                            if label in cell_means:
-                                print(f"  [skip] {label} (already in CSV)")
+                            if label in cell_means and cell_means[label].get("n_episodes", 0) >= self.args.episodes:
+                                print(f"  [skip] {label} (already enough episodes in CSV)")
                                 continue
-                            res, _ = self.run_simulation(env, cfg, policies[pkey], label)
+                            res, _ = self.run_simulation(env, cfg, policies[pkey], label, cache_key=f"{label}_n{n_edge}")
                             cell_means[label] = self.extract_metrics(res)
                     finally:
                         if os.path.exists(tmp_path): os.remove(tmp_path)
@@ -130,8 +131,19 @@ class NumEdgeEvaluator(BaseEvaluator):
                     n_edge, method, metric, value = int(row["n_edge"]), row["method"], row["metric"], float(row["value"])
                     means.setdefault(n_edge, {}).setdefault(method, {})[metric] = value
             for n in n_edges_list:
-                if n in means and all(m in means[n] and all(mk in means[n][m] for mk, _ in METRICS) for m in methods_display):
-                    done.add(n)
+                if n in means:
+                    all_methods_done = True
+                    for m in methods_display:
+                        if m not in means[n]:
+                            all_methods_done = False
+                            break
+                        metrics_present = all(mk in means[n][m] for mk, _ in METRICS)
+                        eps_match = means[n][m].get("n_episodes", 0) >= self.args.episodes
+                        if not (metrics_present and eps_match):
+                            all_methods_done = False
+                            break
+                    if all_methods_done:
+                        done.add(n)
         except Exception as e: print(f"[warn] Failed to load CSV: {e}")
         return means, done
 
@@ -143,6 +155,7 @@ class NumEdgeEvaluator(BaseEvaluator):
                 m_data = means[n].get(m_label, {})
                 for mk, mt in METRICS:
                     rows.append({"n_edge": n, "method": m_label, "metric": mk, "metric_label": mt, "value": m_data.get(mk, np.nan)})
+                rows.append({"n_edge": n, "method": m_label, "metric": "n_episodes", "metric_label": "Num Episodes", "value": m_data.get("n_episodes", self.args.episodes)})
         with open(path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=["n_edge", "method", "metric", "metric_label", "value"])
             writer.writeheader()

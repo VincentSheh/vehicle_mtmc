@@ -25,6 +25,7 @@ from offload import (
     no_offload,
     balance_workload,
     score_based_offload,
+    cto_balanced,
     balance_workload_cto,
     balance_workload_cto_acc,
     balance_workload_cto_acc_inv,
@@ -121,6 +122,7 @@ class Environment:
         self.va_attack_offload = bool(va_attack_offload)
         self.t_max = int(t_max)
         self.t = 0
+        self.slot_ms = 200.0  # default, will be set from globals_cfg
         self.history: List[StepMetrics] = []
         self.last_history: List[StepMetrics] = []
         self.final_qoe = 0
@@ -320,7 +322,7 @@ class Environment:
                 s: {r: float(self.prop_delay.get((s, r), 0.0)) for r in self.area_ids}
                 for s in self.area_ids
             }
-            return balance_workload_cto(self.area_ids, W_src, c_dst, nested)
+            return balance_workload_cto(self.area_ids, W_src, c_dst, nested, slot_ms=self.slot_ms)
 
         if mode == "cto_acc":
             nested = {
@@ -341,6 +343,7 @@ class Environment:
                 fnr_matrix=fnr_mat,
                 fpr_matrix=fpr_mat,
                 id_to_idx=self.id_to_idx,
+                slot_ms=self.slot_ms,
             )
 
         if mode == "cto_acc_inv":
@@ -362,6 +365,29 @@ class Environment:
                 fnr_matrix=fnr_mat,
                 fpr_matrix=fpr_mat,
                 id_to_idx=self.id_to_idx,
+                slot_ms=self.slot_ms,
+            )
+
+        if mode == "cto_balanced":
+            nested = {
+                s: {r: float(self.prop_delay.get((s, r), 0.0)) for r in self.area_ids}
+                for s in self.area_ids
+            }
+            fnr_mat = fpr_mat = None
+            if self.acc_by_region is not None and stage == "ids":
+                fpr_mat = self.acc_by_region[:, :, 0]
+                fnr_mat = self.acc_by_region[:, :, 1]
+            return cto_balanced(
+                area_ids=self.area_ids,
+                W_src=W_src,
+                c_dst=c_dst,
+                propagation_delays=nested,
+                fnr_matrix=fnr_mat,
+                fpr_matrix=fpr_mat,
+                weights=self._offload_weights,
+                id_to_idx=self.id_to_idx,
+                max_prop_delay=self._max_prop_delay_ms,
+                slot_ms=self.slot_ms,
             )
 
         # modes "delay_workload" and "full" use score_based_offload
@@ -384,6 +410,7 @@ class Environment:
             weights=self._offload_weights,
             id_to_idx=self.id_to_idx,
             max_prop_delay=self._max_prop_delay_ms,
+            slot_ms=self.slot_ms,
         )
 
     def _run_step_multi_edge(self, ids_cpus, overhead=0.0, disable_attack=False, forced_mode: Optional[str] = None):
@@ -874,6 +901,7 @@ def build_env_from_cfg(cfg: dict):
         offload_mode=_resolve_offload_mode(cfg["globals"]),
         va_attack_offload=bool(cfg["globals"].get("va_attack_offload", False)),
     )
+    env.slot_ms = float(globals_cfg.slot_ms)
     env._max_prop_delay_ms = float(cfg["globals"].get("max_prop_delay_ms", 1e9))
     w = cfg["globals"].get("offload_weights", {})
     env._offload_weights = (

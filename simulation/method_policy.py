@@ -80,6 +80,8 @@ class BaselinePolicy(abc.ABC):
 class ConstantPolicy(BaselinePolicy):
     def __init__(self, cpu_value: float):
         self.cpu_value = cpu_value
+        if cpu_value == 0.0:
+            self.min_cpu_override = 0.0
 
     def act(self, ctx: ActContext) -> tuple[Optional[np.ndarray], np.ndarray]:
         n_edges = len(ctx.ids_cpu)

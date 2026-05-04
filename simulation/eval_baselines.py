@@ -115,7 +115,7 @@ class BaselineEvaluator(BaseEvaluator):
                     try:
                         env = build_env_base(tmp_path)
                         for pkey, rkey in pkey_rkey_pairs:
-                            results[rkey], _ = self.run_simulation(env, cfg, policies[pkey], rkey)
+                            results[rkey], _ = self.run_simulation(env, cfg, policies[pkey], rkey, cache_key=f"{rkey}_{atk_lvl}_{user_lvl}")
                     finally:
                         if os.path.exists(tmp_path): os.remove(tmp_path)
 
@@ -142,7 +142,7 @@ class BaselineEvaluator(BaseEvaluator):
 
     def _print_table(self, results, csv_path: Path):
         col_w = 32
-        header = f"{'Method':<{col_w}} {'qoe_vio_rate':>12} {'reward/mean':>12} {'qoe_penalty':>12} {'atk_drop_pct':>12} {'lambda_res':>12}"
+        header = f"{'Method':<{col_w}} {'qoe_vio_rate':>12} {'reward/mean':>12} {'qoe_penalty':>12} {'atk_drop_pct':>12} {'n_eps':>8}"
         print("\n" + header + "\n" + "-" * len(header))
         
         rows = []
@@ -152,13 +152,14 @@ class BaselineEvaluator(BaseEvaluator):
             atk_drop_pct = atk_drp / atk_in if atk_in > 1e-6 else 0.0
             label = self._display_label(rkey)
             print(f"{label:<{col_w}} {m['slo_vio']:>12.1%} {m['reward']:>12.4f} "
-                  f"{float(np.mean(r['reward_qoe_penalty'])):>12.4f} {atk_drop_pct:>12.1%} {1.0-atk_drop_pct:>12.4f}")
+                  f"{float(np.mean(r['reward_qoe_penalty'])):>12.4f} {atk_drop_pct:>12.1%} {int(m['n_episodes']):>8}")
             
             # Save for replot
             rows.append({"Method": label, "Metric": "SLO Violation Rate", "MetricKey": "slo_vio", "Value": m["slo_vio"]})
             rows.append({"Method": label, "Metric": "Benign Collateral Damage", "MetricKey": "bcd", "Value": m["bcd"]})
             rows.append({"Method": label, "Metric": "Attack Drop %", "MetricKey": "atk_drop", "Value": atk_drop_pct})
             rows.append({"Method": label, "Metric": "Reward", "MetricKey": "reward", "Value": m["reward"]})
+            rows.append({"Method": label, "Metric": "Num Episodes", "MetricKey": "n_episodes", "Value": m["n_episodes"]})
 
         import csv
         with open(csv_path, "w", newline="") as f:

@@ -37,11 +37,11 @@ DEFAULT_METHODS = [
 
 PROPOSED_CONFIGS = [
     ("gm", "delay_workload"),
-    # ("gm", "cto"),
-    ("lm", "delay_workload"),
+    ("gm", "cto"),
+    # ("lm", "delay_workload"),
     # ("lm", "cto_acc_inv"),
-    ("lm", "cto"),
-    ("lm", "cto_acc"),
+    # ("lm", "cto"),
+    # ("lm", "cto_acc"),
 ]
 
 DISPLAY_NAMES: Dict[str, str] = {
@@ -365,10 +365,41 @@ class BaseEvaluator:
         """Override in subclasses to modify config for each simulation run."""
         return cfg
 
-    def run_simulation(self, env, cfg, policy, label, initial_ids_cpu=None) -> Tuple[Dict[str, np.ndarray], np.ndarray]:
+    def run_simulation(self, env, cfg, policy, label, initial_ids_cpu=None, cache_key: str = None) -> Tuple[Dict[str, np.ndarray], np.ndarray]:
+        # Sanitize key for filename
+        use_key = cache_key or label
+        safe_label = "".join([c if c.isalnum() or c in ("_", "-") else "_" for c in use_key])
+        cache_path = self.outdir / f"cache_{safe_label}.npz"
+        
         accumulated = {}
         last_ids = initial_ids_cpu
-        for ep in tqdm(range(self.args.episodes), desc=f"episodes ({label})", leave=False):
+        start_ep = 0
+
+        if cache_path.exists():
+            try:
+                with np.load(cache_path, allow_pickle=True) as data:
+                    # np.load returns a NpzFile which is like a dict
+                    accumulated = {k: data[k] for k in data.files if k != "last_ids"}
+                    if "last_ids" in data.files:
+                        last_ids = data["last_ids"]
+                    
+                    # Determine start episode from reallocations (1 per episode) or other metrics
+                    if "reallocations" in accumulated:
+                        start_ep = len(accumulated["reallocations"])
+                    elif "qoe" in accumulated:
+                        # Fallback: total steps / decision_interval (rough estimate)
+                        # But reallocations is better if available
+                        pass
+                
+                if start_ep > 0:
+                    print(f"  [cache] Loaded {start_ep} episodes for {label}")
+            except Exception as e:
+                print(f"  [warn] Failed to load cache {cache_path}: {e}")
+
+        if start_ep >= self.args.episodes:
+            return accumulated, last_ids
+
+        for ep in tqdm(range(start_ep, self.args.episodes), desc=f"episodes ({label})", leave=False):
             ep_seed = self.base_seed + (ep + 1) * 1000
             res, last_ids = run_episode(
                 env=env, cfg=cfg, policy=policy, obs_keys=self.obs_keys,
@@ -384,6 +415,16 @@ class BaseEvaluator:
             
             for k, v in res.items():
                 accumulated[k] = np.concatenate([accumulated[k], v]) if k in accumulated else v
+        
+        # Save to cache
+        try:
+            save_dict = {**accumulated}
+            if last_ids is not None:
+                save_dict["last_ids"] = last_ids
+            np.savez(cache_path, **save_dict)
+        except Exception as e:
+            print(f"  [warn] Failed to save cache {cache_path}: {e}")
+
         return accumulated, last_ids
 
     @staticmethod
@@ -397,12 +438,13 @@ class BaseEvaluator:
         else: atk_leak = np.nan
 
         return {
-            "slo_vio":  float(np.mean(arrays["qoe_vio_rate"])) if "qoe_vio_rate" in arrays else np.nan,
-            "bcd":      float(np.mean(arrays["reward_benign_col_dmg"])) if "reward_benign_col_dmg" in arrays else np.nan,
-            "atk_leak": atk_leak,
-            "atk_drop": 1.0 - atk_leak if not np.isnan(atk_leak) else np.nan,
-            "realloc":  float(np.mean(arrays["reallocations"])) if "reallocations" in arrays else np.nan,
-            "reward":   float(np.mean(arrays["reward"])) if "reward" in arrays else np.nan,
+            "slo_vio":   float(np.mean(arrays["qoe_vio_rate"])) if "qoe_vio_rate" in arrays else np.nan,
+            "bcd":       float(np.mean(arrays["reward_benign_col_dmg"])) if "reward_benign_col_dmg" in arrays else np.nan,
+            "atk_leak":  atk_leak,
+            "atk_drop":  1.0 - atk_leak if not np.isnan(atk_leak) else np.nan,
+            "realloc":   float(np.mean(arrays["reallocations"])) if "reallocations" in arrays else np.nan,
+            "reward":    float(np.mean(arrays["reward"])) if "reward" in arrays else np.nan,
+            "n_episodes": float(len(arrays["reallocations"])) if "reallocations" in arrays else 0.0,
         }
 
     @staticmethod
