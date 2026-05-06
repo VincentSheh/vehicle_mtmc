@@ -25,7 +25,7 @@ globals:
     # pattern_types: ["yoyo"]
     level: "default"
     lambda_level:
-      default: [14000, 18000] # Per Second
+      default: [7000, 24000] # Per Second
       # default: [0, 0]
       low: [5000, 10000]
       mid: [12000, 16000]

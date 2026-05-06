@@ -28,16 +28,23 @@ from method_policy import (
 SCALING_QUANTA = [0.5, 1.0, 1.5, 2.0]
 
 DEFAULT_METHODS = [
+    # "constant_0.0",
+    # "constant_1.0",
+    # "constant_2.0",
+    # "constant_3.0",
+    # "constant_4.0",
+    # "constant_5.0",
     # "no_ids",
     # "static_low",
     # "static_high",
-    # "autoscale_def",
-    # "offline_optimal",
+    # "static_balanced",
+    "autoscale_def",
+    "offline_optimal",
 ]
 
 PROPOSED_CONFIGS = [
     ("gm", "delay_workload"),
-    ("gm", "cto"),
+    # ("gm", "cto"),
     # ("lm", "delay_workload"),
     # ("lm", "cto_acc_inv"),
     # ("lm", "cto"),
@@ -181,6 +188,7 @@ def run_episode(
 ) -> Tuple[Dict[str, np.ndarray], np.ndarray]:
     env.reset(seed)
     policy.reset()
+    import torch; torch.manual_seed(seed)
 
     n_edges      = len(env.edge_areas)
     area_ids_run = [e.area_id for e in env.edge_areas]
@@ -327,7 +335,9 @@ class BaseEvaluator:
         self.decision_interval = args.decision_interval or int(self.cfg_original["globals"]["decision_interval"])
         self.outdir = Path(args.outdir)
         self.outdir.mkdir(parents=True, exist_ok=True)
-        
+        self.cachedir = self.outdir / "cache"
+        self.cachedir.mkdir(parents=True, exist_ok=True)
+
         # Setup obs/reward params from a temporary env wrapper
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as tmp:
             yaml.dump(self.cfg_original, tmp)
@@ -365,11 +375,13 @@ class BaseEvaluator:
         """Override in subclasses to modify config for each simulation run."""
         return cfg
 
-    def run_simulation(self, env, cfg, policy, label, initial_ids_cpu=None, cache_key: str = None) -> Tuple[Dict[str, np.ndarray], np.ndarray]:
+    def run_simulation(self, env, cfg, policy, label, initial_ids_cpu=None, cache_key: str = None, cache_dir: Optional[Path] = None) -> Tuple[Dict[str, np.ndarray], np.ndarray]:
         # Sanitize key for filename
         use_key = cache_key or label
         safe_label = "".join([c if c.isalnum() or c in ("_", "-") else "_" for c in use_key])
-        cache_path = self.outdir / f"cache_{safe_label}.npz"
+        resolved_cache_dir = cache_dir if cache_dir is not None else self.cachedir
+        resolved_cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_path = resolved_cache_dir / f"{safe_label}.npz"
         
         accumulated = {}
         last_ids = initial_ids_cpu

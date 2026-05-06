@@ -43,9 +43,22 @@ class AttackTypeLibrary:
     Each EdgeArea holds a reference and draws from P(a|e) at episode start.
     """
 
-    def __init__(self, n_types: int, sampler_cfg: dict, rng: np.random.Generator):
+    def __init__(
+        self,
+        n_types: int,
+        sampler_cfg: dict,
+        rng: np.random.Generator,
+        decision_interval: Optional[int] = None,
+        slot_ms: Optional[float] = None,
+        ids_latency_ms: Optional[float] = None,
+        cpu_cores: Optional[int] = None,
+    ):
         self.n_types = n_types
         self.sampler_cfg = sampler_cfg
+        self._decision_interval = decision_interval
+        self._slot_ms = slot_ms
+        self._ids_latency_ms = ids_latency_ms
+        self._cpu_cores = cpu_cores
         self._specs: List[AttackTypeSpec] = []
         self._sample_all(rng)
 
@@ -54,6 +67,11 @@ class AttackTypeLibrary:
         pattern_types = cfg.get("pattern_types", ["sinus", "pw", "expo", "static"])
         specs = []
 
+        use_derived_cycle = (
+            "t_cycle_min" not in cfg and "t_cycle_delta" not in cfg
+            and None not in (self._decision_interval, self._slot_ms, self._ids_latency_ms, self._cpu_cores)
+        )
+
         # Support dynamic level injection for lambda_base
         if "lambda_level" in cfg:
             lvl = cfg.get("level", "default")
@@ -61,17 +79,42 @@ class AttackTypeLibrary:
         else:
             lb_range = cfg["lambda_base"]
 
+        raw_alf = cfg.get("active_len_factor", 0.25)
+
         for i in range(self.n_types):
             ns_range   = cfg["noise_std"]
-            tcm_range  = cfg["t_cycle_min"]
-            tcd_range  = cfg["t_cycle_delta"]
             lat_range  = cfg["latency_per_flow"]
             bw_range   = cfg["bw_per_flow"]
-            t_min = float(rng.uniform(*tcm_range))
-            t_max = t_min + float(rng.uniform(*tcd_range))
+
+            if use_derived_cycle:
+                # lambda_base drawn first — formula depends on it
+                lambda_base = float(rng.uniform(*lb_range))
+                decision_sec = self._decision_interval * self._slot_ms / 1000.0
+                ids_speed_half = (1000.0 / self._ids_latency_ms) * (0.5 / self._cpu_cores)
+                t_cycle = 1.0 * decision_sec * lambda_base / ids_speed_half
+                t_min = t_cycle
+                t_max = t_cycle
+            else:
+                # Preserve original draw order: t_min → t_max_delta → lambda_base
+                tcm_range = cfg["t_cycle_min"]
+                tcd_range = cfg["t_cycle_delta"]
+                t_min = float(rng.uniform(*tcm_range))
+                t_max = t_min + float(rng.uniform(*tcd_range))
+                lambda_base = float(rng.uniform(*lb_range))
+
+            if isinstance(raw_alf, (list, tuple)):
+                if len(raw_alf) == 2:
+                    active_len_factor = float(rng.uniform(raw_alf[0], raw_alf[1]))
+                elif len(raw_alf) == 3:
+                    p_inactive, lo, hi = raw_alf
+                    active_len_factor = 0.0 if float(rng.uniform(0.0, 1.0)) < p_inactive else float(rng.uniform(lo, hi))
+                else:
+                    raise ValueError(f"active_len_factor array must have length 2 or 3, got {len(raw_alf)}")
+            else:
+                active_len_factor = float(raw_alf)
             specs.append(AttackTypeSpec(
                 type_id=i,
-                lambda_base=float(rng.uniform(*lb_range)),
+                lambda_base=lambda_base,
                 noise_std=float(np.clip(rng.uniform(*ns_range), 0.0, 1.0)),
                 pattern_type=str(rng.choice(pattern_types)),
                 t_min_pattern=t_min,
@@ -79,7 +122,7 @@ class AttackTypeLibrary:
                 latency_per_flow=float(rng.uniform(*lat_range)),
                 bw_per_flow=float(rng.uniform(*bw_range)),
                 non_defendable_bw_const=float(cfg.get("non_defendable_bw_const", 0.0)),
-                active_len_factor=float(cfg.get("active_len_factor", 0.25)),
+                active_len_factor=active_len_factor,
             ))
         self._specs = specs
 

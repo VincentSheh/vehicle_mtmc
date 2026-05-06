@@ -16,8 +16,10 @@ __py*
 .jedi
 simulation/wandb/*
 simulation/eval_out/*
+simulation/eval_out_*
 simulation/logs/*
 simulation/output/*
 simulation/visualization/output/*
 *.csv
 *.png
+*.npz

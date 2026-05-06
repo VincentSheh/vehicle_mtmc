@@ -10,9 +10,9 @@ globals:
   cpu_clock_cycle: 3.8 # Used to convert detection latency to cycle
   cpu_cores: 8
   fps: 5
-  decision_interval: 100
+  decision_interval: 300
 
-  ids: # Capacity with 8 CPU is 1 / 0.0357 = 28011 Flows / second
+  ids:
     latency_ms: 0.0357 #0.357
     cycles_ms: 0.0
 
@@ -25,13 +25,13 @@ globals:
     # pattern_types: ["yoyo"]
     level: "default"
     lambda_level:
-      default: [14000, 18000] # Per Second
+      default: [10000, 18000]
       # default: [0, 0]
       low: [5000, 10000]
       mid: [12000, 16000]
       high: [18000, 24000]
     noise_std:        [0.05, 0.10]
-    t_cycle_min:      [300, 500]     # seconds (lower bound on cycle duration)
+    t_cycle_min:      [600, 1000]     # seconds (lower bound on cycle duration)
     t_cycle_delta:    [300, 800]   # seconds added to t_min to get t_max
     latency_per_flow: [2,4]      # ms per flow  (latency_per_flow * 1000 * va_cpu / lambda_base)
     bw_per_flow:      [0.0, 0.0]   # Mbps per flow
@@ -45,7 +45,7 @@ globals:
       kappa: 0.25 
       sigma: 8 # Before Conversion to per step request = 0.9
       mu_level:
-        default: [20.0, 250.0]
+        default: [50.0, 250.0]
         low: [10.0, 100.0]
         mid: [30.0, 150.0]
         high: [50.0, 250.0]
@@ -98,33 +98,9 @@ globals:
     path: configs/accuracy_matrix.json
     model: gm
 
-  # accuracy_by_region (static fallback, used when accuracy_matrix is absent):
-  #   - [[0.10, 0.00], [0.45, 0.00], [0.01, 0.00]]
-  #   - [[0.20, 0.00], [0.10, 0.00], [0.01, 0.00]]
-  #   - [[0.20, 0.00], [0.45, 0.00], [0.10, 0.00]]
-
   # Propagation delay matrix in ms: row=source edge index, col=target edge index.
-  # Order matches edge_areas list: E1=0, E2=1, E3=2. Diagonal must be 0.
-  # - Campus LAN: 1–5 ms
-  # - City-scale (intersection to intersection): 5–20 ms
-  # - Metro area / across districts: 20–50 ms
   delay_ms:
-    # Asymmetric: E2 is close (5 ms), E3 is far (30 ms from E1).
-    # delay_workload prefers E2 (lower delay penalty); full overrides to E3 (accuracy wins).
-    # - [0.0,   5.0,  30.0]
-    # - [5.0,   0.0,  25.0]
-    # - [30.0, 25.0,   0.0]
-    # - [0.0,   0.0,  0.0]
-    # - [0.0,   0.0,  0.0]
-    # - [0.0,  0.0,  0.0]
-    - [0.0,   20.0,  20.0]
-    - [20.0,   0.0,  20.0]
-    - [20.0,  20.0,  0.0]
-    # - [0.0,  20.0,  20.0, 20.0, 20.0]
-    # - [20.0,  0.0,  20.0, 20.0, 20.0]
-    # - [20.0, 20.0,   0.0, 20.0, 20.0]
-    # - [20.0, 20.0,  20.0,  0.0, 20.0]
-    # - [20.0, 20.0,  20.0, 20.0,  0.0]
+    - [0.0]
 
   video_pipeline:
     reid_latency: 20 #! Should consider batch processing
@@ -186,55 +162,3 @@ edge_areas:
       Gamma: 0.0005
 
     dirichlet_concentration: 1.0  # Dirichlet alpha for P(a|e); 1.0 = uniform over attack types
-
-
-  - area_id: "E2"
-    cpu_cycle_per_ms: 3.8 #3.8GHz #3.8E6 / ms
-    slo_beta: 3.0
-    slo_threshold: 0.2
-    budget: { cpu: 8.0, mem: 8.0, uplink: 100 } #100Mbps
-    constraints:
-      D_Max: 250.0
-      MOTA_min: 0.1
-      Gamma: 0.0005
-
-    dirichlet_concentration: 1.0  # Dirichlet alpha for P(a|e); 1.0 = uniform over attack types
-
-
-  - area_id: "E3"
-    cpu_cycle_per_ms: 3.8 #3.8GHz #3.8E6 / ms
-    slo_beta: 3.0
-    slo_threshold: 0.2
-    budget: { cpu: 8.0, mem: 8.0, uplink: 100 } #100Mbps
-    constraints:
-      D_Max: 250.0
-      MOTA_min: 0.1
-      Gamma: 0.0005
-
-    dirichlet_concentration: 1.0  # Dirichlet alpha for P(a|e); 1.0 = uniform over attack types
-
-
-  # - area_id: "E4"
-  #   cpu_cycle_per_ms: 3.8 #3.8GHz #3.8E6 / ms
-  #   slo_beta: 3.0
-  #   slo_threshold: 0.2
-  #   budget: { cpu: 8.0, mem: 8.0, uplink: 100 } #100Mbps
-  #   constraints:
-  #     D_Max: 250.0
-  #     MOTA_min: 0.1
-  #     Gamma: 0.0005
-
-  #   dirichlet_concentration: 1.0  # Dirichlet alpha for P(a|e); 1.0 = uniform over attack types
-
-
-  # - area_id: "E5"
-  #   cpu_cycle_per_ms: 3.8 #3.8GHz #3.8E6 / ms
-  #   slo_beta: 3.0
-  #   slo_threshold: 0.2
-  #   budget: { cpu: 8.0, mem: 8.0, uplink: 100 } #100Mbps
-  #   constraints:
-  #     D_Max: 250.0
-  #     MOTA_min: 0.1
-  #     Gamma: 0.0005
-
-  #   dirichlet_concentration: 1.0  # Dirichlet alpha for P(a|e); 1.0 = uniform over attack types

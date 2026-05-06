@@ -799,6 +799,10 @@ def build_env_from_cfg(cfg: dict):
             n_types=int(sampler_cfg.get("n_types", 10)),
             sampler_cfg=sampler_cfg,
             rng=lib_rng,
+            decision_interval=int(cfg["globals"].get("decision_interval", 300)),
+            slot_ms=globals_cfg.slot_ms,
+            ids_latency_ms=float(cfg["globals"]["ids"]["latency_ms"]),
+            cpu_cores=globals_cfg.cpu_cores,
         )
     else:
         attack_type_library = None

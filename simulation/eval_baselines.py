@@ -115,7 +115,7 @@ class BaselineEvaluator(BaseEvaluator):
                     try:
                         env = build_env_base(tmp_path)
                         for pkey, rkey in pkey_rkey_pairs:
-                            results[rkey], _ = self.run_simulation(env, cfg, policies[pkey], rkey, cache_key=f"{rkey}_{atk_lvl}_{user_lvl}")
+                            results[rkey], _ = self.run_simulation(env, cfg, policies[pkey], rkey, cache_key=f"{rkey}_{atk_lvl}_{user_lvl}", cache_dir=lvl_outdir / "cache")
                     finally:
                         if os.path.exists(tmp_path): os.remove(tmp_path)
 

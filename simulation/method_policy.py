@@ -784,7 +784,7 @@ def make_baseline_policy(
     device: str = "cpu",
 ) -> BaselinePolicy:
     """
-    name examples: "random", "constant_0.5", "constant_1.5", "reactive", "tbsa", "lstm_rl", "ma_lstm_rl"
+    name examples: "random", "constant_0.5", "constant_2.0", "reactive", "tbsa", "lstm_rl", "ma_lstm_rl"
     """
     if name.startswith("constant_"):
         cpu_val = float(name.split("_", 1)[1])
