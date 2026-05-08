@@ -89,11 +89,24 @@ class AttackTypeLibrary:
             if use_derived_cycle:
                 # lambda_base drawn first — formula depends on it
                 lambda_base = float(rng.uniform(*lb_range))
-                decision_sec = self._decision_interval * self._slot_ms / 1000.0
-                ids_speed_half = (1000.0 / self._ids_latency_ms) * (0.5 / self._cpu_cores)
-                t_cycle = 1.0 * decision_sec * lambda_base / ids_speed_half
-                t_min = t_cycle
-                t_max = t_cycle
+
+                # Formula parameters (principled ranges for reactive baselines)
+                # mu_def_core: IDS capacity per core (pkts/sec)
+                mu_def_core = (1000.0 / self._ids_latency_ms) / self._cpu_cores
+
+                # Principled ranges for delta_c (scaling magnitude) and delta_t (decision duration)
+                # Ensuring the silent phase reliably triggers a scale-down and sustains oscillation.
+                dc_min, dc_max = 0.5, 2.0
+                dt_min_sec = 300.0 * self._slot_ms / 1000.0
+                dt_max_sec = 500.0 * self._slot_ms / 1000.0
+
+                # T_cyc range: ramp-up time to full defense capacity varies across configurations
+                t_cyc_min = 2.0 * np.ceil(lambda_base / (mu_def_core * dc_max)) * dt_max_sec
+                t_cyc_max = 2.0 * np.ceil(lambda_base / (mu_def_core * dc_min)) * dt_min_sec
+
+
+                t_min = t_cyc_min
+                t_max = t_cyc_max
             else:
                 # Preserve original draw order: t_min → t_max_delta → lambda_base
                 tcm_range = cfg["t_cycle_min"]

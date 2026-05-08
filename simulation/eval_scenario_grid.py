@@ -200,7 +200,7 @@ def main():
     ap.add_argument("--episodes", type=int, default=10)
     ap.add_argument("--outdir", default="eval_out/scenario_grid")
     ap.add_argument("--ckpt", default="checkpoints/_singleedge/a4_sf20_atk3_a18_default_default/ckpt_best.pt")
-    ap.add_argument("--tbsa_table", default="tbsa_table.npz")
+    ap.add_argument("--tbsa_table", default="tbsa_table_15.npz")
     ap.add_argument("--ids_cpu_min", type=float, default=0.5)
     ap.add_argument("--scale_step", type=float, default=0.5)
     ap.add_argument("--decision_interval", type=int, default=None)

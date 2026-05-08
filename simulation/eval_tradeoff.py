@@ -54,10 +54,9 @@ class TradeoffEvaluator(BaseEvaluator):
 
     def run_adaptive(self):
         env = build_env_base(self.args.cfg)
-        # Use MA LSTM RL as the proposed method
         policy = make_baseline_policy(
-            "ma_lstm_rl", 
-            ckpt_path=self.args.adaptive_ckpt,
+            self.args.proposed_method,
+            ckpt_path=self.args.ckpt,
             device=self.args.device
         )
         label = "adaptive_rl"
@@ -97,7 +96,7 @@ def plot_tradeoff(sweep_results, adaptive_metrics, outpath):
 
     # Let's adjust the run_adaptive to return the avg_eta too.
     
-    ax.set_xlabel('Static IDS Allocation Ratio ($\eta$)')
+    ax.set_xlabel(r'Static IDS Allocation Ratio ($\eta$)')
     ax.set_ylabel('Metric Value')
     ax.set_title('Defense-Service Tradeoff Curve')
     ax.grid(True, alpha=0.3)
@@ -113,6 +112,7 @@ def main():
     parser.add_argument("--outdir", default="eval_tradeoff_out/test")
     parser.add_argument("--episodes", type=int, default=5)
     parser.add_argument("--ckpt", default="checkpoints/_phase2/phase2_act3/ckpt_best.pt", help="Path to the adaptive method checkpoint")
+    parser.add_argument("--proposed_method", default="ma_lstm_rl", help="Policy type for the proposed method (ma_lstm_rl, ma_mlp_rl, etc.)")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--eta_steps", type=int, default=11)
     # Re-use some defaults from eval_common/BaseEvaluator
@@ -144,7 +144,7 @@ def main():
         
         try:
             env = build_env_base(tmp_path)
-            policy = make_baseline_policy("ma_lstm_rl", ckpt_path=args.ckpt, device=args.device)
+            policy = make_baseline_policy(args.proposed_method, ckpt_path=args.ckpt, device=args.device)
             res_dict, _ = evaluator.run_simulation(env, cfg_mut, policy, label)
             metrics = evaluator.extract_metrics(res_dict)
             avg_eta = np.mean(res_dict["cpu_to_ids_ratio"])
@@ -165,8 +165,12 @@ def main():
     other_adaptive = []
     for bname in ["reactive", "offline_optimal"]:
         print(f"\nRunning adaptive baseline: {bname}...")
-        env = build_env_base(args.cfg)
+        # Fix disk re-read
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as tmp:
+            yaml.dump(evaluator.cfg_original, tmp)
+            tmp_path = tmp.name
         try:
+            env = build_env_base(tmp_path)
             policy = make_baseline_policy(bname, tbsa_table_path=args.tbsa_table, device=args.device)
             res_dict, _ = evaluator.run_simulation(env, evaluator.cfg_original, policy, f"baseline_{bname}")
             metrics = evaluator.extract_metrics(res_dict)
@@ -180,6 +184,9 @@ def main():
             print(f"    Leak={metrics['atk_leak']:.3f}, SLO={metrics['slo_vio']:.3f}, BCD={metrics['bcd']:.3f}")
         except Exception as e:
             print(f"  [warn] Failed to run {bname}: {e}")
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
 
     # Plotting
     etas = [r["eta"] for r in sweep_results]
@@ -200,9 +207,16 @@ def main():
         met = pt["metrics"]
         lbl = pt["label"]
         plt.axvline(x=ae, color='red', linestyle=':', alpha=0.1)
+        
+        # Plot markers
         plt.scatter([ae], [met["atk_leak"]], color='red', marker=m, s=200, edgecolors='black', label=f'Prop {lbl} (Leak)', zorder=10)
         plt.scatter([ae], [met["slo_vio"]], color='blue', marker=m, s=200, edgecolors='black', label=f'Prop {lbl} (SLO)', zorder=10)
         plt.scatter([ae], [met["bcd"]], color='purple', marker=m, s=200, edgecolors='black', label=f'Prop {lbl} (BCD)', zorder=10)
+        
+        # Plot text on top (higher zorder and slight y-offset)
+        plt.text(ae, met["atk_leak"] + 0.005, f'{met["atk_leak"]:.3f}', ha='center', va='bottom', fontsize=8, color='red', fontweight='bold', zorder=20)
+        plt.text(ae, met["slo_vio"] + 0.005, f'{met["slo_vio"]:.3f}', ha='center', va='bottom', fontsize=8, color='blue', fontweight='bold', zorder=20)
+        plt.text(ae, met["bcd"] + 0.005, f'{met["bcd"]:.3f}', ha='center', va='bottom', fontsize=8, color='purple', fontweight='bold', zorder=20)
 
     # Other Adaptive points
     markers_other = ['d', 'h', 'p', '8']
@@ -212,15 +226,20 @@ def main():
         met = pt["metrics"]
         lbl = pt["label"]
         plt.axvline(x=ae, color='gray', linestyle=':', alpha=0.1)
+        
         plt.scatter([ae], [met["atk_leak"]], color='red', marker=m, s=150, alpha=0.7, edgecolors='gray', label=f'Base {lbl} (Leak)', zorder=5)
         plt.scatter([ae], [met["slo_vio"]], color='blue', marker=m, s=150, alpha=0.7, edgecolors='gray', label=f'Base {lbl} (SLO)', zorder=5)
         plt.scatter([ae], [met["bcd"]], color='purple', marker=m, s=150, alpha=0.7, edgecolors='gray', label=f'Base {lbl} (BCD)', zorder=5)
+        
+        plt.text(ae, met["atk_leak"] + 0.005, f'{met["atk_leak"]:.3f}', ha='center', va='bottom', fontsize=7, color='red', zorder=20)
+        plt.text(ae, met["slo_vio"] + 0.005, f'{met["slo_vio"]:.3f}', ha='center', va='bottom', fontsize=7, color='blue', zorder=20)
+        plt.text(ae, met["bcd"] + 0.005, f'{met["bcd"]:.3f}', ha='center', va='bottom', fontsize=7, color='purple', zorder=20)
 
-    plt.xlabel('IDS Allocation Ratio ($\eta$)')
+    plt.xlabel(r'IDS Allocation Ratio ($\eta$)')
     plt.ylabel('Metric Value')
     plt.title('Defense-Service Tradeoff Curve (Proposed vs Baselines)')
     plt.grid(True, alpha=0.2)
-    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize='x-small')
+    plt.legend(loc='upper center', bbox_to_anchor=(0.5, 0.98), ncol=3, fontsize='x-small', framealpha=0.8)
     
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)

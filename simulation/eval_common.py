@@ -61,6 +61,7 @@ DISPLAY_NAMES: Dict[str, str] = {
     "offline_optimal": "TBSA Optimal",
     "lstm_rl":         "LSTM RL",
     "ma_lstm_rl":      "MA LSTM RL",
+    "ma_mlp_rl":       "MA MLP RL",
     "gm":              "Global Model",
     "lm":              "Local Model",
 }
@@ -170,6 +171,30 @@ def _get_cpu_utils(env, decision_interval: int) -> np.ndarray:
         utils[i] = float(np.clip(np.mean(g["ids_cpu_utilization"].values), 0.0, 1.0))
     return utils
 
+def _derive_last_atk_fields(accumulated: Dict[str, np.ndarray]) -> None:
+    """Back-fill last_atk_intervals / last_atk_intensity from attack_in_rate when missing (e.g. old cache)."""
+    if "last_atk_intervals" in accumulated and "last_atk_intensity" in accumulated:
+        return
+    atk = accumulated.get("attack_in_rate")
+    if atk is None or atk.size == 0:
+        return
+    intervals = np.empty(len(atk), dtype=np.float32)
+    intensity = np.empty(len(atk), dtype=np.float32)
+    cur_iv, cur_int = 10, 0.0
+    for t in range(len(atk)):
+        if atk[t] > 1e-6:
+            cur_iv = 0
+            cur_int = max(cur_int, float(atk[t]))
+        else:
+            cur_iv = min(cur_iv + 1, 10)
+            if cur_iv >= 10:
+                cur_int = 0.0
+        intervals[t] = float(cur_iv)
+        intensity[t] = cur_int
+    accumulated["last_atk_intervals"] = intervals
+    accumulated["last_atk_intensity"] = intensity
+
+
 def run_episode(
     env,
     cfg: dict,
@@ -219,8 +244,12 @@ def run_episode(
         "qoe": [], "qoe_per_edge": [], "qoe_vio_rate": [], "benign_col_dmg": [],
         "cpu_util": [], "local_num_req": [], "attack_in_rate": [], "attack_in_rate_std": [],
         "attack_drop_rate": [], "ema_mom": [], "cpu_to_ids_ratio": [],
-        "reward_lambda_res": [], "reward_benign_col_dmg": [], "reward_qoe_penalty": [], "reward": []
+        "reward_lambda_res": [], "reward_benign_col_dmg": [], "reward_qoe_penalty": [], "reward": [],
+        "last_atk_intervals": [], "last_atk_intensity": [],
     }
+
+    last_atk_intervals = np.full(n_edges, 10, dtype=np.int32)
+    last_atk_intensity = np.zeros(n_edges, dtype=np.float32)
 
     for _ in range(decisions):
         if env.t >= env.t_max: break
@@ -299,6 +328,23 @@ def run_episode(
         for k in ["local_num_req", "attack_in_rate", "attack_drop_rate", "ema_mom"]:
             metrics_ts[k].append(float(df[k].mean()) if k in df.columns else 0.0)
         metrics_ts["attack_in_rate_std"].append(float(df["attack_in_rate"].std()) if "attack_in_rate" in df.columns else 0.0)
+
+        # Last-attack tracking (mirrors train_ma_cur_mlp.py wrapper logic)
+        for i, aid in enumerate(area_ids_run):
+            g = df[df["area_id"] == aid] if "area_id" in df.columns else pd.DataFrame()
+            if not g.empty and "attack_in_rate" in g.columns:
+                atk_vals = g["attack_in_rate"].values
+                atk_present = atk_vals > 1e-6
+                if atk_present.any():
+                    last_atk_intervals[i] = 0
+                    mean_atk = float(atk_vals[atk_present].mean())
+                    last_atk_intensity[i] = max(float(last_atk_intensity[i]), mean_atk)
+                else:
+                    last_atk_intervals[i] = min(int(last_atk_intervals[i]) + 1, 10)
+                    if last_atk_intervals[i] >= 10:
+                        last_atk_intensity[i] = 0.0
+        metrics_ts["last_atk_intervals"].append(float(np.mean(last_atk_intervals)))
+        metrics_ts["last_atk_intensity"].append(float(np.mean(last_atk_intensity)))
         
         ratios = ids_cpu_settled / np.array([e.budget.cpu for e in env.edge_areas], dtype=np.float32)
         metrics_ts["cpu_to_ids_ratio"].append(float(ratios.mean()))
@@ -363,7 +409,7 @@ class BaseEvaluator:
         policies = {}
         for name in methods:
             tbsa_path = str(self.args.tbsa_table) if name in ("tbsa", "offline_optimal") else None
-            ckpt = self.args.ckpt if name in ("lstm_rl", "ma_lstm_rl") else None
+            ckpt = self.args.ckpt if name in ("lstm_rl", "ma_lstm_rl", "ma_mlp_rl") else None
             ok_keys = self.obs_keys if name == "lstm_rl" else None
             try:
                 policies[name] = make_baseline_policy(name, tbsa_table_path=tbsa_path, ckpt_path=ckpt, obs_keys=ok_keys, device=self.args.device)
@@ -409,14 +455,16 @@ class BaseEvaluator:
                 print(f"  [warn] Failed to load cache {cache_path}: {e}")
 
         if start_ep >= self.args.episodes:
+            _derive_last_atk_fields(accumulated)
             return accumulated, last_ids
 
+        effective_n_actions = getattr(policy, "n_actions", self.n_actions)
         for ep in tqdm(range(start_ep, self.args.episodes), desc=f"episodes ({label})", leave=False):
             ep_seed = self.base_seed + (ep + 1) * 1000
             res, last_ids = run_episode(
                 env=env, cfg=cfg, policy=policy, obs_keys=self.obs_keys,
                 decision_interval=self.decision_interval, scale_step=self.args.scale_step,
-                n_actions=self.n_actions, ids_cpu_min=self.args.ids_cpu_min, seed=ep_seed,
+                n_actions=effective_n_actions, ids_cpu_min=self.args.ids_cpu_min, seed=ep_seed,
                 reward_alpha=self.reward_alpha, reward_beta=self.reward_beta,
                 reward_gamma=self.reward_gamma, reward_q_th=self.reward_q_th,
                 initial_ids_cpu=last_ids,
@@ -469,4 +517,5 @@ class BaseEvaluator:
 
     @staticmethod
     def make_proposed_display_label(mname: str, model_key: str, offload_mode: str) -> str:
-        return f"{mname} {offload_mode}_{model_key}"
+        ol = OFFLOAD_DISPLAY_NAMES.get(offload_mode, offload_mode)
+        return f"{mname} {ol}_{model_key}"

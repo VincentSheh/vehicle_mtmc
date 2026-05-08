@@ -23,7 +23,7 @@ from tbsa_offline import TBSAPolicy
 OFFLOAD_DISPLAY_NAMES: Dict[str, str] = {
     "none":           "No Offload",
     "balance":        "Balance",
-    "delay_workload": "Delay-Weighted",
+    "delay_workload": "qos_offloading",
     "full":           "Full Score",
     "cto":            "CTO",
     "cto_acc":        "CTO+Acc",
@@ -774,6 +774,259 @@ class MALSTMRLPolicy(BaselinePolicy):
 
 
 # ---------------------------------------------------------------------------
+# Multi-Agent MLP RL policy (loads a train_ma_cur_mlp.py checkpoint)
+# ---------------------------------------------------------------------------
+class MAMLPRLPolicy(BaselinePolicy):
+    """
+    Wraps a checkpoint produced by train_ma_cur_mlp.py (pure MLP actor).
+    Obs layout mirrors IndepTorchRLEnvWrapper._build_observation(), including
+    stateful last-attack-interval and attack-rate ring-buffer tracking.
+    """
+    _ATK_WINDOW = 10
+
+    @staticmethod
+    def _make_obs_keys(n_actions: int) -> List[str]:
+        _ext = n_actions != 3
+        return [
+            "local_num_req",
+            "attack_in_rate",
+            "last_atk_intervals",
+            "last_atk_intensity",
+            "cpu_to_ids_ratio",
+            "ids_cpu_utilization",
+            "neighbor_ids_util",
+            *( ["neighbor_delta"] if _ext else [] ),
+            "neighbor_atk_rate",
+            "prev_slo_vio",
+            *( ["transition_ticks_norm", "delta_in_flight_norm", "queue_ahead_norm"] if _ext else [] ),
+        ]
+
+    def __init__(self, ckpt_path: str, device: str = "cpu", greedy: bool = False):
+        import torch
+        import torch.nn as nn
+
+        self.device     = torch.device(device)
+        self.greedy     = greedy
+        self.scale_step = 0.5
+        self.is_phase1  = "phase1" in str(ckpt_path).lower()
+
+        state     = torch.load(ckpt_path, map_location=self.device, weights_only=False)
+        train_cfg = state["train_cfg"]
+
+        hidden_dim     = int(train_cfg["model"]["hidden_dim"])
+        self.n_actions = int(train_cfg["model"]["n_actions"])
+        num_layers     = int(train_cfg["model"].get("num_layers", 2))
+
+        # Checkpoint: ProbabilisticActor(TensorDictModule(nn.Sequential))
+        # PA wraps TDM → "module." prefix; TDM may wrap another TDM at index 0
+        # giving "module.0.module.<idx>.<param>" or "module.module.<idx>.<param>"
+        policy_sd = state["policy"]
+        mapped_sd = {}
+        for k, v in policy_sd.items():
+            if k.startswith("module.module."):
+                mapped_sd[k[len("module.module."):]] = v
+            elif k.startswith("module.0.module."):
+                mapped_sd[k[len("module.0.module."):]] = v
+            elif k.startswith("module."):
+                mapped_sd[k[len("module."):]] = v
+
+        # Determine obs_keys / obs_dim: prefer stored obs_keys, fall back to weight shape
+        # Keys added after initial training (newest first); dropped in order until dims match
+        _ADDED_KEYS = ["last_atk_intensity"]
+        if state.get("obs_keys"):
+            self._obs_keys = list(state["obs_keys"])
+        else:
+            canonical = self._make_obs_keys(self.n_actions)
+            ckpt_obs_dim = next(
+                (v.shape[1] for k, v in mapped_sd.items() if k == "0.weight"), len(canonical)
+            )
+            keys = list(canonical)
+            for drop in _ADDED_KEYS:
+                if len(keys) <= ckpt_obs_dim:
+                    break
+                if drop in keys:
+                    keys.remove(drop)
+            self._obs_keys = keys
+        self._obs_dim = len(self._obs_keys)
+
+        # Rebuild MLP matching build_mlp() from train_ma_cur_mlp.py
+        layers, in_dim = [], self._obs_dim
+        for _ in range(num_layers):
+            layers += [nn.Linear(in_dim, hidden_dim), nn.Tanh()]
+            in_dim = hidden_dim
+        layers.append(nn.Linear(in_dim, self.n_actions))
+        self.actor = nn.Sequential(*layers).to(self.device)
+
+        missing, unexpected = self.actor.load_state_dict(mapped_sd, strict=False)
+        if missing:
+            print(f"[MAMLPRLPolicy] WARNING: missing keys ({len(missing)}): {missing[:5]}")
+        if unexpected:
+            print(f"[MAMLPRLPolicy] WARNING: unexpected keys ({len(unexpected)}): {unexpected[:5]}")
+        self.actor.eval()
+
+        # ObsNorm: TransformedEnv(Compose(ObservationNorm)) → transforms.0.loc/scale
+        obsnorm    = state.get("obsnorm", {})
+        _LOC_KEY   = "transforms.0.loc"
+        _SCALE_KEY = "transforms.0.scale"
+        self.obs_loc = self.obs_scale = None
+        if _LOC_KEY in obsnorm and _SCALE_KEY in obsnorm:
+            self.obs_loc   = obsnorm[_LOC_KEY].detach().to(self.device)
+            self.obs_scale = obsnorm[_SCALE_KEY].detach().to(self.device)
+        else:
+            loc_key   = next((k for k in obsnorm if k.endswith("loc")),   None)
+            scale_key = next((k for k in obsnorm if k.endswith("scale")), None)
+            if loc_key and scale_key:
+                print(f"[MAMLPRLPolicy] WARNING: expected {_LOC_KEY!r} not found; "
+                      f"falling back to {loc_key!r}/{scale_key!r}")
+                self.obs_loc   = obsnorm[loc_key].detach().to(self.device)
+                self.obs_scale = obsnorm[scale_key].detach().to(self.device)
+            else:
+                print(f"[MAMLPRLPolicy] WARNING: no obsnorm found — running WITHOUT normalisation "
+                      f"(keys: {list(obsnorm.keys())})")
+
+        print(f"[MAMLPRLPolicy] n_actions={self.n_actions}, obs_dim={self._obs_dim}, obs_keys={self._obs_keys}")
+
+        # Stateful per-episode tracking (reset each episode)
+        self._last_atk_intervals: Optional[np.ndarray] = None
+        self._last_atk_intensity: Optional[np.ndarray] = None
+
+    def reset(self) -> None:
+        self._last_atk_intervals = None
+        self._last_atk_intensity = None
+
+    def _build_ma_obs(self, ctx: ActContext) -> np.ndarray:
+        import pandas as pd
+
+        env      = ctx.env
+        n_edges  = len(ctx.ids_cpu)
+        area_ids = [e.area_id for e in env.edge_areas]
+        obs      = np.zeros((n_edges, self._obs_dim), dtype=np.float32)
+
+        if self._last_atk_intervals is None:
+            self._last_atk_intervals = np.full(n_edges, 10, dtype=np.int32)
+            self._last_atk_intensity = np.zeros(n_edges, dtype=np.float32)
+
+        if not env.history:
+            return obs.reshape(-1)
+
+        records = env.history[-ctx.decision_interval * n_edges:]
+        df      = pd.DataFrame([m.__dict__ for m in records])
+
+        BASE_KEYS = ["local_num_req", "attack_in_rate", "cpu_to_ids_ratio", "ids_cpu_utilization"]
+        for i, area_id in enumerate(area_ids):
+            g = df[df["area_id"] == area_id]
+            if g.empty:
+                continue
+            for k in BASE_KEYS:
+                if k not in self._obs_keys or k not in g.columns:
+                    continue
+                vals = g[k].values
+                j    = self._obs_keys.index(k)
+                obs[i, j] = float(vals[-1]) if k == "cpu_to_ids_ratio" else float(np.mean(vals))
+
+            atk_vals = g["attack_in_rate"].values if "attack_in_rate" in g.columns else np.zeros(1)
+            mean_atk = float(np.mean(atk_vals))
+            if mean_atk > 1e-6:
+                self._last_atk_intervals[i] = 0
+                self._last_atk_intensity[i] = max(float(self._last_atk_intensity[i]), mean_atk)
+            else:
+                self._last_atk_intervals[i] = min(int(self._last_atk_intervals[i]) + 1, 10)
+                if self._last_atk_intervals[i] >= 10:
+                    self._last_atk_intensity[i] = 0.0
+
+            obs[i, self._obs_keys.index("last_atk_intervals")] = float(self._last_atk_intervals[i])
+            if "last_atk_intensity" in self._obs_keys:
+                obs[i, self._obs_keys.index("last_atk_intensity")] = float(self._last_atk_intensity[i])
+
+        if n_edges > 1:
+            if self.is_phase1:
+                obs[:, self._obs_keys.index("neighbor_ids_util")] = 0.0
+                obs[:, self._obs_keys.index("neighbor_atk_rate")] = 0.0
+                if "neighbor_delta" in self._obs_keys:
+                    obs[:, self._obs_keys.index("neighbor_delta")] = 0.0
+            else:
+                edge_ids_util: Dict[str, float] = {}
+                edge_atk_rate: Dict[str, float] = {}
+                for area_id in area_ids:
+                    g = df[df["area_id"] == area_id]
+                    if g.empty:
+                        edge_ids_util[area_id] = 0.0
+                        edge_atk_rate[area_id] = 0.0
+                    else:
+                        edge_ids_util[area_id] = float(np.clip(np.mean(g["ids_cpu_utilization"].values if "ids_cpu_utilization" in g.columns else [0.0]), 0.0, 1.0))
+                        edge_atk_rate[area_id] = float(np.mean(g["attack_in_rate"].values if "attack_in_rate" in g.columns else [0.0]))
+
+                _has_delta = "neighbor_delta" in self._obs_keys
+                for i, area_id in enumerate(area_ids):
+                    nbr_utils, nbr_deltas, nbr_atk = [], [], []
+                    for j in range(n_edges):
+                        if j == i:
+                            continue
+                        nbr_utils.append(edge_ids_util[area_ids[j]])
+                        nbr_atk.append(edge_atk_rate[area_ids[j]])
+                        nbr_deltas.append(float(ctx.delta_in_flight_norm[j]))
+                    obs[i, self._obs_keys.index("neighbor_ids_util")] = float(np.mean(nbr_utils)) if nbr_utils else 0.0
+                    obs[i, self._obs_keys.index("neighbor_atk_rate")] = float(np.mean(nbr_atk))   if nbr_atk   else 0.0
+                    if _has_delta:
+                        obs[i, self._obs_keys.index("neighbor_delta")] = float(np.mean(nbr_deltas)) if nbr_deltas else 0.0
+
+        _slo_idx = self._obs_keys.index("prev_slo_vio")
+        for i, area_id in enumerate(area_ids):
+            g = df[df["area_id"] == area_id]
+            if g.empty:
+                continue
+            last_qoe  = float(g["qoe_mean"].values[-1]) if "qoe_mean" in g.columns else 0.0
+            threshold = float(env.edge_areas[i].slo_threshold)
+            obs[i, _slo_idx] = 1.0 if last_qoe < threshold else 0.0
+
+        if "transition_ticks_norm" in self._obs_keys:
+            for i in range(n_edges):
+                obs[i, self._obs_keys.index("transition_ticks_norm")] = float(ctx.transition_ticks_norm[i])
+                obs[i, self._obs_keys.index("delta_in_flight_norm")]  = float(ctx.delta_in_flight_norm[i])
+                obs[i, self._obs_keys.index("queue_ahead_norm")]      = float(ctx.queue_ahead_norm[i]) if ctx.queue_ahead_norm is not None else 0.0
+
+        return obs.reshape(-1).astype(np.float32)
+
+    def _normalise(self, obs_flat: np.ndarray) -> np.ndarray:
+        if self.obs_loc is None:
+            return obs_flat
+        import torch
+        n_edges = len(obs_flat) // self._obs_dim
+        x     = torch.from_numpy(obs_flat).to(self.device).view(n_edges, self._obs_dim)
+        loc   = self.obs_loc.view(-1)
+        scale = self.obs_scale.view(-1)
+        if loc.numel() != 1 and loc.numel() != self._obs_dim:
+            return obs_flat
+        return ((x - loc) / (scale + 1e-8)).view(-1).cpu().numpy()
+
+    def act(self, ctx: ActContext) -> tuple[Optional[np.ndarray], np.ndarray]:
+        import torch
+
+        n_edges  = len(ctx.ids_cpu)
+        obs_flat = self._build_ma_obs(ctx)
+        obs_norm = self._normalise(obs_flat)
+
+        obs_t = torch.from_numpy(obs_norm).float().to(self.device).view(n_edges, self._obs_dim)
+        with torch.no_grad():
+            logits = self.actor(obs_t)  # (n_edges, n_actions)
+
+        ids_cpu_abs = np.empty(n_edges, dtype=np.float32)
+        for i in range(n_edges):
+            edge_logits = logits[i]
+            if self.greedy:
+                action = int(torch.argmax(edge_logits).item())
+            else:
+                probs  = torch.softmax(edge_logits, dim=-1)
+                action = int(torch.multinomial(probs, 1).item())
+            delta_cmd      = (action - (self.n_actions - 1) / 2.0) * self.scale_step
+            ids_cpu_abs[i] = float(np.clip(
+                ctx.ids_cpu[i] + delta_cmd, ctx.ids_cpu_min, ctx.ids_cpu_max[i],
+            ))
+
+        return ids_cpu_abs, np.zeros(n_edges, dtype=np.int64)
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 def make_baseline_policy(
@@ -817,6 +1070,10 @@ def make_baseline_policy(
     elif name == "ma_lstm_rl":
         if ckpt_path is None:
             raise ValueError("ckpt_path must be provided for 'ma_lstm_rl' policy")
-        return MALSTMRLPolicy(ckpt_path=ckpt_path, device=device, greedy=False)
+        return MALSTMRLPolicy(ckpt_path=ckpt_path, device=device, greedy=True)
+    elif name == "ma_mlp_rl":
+        if ckpt_path is None:
+            raise ValueError("ckpt_path must be provided for 'ma_mlp_rl' policy")
+        return MAMLPRLPolicy(ckpt_path=ckpt_path, device=device, greedy=True)
     else:
         raise ValueError(f"Unknown baseline policy name: {name!r}")

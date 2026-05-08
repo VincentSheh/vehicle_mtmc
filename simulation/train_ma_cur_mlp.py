@@ -18,9 +18,7 @@ from torch.distributions import Categorical
 from environment import build_env_base, VA_CPU_RESERVE
 from torchrl.envs.transforms import ObservationNorm, TransformedEnv
 from torchrl.envs import ParallelEnv, EnvBase
-from torchrl.modules import LSTMModule
 from torchrl.envs.transforms import Compose
-from torchrl.envs.transforms import InitTracker
 from torchrl.data.tensor_specs import (
     BoundedTensorSpec,
     CompositeSpec,
@@ -30,11 +28,6 @@ from torchrl.data.tensor_specs import (
 from logger import *
 
 from pathlib import Path
-
-# First N_TEMPORAL_PER_EDGE features per edge (local_num_req, attack_in_rate)
-# are fed through the LSTM. The remaining features bypass directly to the
-# actor/critic heads.
-N_TEMPORAL_PER_EDGE = 2
 
 
 class IndepTorchRLEnvWrapper(EnvBase):
@@ -55,8 +48,7 @@ class IndepTorchRLEnvWrapper(EnvBase):
         self.env = build_env_base(cfg_path)
         self.n_edges = len(self.env.edge_areas)
         self.mode = mode
-        
-        # Batch size is [n_edges] so agents are treated as independent parallel environments
+
         super().__init__(device=torch.device(device), batch_size=torch.Size([self.n_edges]))
 
         self.area_ids = [e.area_id for e in self.env.edge_areas]
@@ -69,7 +61,8 @@ class IndepTorchRLEnvWrapper(EnvBase):
         self.obs_keys = [
             "local_num_req",
             "attack_in_rate",
-            "ema_mom",
+            "last_atk_intervals",  # decision intervals since last attack seen (0–10)
+            "last_atk_intensity",  # peak attack_in_rate over last 10 decision intervals; 0 if none
             "cpu_to_ids_ratio",
             "ids_cpu_utilization",
             "neighbor_ids_util",
@@ -89,20 +82,27 @@ class IndepTorchRLEnvWrapper(EnvBase):
         self.scale_step = 0.5
 
         _reward_cfg = _cfg["globals"].get("reward", {})
-        self.reward_alpha = float(_reward_cfg.get("alpha_inv", 0.10))
-        self.reward_beta  = float(_reward_cfg.get("beta_inv",  0.20))
-        self.reward_gamma = float(_reward_cfg.get("gamma_inv", 0.12))
-        self.reward_q_th  = float(_reward_cfg.get("q_th", 0.20))
+        self.reward_alpha        = float(_reward_cfg.get("alpha_inv",    0.10))
+        self.reward_beta         = float(_reward_cfg.get("beta_inv",     0.20))
+        self.reward_gamma        = float(_reward_cfg.get("gamma_inv",    0.12))
+        self.reward_q_th         = float(_reward_cfg.get("q_th",         0.20))
         self.reward_delta_switch = float(_reward_cfg.get("delta_switch", 0.0))
 
         self.ids_cpu = torch.zeros(self.n_edges, device=self.device)
         for i, e in enumerate(self.env.edge_areas):
             self.ids_cpu[i] = e.ids_cpu
-            
+
         self.ids_cpu_settled = self.ids_cpu.clone()
         self.ids_cpu_target = self.ids_cpu.clone()
         self.transition_ticks_remaining = torch.zeros(self.n_edges, dtype=torch.int32, device=self.device)
         self.transition_ticks_total = torch.ones(self.n_edges, dtype=torch.int32, device=self.device)
+
+        # Last-attack tracking
+        self._ATK_INTERVAL_CAP = 10
+        self.last_atk_intervals = torch.full((self.n_edges,), self._ATK_INTERVAL_CAP, dtype=torch.int32, device=self.device)
+        # Running max of mean attack rate since the current attack episode started;
+        # resets to 0 only after last_atk_intervals reaches the cap.
+        self.last_atk_intensity = torch.zeros(self.n_edges, device=self.device)
 
         self._make_specs()
 
@@ -113,7 +113,6 @@ class IndepTorchRLEnvWrapper(EnvBase):
                 dtype=torch.float32,
                 device=self.device,
             ),
-            # extra keys that survive rollout collection
             qoe_mean=UnboundedContinuousTensorSpec(
                 shape=(self.n_edges, 1), dtype=torch.float32, device=self.device,
             ),
@@ -172,7 +171,6 @@ class IndepTorchRLEnvWrapper(EnvBase):
         torch.manual_seed(episode_seed)
         self.env.reset(episode_seed)
 
-        # Restore current CPU allocation to environment (persist across episodes)
         for i, e in enumerate(self.env.edge_areas):
             e.ids_cpu = float(self.ids_cpu[i].item())
             e.va_cpu = e.budget.cpu - e.ids_cpu
@@ -181,10 +179,12 @@ class IndepTorchRLEnvWrapper(EnvBase):
         self.ids_cpu_target = self.ids_cpu.clone()
         self.transition_ticks_remaining.fill_(0)
         self.transition_ticks_total.fill_(1)
+        self.last_atk_intervals.fill_(self._ATK_INTERVAL_CAP)
+        self.last_atk_intensity.zero_()
 
         obs = self._build_observation()
         _zeroE1 = torch.zeros((self.n_edges, 1), dtype=torch.float32, device=self.device)
-        
+
         return TensorDict(
             {
                 "observation": obs,
@@ -241,7 +241,7 @@ class IndepTorchRLEnvWrapper(EnvBase):
                 self.transition_ticks_total[i]     = dur
                 self.transition_ticks_remaining[i] = dur
 
-        # Binary switching penalty: fired once per decision step, before simulation ticks
+        # Binary switching penalty: fired once per decision step
         switch_pen = torch.zeros((self.n_edges, 1), device=self.device)
         if self.reward_delta_switch > 1e-9:
             for i, de in enumerate(delta_effs):
@@ -253,7 +253,7 @@ class IndepTorchRLEnvWrapper(EnvBase):
         comp_bcd = torch.zeros((self.n_edges, 1), device=self.device)
         comp_qsf = torch.zeros((self.n_edges, 1), device=self.device)
         comp_vio = torch.zeros((self.n_edges, 1), device=self.device)
-        
+
         terminated_flag = False
         steps = 0
 
@@ -270,7 +270,6 @@ class IndepTorchRLEnvWrapper(EnvBase):
                     self.transition_ticks_remaining[i] -= 1
                     if self.transition_ticks_remaining[i] == 0:
                         self.ids_cpu_settled[i] = self.ids_cpu_target[i]
-                        # Bug 1 fix: start a new transition for any queued command
                         queued = float(self.ids_cpu[i].item()) - float(self.ids_cpu_settled[i].item())
                         if abs(queued) > 1e-9:
                             self.ids_cpu_target[i] = self.ids_cpu[i]
@@ -281,19 +280,17 @@ class IndepTorchRLEnvWrapper(EnvBase):
                             step_overhead[i] = -new_d if abs(new_d) > 1e-9 else 0.0
                         else:
                             step_overhead[i] = 0.0
-                        # Bug 2 fix: apply newly settled value within the same tick
                         ids_cpu_eff[i] = float(self.ids_cpu_settled[i].item())
 
             self.env.step(ids_cpu_eff.tolist(), step_overhead.tolist())
-            
-            # Multi-agent reward computation
+
             r_dict = self._compute_reward()
             total_reward += r_dict["reward"]
             comp_lres += r_dict["lres"]
             comp_bcd += r_dict["bcd"]
             comp_qsf += r_dict["qsf"]
             comp_vio += r_dict["vio"]
-            
+
             steps += 1
             if self.env.t >= self.env.t_max:
                 terminated_flag = True
@@ -301,11 +298,10 @@ class IndepTorchRLEnvWrapper(EnvBase):
 
         n = max(1, steps)
         obs = self._build_observation()
-        
+
         terminated = torch.full((self.n_edges, 1), terminated_flag, dtype=torch.bool, device=self.device)
         truncated = torch.zeros((self.n_edges, 1), dtype=torch.bool, device=self.device)
-        
-        # Get latest QoE from history
+
         qoe_vec = torch.zeros((self.n_edges, 1), device=self.device)
         if self.env.history:
             last_block = self.env.history[-self.n_edges:]
@@ -336,14 +332,10 @@ class IndepTorchRLEnvWrapper(EnvBase):
     def _compute_reward(self) -> dict:
         r_dict = self._build_ima_reward()
         if self.mode == "cma":
-            # Centralized reward: average components across all agents.
-            # Matching train_ma_lstm.py's behavior for lres.
             avg_bcd  = float(r_dict["bcd"].mean().item())
             avg_qsf  = float(r_dict["qsf"].mean().item())
             avg_vio  = float(r_dict["vio"].mean().item())
 
-            # For lres, we need to know which ones were actually under attack
-            # lres_vec contains ratios; we only mean those where attack_in_rate > 1e-6
             last_block = self.env.history[-self.n_edges:]
             mask = torch.zeros(self.n_edges, dtype=torch.bool, device=self.device)
             for i, aid in enumerate(self.area_ids):
@@ -352,21 +344,20 @@ class IndepTorchRLEnvWrapper(EnvBase):
                         if record.attack_in_rate > 1e-6:
                             mask[i] = True
                         break
-            
+
             if mask.any():
                 avg_lres = float(r_dict["lres"][mask].mean().item())
             else:
                 avg_lres = 0.0
-            
-            # Recompute shared reward
+
             shared_rew = -(self.reward_alpha * avg_qsf + self.reward_beta * avg_lres + self.reward_gamma * avg_bcd)
-            
+
             r_dict["reward"] = torch.full_like(r_dict["reward"], shared_rew)
             r_dict["lres"]   = torch.full_like(r_dict["lres"],   avg_lres)
             r_dict["bcd"]    = torch.full_like(r_dict["bcd"],    avg_bcd)
             r_dict["qsf"]    = torch.full_like(r_dict["qsf"],    avg_qsf)
             r_dict["vio"]    = torch.full_like(r_dict["vio"],    avg_vio)
-            
+
         return r_dict
 
     def _build_observation(self) -> torch.Tensor:
@@ -377,8 +368,7 @@ class IndepTorchRLEnvWrapper(EnvBase):
         records = self.env.history[-self.decision_interval * self.n_edges:]
         df = pd.DataFrame([m.__dict__ for m in records])
 
-        # 1. Local metrics
-        base_keys = ["local_num_req", "attack_in_rate", "ema_mom", "cpu_to_ids_ratio", "ids_cpu_utilization"]
+        base_keys = ["local_num_req", "attack_in_rate", "cpu_to_ids_ratio", "ids_cpu_utilization"]
         for i, area_id in enumerate(self.area_ids):
             g = df[df["area_id"] == area_id]
             if g.empty:
@@ -389,13 +379,24 @@ class IndepTorchRLEnvWrapper(EnvBase):
                 vals = g[k].values
                 if k == "cpu_to_ids_ratio":
                     obs[i, idx] = float(vals[-1])
-                elif k == "ema_mom":
-                    vals_nz = vals[vals != 0.0]
-                    obs[i, idx] = float(np.mean(vals_nz)) if len(vals_nz) > 0 else 0.0
                 else:
                     obs[i, idx] = float(np.mean(vals))
 
-        # 2. Neighbor metrics
+            # Last-attack interval counter and running-max intensity
+            atk_vals = g["attack_in_rate"].values
+            mean_atk = float(np.mean(atk_vals))
+            if mean_atk > 1e-6:
+                self.last_atk_intervals[i] = 0
+                self.last_atk_intensity[i] = max(float(self.last_atk_intensity[i].item()), mean_atk)
+            else:
+                new_intervals = min(int(self.last_atk_intervals[i].item()) + 1, self._ATK_INTERVAL_CAP)
+                self.last_atk_intervals[i] = new_intervals
+                if new_intervals >= self._ATK_INTERVAL_CAP:
+                    self.last_atk_intensity[i] = 0.0
+
+            obs[i, self.obs_keys.index("last_atk_intervals")] = float(self.last_atk_intervals[i].item())
+            obs[i, self.obs_keys.index("last_atk_intensity")] = float(self.last_atk_intensity[i].item())
+
         if self.n_edges > 1:
             edge_ids_util = {}
             edge_atk_rate = {}
@@ -426,7 +427,6 @@ class IndepTorchRLEnvWrapper(EnvBase):
                     obs[i, self.obs_keys.index("neighbor_delta")] = float(np.mean(nbr_deltas)) if nbr_deltas else 0.0
                 obs[i, self.obs_keys.index("neighbor_atk_rate")] = float(np.mean(nbr_atk)) if nbr_atk else 0.0
 
-        # 2b. SLO violation flag (local signal, valid for single- and multi-edge)
         for i, area_id in enumerate(self.area_ids):
             g = df[df["area_id"] == area_id]
             if not g.empty:
@@ -434,7 +434,6 @@ class IndepTorchRLEnvWrapper(EnvBase):
                 threshold = float(self.env.edge_areas[i].slo_threshold)
                 obs[i, self.obs_keys.index("prev_slo_vio")] = 1.0 if last_qoe < threshold else 0.0
 
-        # 3. Scaling features (omitted when n_actions == 3)
         if "transition_ticks_norm" in self.obs_keys:
             max_dur = float(self.scaling_time_steps[-1])
             max_delta = self.scale_step * (self.n_actions - 1) / 2.0
@@ -462,37 +461,32 @@ class IndepTorchRLEnvWrapper(EnvBase):
                     m = record
                     break
             if m is None: continue
-            
+
             attack_pass = max(0.0, m.attack_in_rate - m.attack_drop_rate)
             lres = attack_pass / m.attack_in_rate if m.attack_in_rate > 1e-6 else 0.0
             qsf = max(0.0, self.reward_q_th - m.qoe_mean) / max(self.reward_q_th, 1e-6)
             vio = 1.0 if m.qoe_mean < self.reward_q_th else 0.0
-            
+
             rew[i, 0] = -(self.reward_alpha * qsf + self.reward_beta * lres + self.reward_gamma * m.benign_col_dmg)
             lres_vec[i, 0] = lres
             bcd_vec[i, 0] = m.benign_col_dmg
             qsf_vec[i, 0] = qsf
             vio_vec[i, 0] = vio
-            
+
         return {"reward": rew, "lres": lres_vec, "bcd": bcd_vec, "qsf": qsf_vec, "vio": vio_vec}
 
 
-class SplitObsModule(nn.Module):
-    def __init__(self, temporal_idx: list, static_idx: list):
-        super().__init__()
-        self.register_buffer("t_idx", torch.tensor(temporal_idx, dtype=torch.long))
-        self.register_buffer("s_idx", torch.tensor(static_idx, dtype=torch.long))
-
-    def forward(self, obs: torch.Tensor):
-        return obs[..., self.t_idx], obs[..., self.s_idx]
-
-
-class MergeModule(nn.Module):
-    def forward(self, lstm_out: torch.Tensor, static: torch.Tensor) -> torch.Tensor:
-        return torch.cat([lstm_out, static], dim=-1)
+def build_mlp(input_dim: int, hidden_dim: int, output_dim: int, num_layers: int) -> nn.Sequential:
+    layers = []
+    in_dim = input_dim
+    for _ in range(num_layers):
+        layers += [nn.Linear(in_dim, hidden_dim), nn.Tanh()]
+        in_dim = hidden_dim
+    layers.append(nn.Linear(in_dim, output_dim))
+    return nn.Sequential(*layers)
 
 
-def save_ckpt(path, policy, value, optim, env_cfg, train_cfg, it, device, env):
+def save_ckpt(path, policy, value, optim, env_cfg, train_cfg, it, device, env, obs_keys=None):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -505,6 +499,7 @@ def save_ckpt(path, policy, value, optim, env_cfg, train_cfg, it, device, env):
             "train_cfg": train_cfg,
             "device": str(device),
             "obsnorm": env.state_dict(),
+            "obs_keys": obs_keys,
         },
         str(path),
     )
@@ -523,12 +518,7 @@ def orthogonal_init(m, gain=1.0):
     if isinstance(m, nn.Linear):
         nn.init.orthogonal_(m.weight, gain=gain)
         nn.init.constant_(m.bias, 0.0)
-    elif isinstance(m, nn.LSTM):
-        for name, param in m.named_parameters():
-            if 'weight' in name:
-                nn.init.orthogonal_(param, gain=gain)
-            elif 'bias' in name:
-                nn.init.constant_(param, 0.0)
+
 
 import argparse
 
@@ -541,7 +531,6 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
     if total_frames_override:
         train_cfg["collector"]["total_frames"] = total_frames_override
 
-    # Level override from train_cfg
     atk_lvl  = train_cfg.get("env", {}).get("atk_level", "default")
     user_lvl = train_cfg.get("env", {}).get("user_level", "default")
 
@@ -556,7 +545,7 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
 
     logger_cfg = train_cfg.setdefault("logger", {})
     if "exp_name" not in logger_cfg:
-        logger_cfg["exp_name"] = f"ppo_ma_{mode}"
+        logger_cfg["exp_name"] = f"ppo_ma_{mode}_mlp"
 
     try:
         t_max = env_cfg["run"]["t_max"]
@@ -571,17 +560,17 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
         decisions_per_episode = math.ceil(t_max / decision_interval)
 
         _phase = "_phase2" if resume_ckpt else "_phase1"
-        ckpt_dir = Path(ckpt_dir) if ckpt_dir else Path("checkpoints/_t_cyc_adaptive") / _phase / run.name
+        ckpt_dir = Path(ckpt_dir) if ckpt_dir else Path("checkpoints/_tcyc_adaptive") / _phase / run.name
         ckpt_every = 50
         best_qoe = -1e9
 
-        feature_dim = train_cfg["model"]["hidden_dim"]
-        seq_len = int(train_cfg["loss"].get("seq_len", 8))
+        hidden_dim = train_cfg["model"]["hidden_dim"]
+        num_layers = int(train_cfg["model"].get("num_layers", 2))
+        n_actions = train_cfg["model"]["n_actions"]
 
-        # Build base env for info
         base_env = IndepTorchRLEnvWrapper(
             cfg_path=env_cfg_path_tmp,
-            n_actions=train_cfg["model"]["n_actions"],
+            n_actions=n_actions,
             seed=env_cfg["run"]["seed"],
             device=device,
             decision_interval=decision_interval,
@@ -590,21 +579,10 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
         n_edges = base_env.n_edges
         obs_dim = base_env.obs_dim
 
-        temporal_idx = [i for i, k in enumerate(base_env.obs_keys) if i < N_TEMPORAL_PER_EDGE]
-        static_idx = [i for i, k in enumerate(base_env.obs_keys) if i >= N_TEMPORAL_PER_EDGE]
-
-        lstm = LSTMModule(
-            input_size=len(temporal_idx),
-            hidden_size=feature_dim,
-            in_key="temporal_obs",
-            out_key="lstm_out",
-            device=device,
-        )
-
         def make_env(seed_offset):
             return lambda: IndepTorchRLEnvWrapper(
                 cfg_path=env_cfg_path_tmp,
-                n_actions=train_cfg["model"]["n_actions"],
+                n_actions=n_actions,
                 seed=seed_offset,
                 device="cpu",
                 decision_interval=decision_interval,
@@ -616,47 +594,39 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
         env = TransformedEnv(
             penv,
             Compose(
-                InitTracker(),
-                lstm.make_tensordict_primer(),
                 ObservationNorm(in_keys=["observation"], standard_normal=True),
             ),
         )
-        
+
         env.transform.train()
-        # FIX: include n_edges dimension in reduce_dim if it's causing issues.
-        # But (0, 1) should reduce num_envs and n_edges.
-        # If cat_dim=0 with num_iter=100 results in [100, 4, 3, 12].
-        # reduce_dim=(0, 1) -> reduces 100 and 4. Result [3, 12].
-        # Try reduce_dim=(0, 1, 2) if it prepends? No.
-        # Let's try reduce_dim=(0, 1, 2) where 0=num_iter, 1=num_envs, 2=n_edges.
         env.transform[-1].init_stats(num_iter=100, reduce_dim=(0, 1, 2), cat_dim=0)
         env.transform.eval()
 
-        split_module = TensorDictModule(
-            SplitObsModule(temporal_idx, static_idx).to(device),
+        actor_net = TensorDictModule(
+            build_mlp(obs_dim, hidden_dim, n_actions, num_layers).to(device),
             in_keys=["observation"],
-            out_keys=["temporal_obs", "static_obs"],
+            out_keys=["logits"],
         )
-        merge_module = TensorDictModule(MergeModule(), in_keys=["lstm_out", "static_obs"], out_keys=["features_merged"])
-        shared_core = TensorDictSequential(split_module, lstm, merge_module)
+        critic_net = TensorDictModule(
+            build_mlp(obs_dim, hidden_dim, 1, num_layers).to(device),
+            in_keys=["observation"],
+            out_keys=["state_value"],
+        )
 
-        merged_dim = feature_dim + len(static_idx)
-        actor_head = TensorDictModule(nn.Linear(merged_dim, train_cfg["model"]["n_actions"]).to(device), in_keys=["features_merged"], out_keys=["logits"])
-        critic_head = TensorDictModule(nn.Linear(merged_dim, 1).to(device), in_keys=["features_merged"], out_keys=["state_value"])
-
-        # Orthogonal Initialization
-        actor_head.apply(orthogonal_init)
-        critic_head.apply(orthogonal_init)
-        # Apply orthogonal init to shared_core (LSTM and bypass modules)
-        shared_core.apply(orthogonal_init)
+        actor_net.apply(orthogonal_init)
+        critic_net.apply(orthogonal_init)
 
         collector_policy = ProbabilisticActor(
-            module=TensorDictSequential(shared_core, actor_head),
+            module=actor_net,
             in_keys=["logits"], out_keys=["action"],
             distribution_class=Categorical, return_log_prob=True,
         )
-        loss_actor = ProbabilisticActor(module=actor_head, in_keys=["logits"], out_keys=["action"], distribution_class=Categorical, return_log_prob=True)
-        value = critic_head
+        loss_actor = ProbabilisticActor(
+            module=actor_net,
+            in_keys=["logits"], out_keys=["action"],
+            distribution_class=Categorical, return_log_prob=True,
+        )
+        value = critic_net
 
         adv = GAE(gamma=train_cfg["loss"]["gamma"], lmbda=train_cfg["loss"]["gae_lambda"], value_network=value)
         adv.set_keys(value="state_value", advantage="advantage", value_target="value_target", reward="reward", done="done", terminated="terminated")
@@ -679,8 +649,9 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
             total_frames=total_frames, device=device, trust_policy=True, split_trajs=False,
         )
 
+        all_params = list(actor_net.parameters()) + list(critic_net.parameters())
         optim = torch.optim.Adam(
-            list(shared_core.parameters()) + list(actor_head.parameters()) + list(critic_head.parameters()),
+            all_params,
             lr=train_cfg["optim"]["lr"], weight_decay=train_cfg["optim"]["weight_decay"], eps=train_cfg["optim"]["eps"],
         )
 
@@ -704,8 +675,6 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
             ckpt = torch.load(resume_ckpt, map_location=device)
             collector_policy.load_state_dict(ckpt["policy"])
             value.load_state_dict(ckpt["value"])
-            # Re-init obsnorm: Phase 1 left neighbor dims at zero;
-            # Phase 2 multi-edge env will have non-zero values there.
             _norm = env.transform[-1]
             _norm.loc = torch.nn.UninitializedBuffer()
             _norm.scale = torch.nn.UninitializedBuffer()
@@ -719,26 +688,22 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
             assert_finite(batch, "BATCH")
             assert_finite(batch["next"], "NEXT")
 
-            # batch.batch_size: [num_envs, n_edges, T]
             B_env, E_edges, T_batch = batch.batch_size
 
-            # Rearrange to [B_total, T, ...] for LSTM (batch_first=True)
-            data = batch.view(B_env * E_edges, T_batch).contiguous() # [B_total, T]
+            data = batch.view(B_env * E_edges, T_batch).contiguous()
 
             # ---- per-decision-step obs logging ----
-            _obs_log = data["observation"].float().cpu() # [B, T, obs_dim], normalized
+            _obs_log = data["observation"].float().cpu()
             _norm = env.transform[-1]
-            _obs_log = _obs_log * _norm.scale.cpu() + _norm.loc.cpu()  # de-normalize
+            _obs_log = _obs_log * _norm.scale.cpu() + _norm.loc.cpu()
             _B_total, _T, _D = _obs_log.shape
             for _t in range(_T):
                 _step_log = {"decision_step": global_decision_step + _t}
-                # Log average across all agents/envs
                 _obs_avg = _obs_log[:, _t].mean(dim=0)
                 for _j, _name in enumerate(base_env.obs_keys):
                     _step_log[f"obs/{_name}"] = float(_obs_avg[_j].item())
                 wandb.log(_step_log)
             global_decision_step += _T
-
 
             # ---- build PPO traj ----
             traj = data.clone(False)
@@ -748,19 +713,16 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
             traj.set("truncated", traj.get(("next", "truncated")).to(torch.bool))
 
             with torch.no_grad():
-                shared_core(traj)
-                critic_head(traj)
-                shared_core(traj["next"])
-                critic_head(traj["next"])
+                critic_net(traj)
+                critic_net(traj["next"])
                 adv(traj)
 
             B, T = traj.batch_size
-            seq_len_eff = min(seq_len, T)
-            if seq_len_eff < 2:
-                collector.update_policy_weights_()
-                continue
+            # MLP has no sequential dependency — use minibatch_size as the chunk length
+            # so the PPO loop below is structurally identical to the LSTM version.
+            seq_len_eff = min(train_cfg["loss"].get("seq_len", 8), T)
 
-            done_bt = traj.get("done").squeeze(-1).contiguous() # [B, T]
+            done_bt = traj.get("done").squeeze(-1).contiguous()
             max_t0 = T - seq_len_eff
             csum = torch.cumsum(done_bt.to(torch.int32), dim=1)
             left = csum[:, : max_t0 + 1]
@@ -784,34 +746,33 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
                     start, end = mb_i * minibatch_size, min((mb_i + 1) * minibatch_size, num_sequences)
                     idx = valid_idx_epoch[start:end]
                     b_idx, t0_idx = idx[:, 0], idx[:, 1]
-                    
+
                     mb_td = torch.stack([traj[b_idx, t0_idx + k] for k in range(seq_len_eff)], dim=1).detach()
                     alpha = max(0.0, 1.0 - (num_network_updates / total_network_updates))
                     _apply_anneal(alpha)
                     num_network_updates += 1
 
-                    shared_core(mb_td)
                     out = loss(mb_td)
                     total_loss = out["loss_objective"] + out["loss_critic"] + out.get("loss_entropy", 0.0)
                     optim.zero_grad(set_to_none=True)
                     total_loss.backward()
-                    torch.nn.utils.clip_grad_norm_(list(shared_core.parameters()) + list(actor_head.parameters()) + list(critic_head.parameters()), float(train_cfg["optim"]["max_grad_norm"]))
+                    torch.nn.utils.clip_grad_norm_(all_params, float(train_cfg["optim"]["max_grad_norm"]))
                     optim.step()
 
             qoe_score = float(batch["next", "qoe_mean"].mean().item())
             if (it + 1) % ckpt_every == 0:
-                save_ckpt(ckpt_dir / f"ckpt_iter_{it+1:06d}.pt", collector_policy, value, optim, env_cfg, train_cfg, it + 1, device, env)
+                save_ckpt(ckpt_dir / f"ckpt_iter_{it+1:06d}.pt", collector_policy, value, optim, env_cfg, train_cfg, it + 1, device, env, obs_keys=base_env.obs_keys)
             if qoe_score > best_qoe:
                 best_qoe = qoe_score
-                save_ckpt(ckpt_dir / "ckpt_best.pt", collector_policy, value, optim, env_cfg, train_cfg, it + 1, device, env)
+                save_ckpt(ckpt_dir / "ckpt_best.pt", collector_policy, value, optim, env_cfg, train_cfg, it + 1, device, env, obs_keys=base_env.obs_keys)
 
             _r_lres = float(batch["next", "reward_lambda_res"].mean().item())
             _r_bcd  = float(batch["next", "reward_benign_col_dmg"].mean().item())
             _r_qoe  = float(batch["next", "reward_qoe_penalty"].mean().item())
-            _vio    = float(batch["next", "qoe_vio_rate"].mean().item())
             _r_sw   = float(batch["next", "reward_switch_pen"].mean().item())
+            _vio    = float(batch["next", "qoe_vio_rate"].mean().item())
 
-            print(f"Iter={it:4d} | rew={batch['next','reward'].mean().item():+.4f} | atk_pass={_r_lres:.3f} bcd={_r_bcd:.3f} qoe_sf={_r_qoe:.3f} sw_pen={_r_sw:.3f} | qoe_vio={_vio:.1%}")
+            print(f"Iter={it:4d} | rew={batch['next','reward'].mean().item():+.4f} | atk_pass={_r_lres:.3f} bcd={_r_bcd:.3f} qoe_sf={_r_qoe:.3f} sw={_r_sw:.3f} | qoe_vio={_vio:.1%}")
             wandb.log({
                 "iter": it, "qoe/mean": qoe_score, "qoe/vio_rate": _vio, "reward/mean": float(batch["next", "reward"].mean().item()),
                 "reward/lambda_res": _r_lres, "reward/benign_col_dmg": _r_bcd, "reward/qoe_penalty": _r_qoe,
@@ -836,12 +797,12 @@ if __name__ == "__main__":
 """
   Usage:
   # Independent Multi-Agent (IMA) mode
-  python train_ma_cur_lstm.py --mode ima --cfg configs/simulation_ma_0.yaml
+  python train_ma_cur_mlp.py --mode ima --cfg configs/simulation_ma_0.yaml
 
   # Centralized Multi-Agent (CMA) mode
-  python train_ma_cur_lstm.py --mode cma --cfg configs/simulation_ma_0.yaml
+  python train_ma_cur_mlp.py --mode cma --cfg configs/simulation_ma_0.yaml
 
   # Phase 2 — fine-tuning with checkpoint
-  python train_ma_cur_lstm.py --mode cma --cfg configs/simulation_ma_0.yaml \
+  python train_ma_cur_mlp.py --mode cma --cfg configs/simulation_ma_0.yaml \
     --resume_ckpt checkpoints/_phase1/<run_name>/ckpt_best.pt
 """

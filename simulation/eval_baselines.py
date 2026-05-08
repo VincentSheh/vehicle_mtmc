@@ -136,7 +136,8 @@ class BaselineEvaluator(BaseEvaluator):
             mname = rkey[:rkey.index("[")]
             if "," in inner:
                 model_key, om = inner.split(",", 1)
-                return f"{mname} {om}_{model_key}"
+                ol = OFFLOAD_DISPLAY_NAMES.get(om, om)
+                return f"{mname} {ol}_{model_key}"
             return f"{DISPLAY_NAMES.get(mname, mname)} ({OFFLOAD_DISPLAY_NAMES.get(inner, inner)})"
         return DISPLAY_NAMES.get(rkey, rkey)
 
@@ -176,6 +177,8 @@ def plot_ts_continuous(results, outpath, area_ids, slo_qoe_min=0.2):
         ("reward_lambda_res", "λ_res (raw attack pass-through)"),
         ("cpu_util",          "CPU Utilization"),
         ("cpu_to_ids_ratio",  "CPU→IDS Ratio"),
+        ("last_atk_intervals", "Intervals Since Last Attack (0–10)"),
+        ("last_atk_intensity", "Last Seen Attack Intensity (0 if expired)"),
     ]
     n_edges = len(area_ids)
     n_panels = n_edges + len(static_panels)
