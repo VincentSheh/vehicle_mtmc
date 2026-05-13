@@ -69,14 +69,15 @@ class IndepTorchRLEnvWrapper(EnvBase):
         self.obs_keys = [
             "local_num_req",
             "attack_in_rate",
-            "ema_mom",
+            "last_atk_intensity",
             "cpu_to_ids_ratio",
             "ids_cpu_utilization",
             "neighbor_ids_util",
             *( ["neighbor_delta"] if _ext else [] ),
             "neighbor_atk_rate",
+            "neighbor_last_atk_intensity",
             "prev_slo_vio",
-            *( ["transition_ticks_norm", "delta_in_flight_norm", "queue_ahead_norm"] if _ext else [] ),
+            *( ["delta_in_flight_norm"] if _ext else [] ),
         ]
 
         self.obs_dim = len(self.obs_keys)
@@ -103,6 +104,11 @@ class IndepTorchRLEnvWrapper(EnvBase):
         self.ids_cpu_target = self.ids_cpu.clone()
         self.transition_ticks_remaining = torch.zeros(self.n_edges, dtype=torch.int32, device=self.device)
         self.transition_ticks_total = torch.ones(self.n_edges, dtype=torch.int32, device=self.device)
+
+        # Last-attack tracking (Internal only, not in obs_keys)
+        self._ATK_INTERVAL_CAP = 10
+        self.last_atk_intervals = torch.full((self.n_edges,), self._ATK_INTERVAL_CAP, dtype=torch.int32, device=self.device)
+        self.last_atk_intensity = torch.zeros(self.n_edges, device=self.device)
 
         self._make_specs()
 
@@ -181,6 +187,8 @@ class IndepTorchRLEnvWrapper(EnvBase):
         self.ids_cpu_target = self.ids_cpu.clone()
         self.transition_ticks_remaining.fill_(0)
         self.transition_ticks_total.fill_(1)
+        self.last_atk_intervals.fill_(self._ATK_INTERVAL_CAP)
+        self.last_atk_intensity.zero_()
 
         obs = self._build_observation()
         _zeroE1 = torch.zeros((self.n_edges, 1), dtype=torch.float32, device=self.device)
@@ -222,6 +230,10 @@ class IndepTorchRLEnvWrapper(EnvBase):
         delta_effs = []
         for i in range(self.n_edges):
             ids_cpu_max = float(self.env.edge_areas[i].budget.cpu - VA_CPU_RESERVE)
+            if self.transition_ticks_remaining[i] > 0:
+                delta_effs.append(0.0)
+                continue
+
             prev = self.ids_cpu[i].item()
 
             _settled = float(self.ids_cpu_settled[i].item())
@@ -234,7 +246,7 @@ class IndepTorchRLEnvWrapper(EnvBase):
             delta_eff = float(self.ids_cpu[i].item() - prev)
             delta_effs.append(delta_eff)
 
-            if self.transition_ticks_remaining[i] <= 0 and abs(delta_eff) > 1e-9:
+            if abs(delta_eff) > 1e-9:
                 self.ids_cpu_target[i] = self.ids_cpu[i]
                 gap = abs(float(self.ids_cpu_target[i].item()) - float(self.ids_cpu_settled[i].item()))
                 dur = self._lookup_scaling_duration(gap)
@@ -378,7 +390,7 @@ class IndepTorchRLEnvWrapper(EnvBase):
         df = pd.DataFrame([m.__dict__ for m in records])
 
         # 1. Local metrics
-        base_keys = ["local_num_req", "attack_in_rate", "ema_mom", "cpu_to_ids_ratio", "ids_cpu_utilization"]
+        base_keys = ["local_num_req", "attack_in_rate", "cpu_to_ids_ratio", "ids_cpu_utilization"]
         for i, area_id in enumerate(self.area_ids):
             g = df[df["area_id"] == area_id]
             if g.empty:
@@ -389,11 +401,22 @@ class IndepTorchRLEnvWrapper(EnvBase):
                 vals = g[k].values
                 if k == "cpu_to_ids_ratio":
                     obs[i, idx] = float(vals[-1])
-                elif k == "ema_mom":
-                    vals_nz = vals[vals != 0.0]
-                    obs[i, idx] = float(np.mean(vals_nz)) if len(vals_nz) > 0 else 0.0
                 else:
                     obs[i, idx] = float(np.mean(vals))
+
+            # Internal last-attack tracking logic
+            atk_vals = g["attack_in_rate"].values
+            mean_atk = float(np.mean(atk_vals))
+            if mean_atk > 1e-6:
+                self.last_atk_intervals[i] = 0
+                self.last_atk_intensity[i] = max(float(self.last_atk_intensity[i].item()), mean_atk)
+            else:
+                new_intervals = min(int(self.last_atk_intervals[i].item()) + 1, self._ATK_INTERVAL_CAP)
+                self.last_atk_intervals[i] = new_intervals
+                if new_intervals >= self._ATK_INTERVAL_CAP:
+                    self.last_atk_intensity[i] = 0.0
+            
+            obs[i, self.obs_keys.index("last_atk_intensity")] = float(self.last_atk_intensity[i].item())
 
         # 2. Neighbor metrics
         if self.n_edges > 1:
@@ -413,11 +436,13 @@ class IndepTorchRLEnvWrapper(EnvBase):
                 nbr_utils = []
                 nbr_deltas = []
                 nbr_atk = []
+                nbr_last_intensity = []
                 for j in range(self.n_edges):
                     if j == i: continue
                     other_id = self.area_ids[j]
                     nbr_utils.append(edge_ids_util[other_id])
                     nbr_atk.append(edge_atk_rate[other_id])
+                    nbr_last_intensity.append(float(self.last_atk_intensity[j].item()))
                     delta = float(self.ids_cpu_target[j].item()) - float(self.ids_cpu_settled[j].item())
                     nbr_deltas.append(float(np.clip(delta / max(max_delta, 1e-6), -1.0, 1.0)))
 
@@ -425,6 +450,7 @@ class IndepTorchRLEnvWrapper(EnvBase):
                 if "neighbor_delta" in self.obs_keys:
                     obs[i, self.obs_keys.index("neighbor_delta")] = float(np.mean(nbr_deltas)) if nbr_deltas else 0.0
                 obs[i, self.obs_keys.index("neighbor_atk_rate")] = float(np.mean(nbr_atk)) if nbr_atk else 0.0
+                obs[i, self.obs_keys.index("neighbor_last_atk_intensity")] = float(np.max(nbr_last_intensity)) if nbr_last_intensity else 0.0
 
         # 2b. SLO violation flag (local signal, valid for single- and multi-edge)
         for i, area_id in enumerate(self.area_ids):
@@ -435,15 +461,11 @@ class IndepTorchRLEnvWrapper(EnvBase):
                 obs[i, self.obs_keys.index("prev_slo_vio")] = 1.0 if last_qoe < threshold else 0.0
 
         # 3. Scaling features (omitted when n_actions == 3)
-        if "transition_ticks_norm" in self.obs_keys:
-            max_dur = float(self.scaling_time_steps[-1])
+        if "delta_in_flight_norm" in self.obs_keys:
             max_delta = self.scale_step * (self.n_actions - 1) / 2.0
             for i in range(self.n_edges):
-                obs[i, self.obs_keys.index("transition_ticks_norm")] = float(self.transition_ticks_remaining[i].item()) / max(max_dur, 1.0)
                 dif = float(self.ids_cpu_target[i].item()) - float(self.ids_cpu_settled[i].item())
                 obs[i, self.obs_keys.index("delta_in_flight_norm")] = float(np.clip(dif / max(max_delta, 1e-6), -1.0, 1.0))
-                qa = float(self.ids_cpu[i].item()) - float(self.ids_cpu_target[i].item())
-                obs[i, self.obs_keys.index("queue_ahead_norm")] = float(np.clip(qa / max(max_delta, 1e-6), -1.0, 1.0))
 
         return obs
 

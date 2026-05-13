@@ -18,7 +18,7 @@ logger:
   backend: wandb
   entity: asture123-national-taiwan-university
   project_name: edgeids
-  exp_name: phase1_mlp_act9_gm16
+  exp_name: ima3_phase2_mlp_queue_act5_d60
   # exp_name: phase1_lstm_sp
   plots:
     enabled: true
@@ -28,7 +28,7 @@ logger:
 # Optimizer
 # =========================
 optim:
-  lr: 2.5e-4               # matches Adam(lr=1e-4)
+  lr: 2.5e-5               # matches Adam(lr=1e-4)
   eps: 1.0e-6              # default Adam eps (you didn't override)
   weight_decay: 0.0
   max_grad_norm: 0.5       # matches clip_grad_norm_(..., 1.0)
@@ -43,10 +43,10 @@ loss:
   gae_lambda: 0.95         # matches lmbda=0.95
   ppo_epochs: 10           # matches ppo_epochs = 20
   mini_batch_size: 128     # matches minibatch_size = 128
-  clip_epsilon: 0.2        # matches ClipPPOLoss(clip_epsilon=0.2)
+  clip_epsilon: 0.1        # matches ClipPPOLoss(clip_epsilon=0.2)
   anneal_clip_epsilon: true
   critic_coeff: 1.0
-  entropy_coeff: 0.002
+  entropy_coeff: 0.001
   loss_critic_type: smooth_l1
   normalize_advantage: false  # you normalize manually
   seq_len: 10

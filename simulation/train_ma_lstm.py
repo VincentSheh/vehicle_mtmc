@@ -983,7 +983,10 @@ def train(
 
     ckpt_dir   = Path("checkpoints") / run.name
     ckpt_every = 50
-    best_qoe   = -1e9
+    ema_alpha  = float(train_cfg.get("logger", {}).get("ema_alpha", 0.1))
+    ema_reward = ema_qoe = ema_vio = None
+    best_reward = best_qoe = -1e9
+    best_vio   = 1e9
     obs_keys   = _tmp_env.obs_keys
 
     total_updates_est = max(
@@ -1169,9 +1172,21 @@ def train(
             save_ckpt(ckpt_dir / f"ckpt_iter_{it+1:06d}.pt", policy, value_net, optim,
                       env_cfg, train_cfg, it + 1, device, env)
 
-        if qoe_mean > best_qoe:
-            best_qoe = qoe_mean
-            save_ckpt(ckpt_dir / "ckpt_best.pt", policy, value_net, optim,
+        ema_reward = reward_mean if ema_reward is None else ema_alpha * reward_mean + (1 - ema_alpha) * ema_reward
+        ema_qoe    = qoe_mean    if ema_qoe    is None else ema_alpha * qoe_mean    + (1 - ema_alpha) * ema_qoe
+        ema_vio    = _vio        if ema_vio    is None else ema_alpha * _vio        + (1 - ema_alpha) * ema_vio
+
+        if ema_reward > best_reward:
+            best_reward = ema_reward
+            save_ckpt(ckpt_dir / "ckpt_best_reward.pt", policy, value_net, optim,
+                      env_cfg, train_cfg, it + 1, device, env)
+        if ema_qoe > best_qoe:
+            best_qoe = ema_qoe
+            save_ckpt(ckpt_dir / "ckpt_best_qoe.pt", policy, value_net, optim,
+                      env_cfg, train_cfg, it + 1, device, env)
+        if ema_vio < best_vio:
+            best_vio = ema_vio
+            save_ckpt(ckpt_dir / "ckpt_best_vio.pt", policy, value_net, optim,
                       env_cfg, train_cfg, it + 1, device, env)
 
         wandb.log(

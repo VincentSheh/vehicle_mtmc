@@ -28,12 +28,12 @@ from method_policy import (
 SCALING_QUANTA = [0.5, 1.0, 1.5, 2.0]
 
 DEFAULT_METHODS = [
-    # "constant_0.0",
-    # "constant_1.0",
-    # "constant_2.0",
-    # "constant_3.0",
-    # "constant_4.0",
-    # "constant_5.0",
+    "constant_0.0",
+    "constant_1.0",
+    "constant_2.0",
+    "constant_3.0",
+    "constant_4.0",
+    "constant_5.0",
     # "no_ids",
     # "static_low",
     # "static_high",
@@ -43,8 +43,8 @@ DEFAULT_METHODS = [
 ]
 
 PROPOSED_CONFIGS = [
-    ("gm", "delay_workload"),
-    # ("gm", "cto"),
+    # ("gm", "delay_workload"),
+    ("gm", "cto"),
     # ("lm", "delay_workload"),
     # ("lm", "cto_acc_inv"),
     # ("lm", "cto"),

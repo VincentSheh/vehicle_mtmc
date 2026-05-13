@@ -470,20 +470,37 @@ class MALSTMRLPolicy(BaselinePolicy):
     _N_TEMPORAL = 2   # first N_TEMPORAL_PER_EDGE features fed through LSTM
 
     @staticmethod
-    def _make_obs_keys(n_actions: int) -> List[str]:
+    def _make_obs_keys(n_actions: int, version: int = 1) -> List[str]:
         _ext = n_actions != 3
-        return [
-            "local_num_req",
-            "attack_in_rate",
-            "ema_mom",
-            "cpu_to_ids_ratio",
-            "ids_cpu_utilization",
-            "neighbor_ids_util",
-            *( ["neighbor_delta"] if _ext else [] ),
-            "neighbor_atk_rate",
-            "prev_slo_vio",
-            *( ["transition_ticks_norm", "delta_in_flight_norm", "queue_ahead_norm"] if _ext else [] ),
-        ]
+        if version == 0:
+            # Legacy layout
+            return [
+                "local_num_req",
+                "attack_in_rate",
+                "ema_mom",
+                "cpu_to_ids_ratio",
+                "ids_cpu_utilization",
+                "neighbor_ids_util",
+                *( ["neighbor_delta"] if _ext else [] ),
+                "neighbor_atk_rate",
+                "prev_slo_vio",
+                *( ["transition_ticks_norm", "delta_in_flight_norm", "queue_ahead_norm"] if _ext else [] ),
+            ]
+        else:
+            # Current layout (v1)
+            return [
+                "local_num_req",
+                "attack_in_rate",
+                "last_atk_intensity",
+                "cpu_to_ids_ratio",
+                "ids_cpu_utilization",
+                "neighbor_ids_util",
+                *( ["neighbor_delta"] if _ext else [] ),
+                "neighbor_atk_rate",
+                "neighbor_last_atk_intensity",
+                "prev_slo_vio",
+                *( ["delta_in_flight_norm"] if _ext else [] ),
+            ]
 
     def __init__(self, ckpt_path: str, device: str = "cpu", greedy: bool = False):
         import torch
@@ -534,26 +551,30 @@ class MALSTMRLPolicy(BaselinePolicy):
             obs_dim_from_weights = self._N_TEMPORAL + (int(_head_w.shape[1]) - hidden_dim)
             # find the obs_keys layout whose length matches
             _matched = False
-            for _na in (3, 5, 7, 9):
-                _cand = self._make_obs_keys(_na)
-                if len(_cand) == obs_dim_from_weights:
-                    self._obs_keys = _cand
-                    self._obs_dim  = obs_dim_from_weights
-                    _matched = True
-                    break
+            for _v in (1, 0): # Try current (1) then legacy (0)
+                for _na in (3, 5, 7, 9, 11):
+                    _cand = self._make_obs_keys(_na, version=_v)
+                    if len(_cand) == obs_dim_from_weights:
+                        self._obs_keys = _cand
+                        self._obs_dim  = obs_dim_from_weights
+                        _matched = True
+                        break
+                if _matched: break
+            
             if not _matched:
                 # unknown layout — fall back to n_actions from train_cfg
-                self._obs_keys = self._make_obs_keys(self.n_actions)
+                self._obs_keys = self._make_obs_keys(self.n_actions, version=1)
                 self._obs_dim  = len(self._obs_keys)
                 print(f"[MALSTMRLPolicy] WARNING: actor head implies obs_dim={obs_dim_from_weights} "
-                      f"but no known layout matches; falling back to n_actions={self.n_actions}")
-            elif obs_dim_from_weights != len(self._make_obs_keys(self.n_actions)):
-                print(f"[MALSTMRLPolicy] train_cfg n_actions={self.n_actions} implies obs_dim="
-                      f"{len(self._make_obs_keys(self.n_actions))}, but actor head implies "
-                      f"obs_dim={obs_dim_from_weights}; using weights")
+                      f"but no known layout matches; falling back to current layout")
         else:
-            self._obs_keys = self._make_obs_keys(self.n_actions)
+            self._obs_keys = self._make_obs_keys(self.n_actions, version=1)
             self._obs_dim  = len(self._obs_keys)
+
+        # Internal state for attack tracking (needed for v1 layout)
+        self._ATK_INTERVAL_CAP = 10
+        self._last_atk_intervals: Optional[np.ndarray] = None
+        self._last_atk_intensity: Optional[np.ndarray] = None
 
         obsnorm    = state.get("obsnorm", {})
         _LOC_KEY   = "transforms.2.loc"
@@ -619,6 +640,8 @@ class MALSTMRLPolicy(BaselinePolicy):
     def reset(self) -> None:
         self._h = None
         self._c = None
+        self._last_atk_intervals = None
+        self._last_atk_intensity = None
 
     def _build_ma_obs(self, ctx: ActContext) -> np.ndarray:
         """Replicates IndepTorchRLEnvWrapper._build_observation() from the eval-loop context."""
@@ -635,34 +658,60 @@ class MALSTMRLPolicy(BaselinePolicy):
         records = env.history[-ctx.decision_interval * n_edges:]
         df      = pd.DataFrame([m.__dict__ for m in records])
 
-        # Base 5 features from history
-        BASE_KEYS = ["local_num_req", "attack_in_rate", "ema_mom", "cpu_to_ids_ratio", "ids_cpu_utilization"]
+        # Lazy init of attack tracking state
+        if self._last_atk_intervals is None:
+            self._last_atk_intervals = np.full(n_edges, self._ATK_INTERVAL_CAP, dtype=np.int32)
+            self._last_atk_intensity = np.zeros(n_edges, dtype=np.float32)
+
+        # 1. Local metrics
+        # Base keys present in almost all versions
+        BASE_KEYS = ["local_num_req", "attack_in_rate", "cpu_to_ids_ratio", "ids_cpu_utilization"]
         for i, area_id in enumerate(area_ids):
             g = df[df["area_id"] == area_id]
             if g.empty:
                 continue
             for k in BASE_KEYS:
-                if k not in g.columns or k not in self._obs_keys:
-                    continue
-                j    = self._obs_keys.index(k)
+                if k not in self._obs_keys: continue
+                idx = self._obs_keys.index(k)
                 vals = g[k].values
                 if k == "cpu_to_ids_ratio":
-                    obs[i, j] = float(vals[-1])
-                elif k == "ema_mom":
-                    vals_nz = vals[vals != 0.0]
-                    obs[i, j] = float(np.mean(vals_nz)) if len(vals_nz) > 0 else 0.0
+                    obs[i, idx] = float(vals[-1])
                 else:
-                    obs[i, j] = float(np.mean(vals))
+                    obs[i, idx] = float(np.mean(vals))
 
-        # Neighbor features
+            # Handle EMA MOM (Legacy)
+            if "ema_mom" in self._obs_keys:
+                idx = self._obs_keys.index("ema_mom")
+                vals = g["attack_in_rate"].values
+                vals_nz = vals[vals != 0.0]
+                obs[i, idx] = float(np.mean(vals_nz)) if len(vals_nz) > 0 else 0.0
+
+            # Handle last_atk_intensity (Current)
+            if "last_atk_intensity" in self._obs_keys:
+                atk_vals = g["attack_in_rate"].values
+                mean_atk = float(np.mean(atk_vals))
+                if mean_atk > 1e-6:
+                    self._last_atk_intervals[i] = 0
+                    self._last_atk_intensity[i] = max(float(self._last_atk_intensity[i]), mean_atk)
+                else:
+                    self._last_atk_intervals[i] = min(int(self._last_atk_intervals[i]) + 1, self._ATK_INTERVAL_CAP)
+                    if self._last_atk_intervals[i] >= self._ATK_INTERVAL_CAP:
+                        self._last_atk_intensity[i] = 0.0
+                obs[i, self._obs_keys.index("last_atk_intensity")] = float(self._last_atk_intensity[i])
+
+        # 2. Neighbor metrics
         if self.is_phase1:
             # Phase 1 models were trained in single-edge envs where neighbor features were always 0.
             # When evaluating in multi-edge, we zero them out to avoid "observation noise" 
             # that the policy hasn't seen before.
-            obs[:, self._obs_keys.index("neighbor_ids_util")] = 0.0
-            obs[:, self._obs_keys.index("neighbor_atk_rate")] = 0.0
+            if "neighbor_ids_util" in self._obs_keys:
+                obs[:, self._obs_keys.index("neighbor_ids_util")] = 0.0
+            if "neighbor_atk_rate" in self._obs_keys:
+                obs[:, self._obs_keys.index("neighbor_atk_rate")] = 0.0
             if "neighbor_delta" in self._obs_keys:
                 obs[:, self._obs_keys.index("neighbor_delta")] = 0.0
+            if "neighbor_last_atk_intensity" in self._obs_keys:
+                obs[:, self._obs_keys.index("neighbor_last_atk_intensity")] = 0.0
         else:
             edge_ids_util: Dict[str, float] = {}
             edge_atk_rate: Dict[str, float] = {}
@@ -679,18 +728,25 @@ class MALSTMRLPolicy(BaselinePolicy):
                         g["attack_in_rate"].values if "attack_in_rate" in g.columns else [0.0]))
 
             _has_delta = "neighbor_delta" in self._obs_keys
+            _has_ni    = "neighbor_last_atk_intensity" in self._obs_keys
+
             for i, area_id in enumerate(area_ids):
-                nbr_utils, nbr_deltas, nbr_atk = [], [], []
+                nbr_utils, nbr_deltas, nbr_atk, nbr_intensities = [], [], [], []
                 for j in range(n_edges):
                     if j == i:
                         continue
                     nbr_utils.append(edge_ids_util[area_ids[j]])
                     nbr_atk.append(edge_atk_rate[area_ids[j]])
                     nbr_deltas.append(float(ctx.delta_in_flight_norm[j]))
+                    if _has_ni:
+                        nbr_intensities.append(float(self._last_atk_intensity[j]))
+
                 obs[i, self._obs_keys.index("neighbor_ids_util")] = float(np.mean(nbr_utils)) if nbr_utils else 0.0
                 obs[i, self._obs_keys.index("neighbor_atk_rate")] = float(np.mean(nbr_atk))   if nbr_atk   else 0.0
                 if _has_delta:
                     obs[i, self._obs_keys.index("neighbor_delta")] = float(np.mean(nbr_deltas)) if nbr_deltas else 0.0
+                if _has_ni:
+                    obs[i, self._obs_keys.index("neighbor_last_atk_intensity")] = float(np.max(nbr_intensities)) if nbr_intensities else 0.0
 
         # prev_slo_vio
         _slo_idx = self._obs_keys.index("prev_slo_vio")
@@ -785,21 +841,39 @@ class MAMLPRLPolicy(BaselinePolicy):
     _ATK_WINDOW = 10
 
     @staticmethod
-    def _make_obs_keys(n_actions: int) -> List[str]:
+    def _make_obs_keys(n_actions: int, version: int = 1) -> List[str]:
         _ext = n_actions != 3
-        return [
-            "local_num_req",
-            "attack_in_rate",
-            "last_atk_intervals",
-            "last_atk_intensity",
-            "cpu_to_ids_ratio",
-            "ids_cpu_utilization",
-            "neighbor_ids_util",
-            *( ["neighbor_delta"] if _ext else [] ),
-            "neighbor_atk_rate",
-            "prev_slo_vio",
-            *( ["transition_ticks_norm", "delta_in_flight_norm", "queue_ahead_norm"] if _ext else [] ),
-        ]
+        if version == 0:
+            # Legacy layout
+            return [
+                "local_num_req",
+                "attack_in_rate",
+                "last_atk_intervals",
+                "last_atk_intensity",
+                "cpu_to_ids_ratio",
+                "ids_cpu_utilization",
+                "neighbor_ids_util",
+                *( ["neighbor_delta"] if _ext else [] ),
+                "neighbor_atk_rate",
+                "prev_slo_vio",
+                *( ["transition_ticks_norm", "delta_in_flight_norm", "queue_ahead_norm"] if _ext else [] ),
+            ]
+        else:
+            # Current layout (v1)
+            return [
+                "local_num_req",
+                "attack_in_rate",
+                "last_atk_intervals",
+                "last_atk_intensity",
+                "cpu_to_ids_ratio",
+                "ids_cpu_utilization",
+                "neighbor_ids_util",
+                *( ["neighbor_delta"] if _ext else [] ),
+                "neighbor_atk_rate",
+                "neighbor_last_atk_intensity",
+                "prev_slo_vio",
+                *( ["transition_ticks_norm", "delta_in_flight_norm", "queue_ahead_norm"] if _ext else [] ),
+            ]
 
     def __init__(self, ckpt_path: str, device: str = "cpu", greedy: bool = False):
         import torch
@@ -831,23 +905,33 @@ class MAMLPRLPolicy(BaselinePolicy):
                 mapped_sd[k[len("module."):]] = v
 
         # Determine obs_keys / obs_dim: prefer stored obs_keys, fall back to weight shape
-        # Keys added after initial training (newest first); dropped in order until dims match
-        _ADDED_KEYS = ["last_atk_intensity"]
         if state.get("obs_keys"):
             self._obs_keys = list(state["obs_keys"])
         else:
-            canonical = self._make_obs_keys(self.n_actions)
             ckpt_obs_dim = next(
-                (v.shape[1] for k, v in mapped_sd.items() if k == "0.weight"), len(canonical)
+                (v.shape[1] for k, v in mapped_sd.items() if k == "0.weight"), None
             )
-            keys = list(canonical)
-            for drop in _ADDED_KEYS:
-                if len(keys) <= ckpt_obs_dim:
-                    break
-                if drop in keys:
-                    keys.remove(drop)
-            self._obs_keys = keys
+            if ckpt_obs_dim is None:
+                self._obs_keys = self._make_obs_keys(self.n_actions, version=1)
+            else:
+                _matched = False
+                for _v in (1, 0):
+                    for _na in (3, 5, 7, 9, 11):
+                        _cand = self._make_obs_keys(_na, version=_v)
+                        if len(_cand) == ckpt_obs_dim:
+                            self._obs_keys = _cand
+                            _matched = True
+                            break
+                    if _matched: break
+                if not _matched:
+                    self._obs_keys = self._make_obs_keys(self.n_actions, version=1)
+
         self._obs_dim = len(self._obs_keys)
+
+        # Internal state for attack tracking
+        self._ATK_INTERVAL_CAP = 10
+        self._last_atk_intervals: Optional[np.ndarray] = None
+        self._last_atk_intensity: Optional[np.ndarray] = None
 
         # Rebuild MLP matching build_mlp() from train_ma_cur_mlp.py
         layers, in_dim = [], self._obs_dim
@@ -940,10 +1024,14 @@ class MAMLPRLPolicy(BaselinePolicy):
 
         if n_edges > 1:
             if self.is_phase1:
-                obs[:, self._obs_keys.index("neighbor_ids_util")] = 0.0
-                obs[:, self._obs_keys.index("neighbor_atk_rate")] = 0.0
+                if "neighbor_ids_util" in self._obs_keys:
+                    obs[:, self._obs_keys.index("neighbor_ids_util")] = 0.0
+                if "neighbor_atk_rate" in self._obs_keys:
+                    obs[:, self._obs_keys.index("neighbor_atk_rate")] = 0.0
                 if "neighbor_delta" in self._obs_keys:
                     obs[:, self._obs_keys.index("neighbor_delta")] = 0.0
+                if "neighbor_last_atk_intensity" in self._obs_keys:
+                    obs[:, self._obs_keys.index("neighbor_last_atk_intensity")] = 0.0
             else:
                 edge_ids_util: Dict[str, float] = {}
                 edge_atk_rate: Dict[str, float] = {}
@@ -957,18 +1045,23 @@ class MAMLPRLPolicy(BaselinePolicy):
                         edge_atk_rate[area_id] = float(np.mean(g["attack_in_rate"].values if "attack_in_rate" in g.columns else [0.0]))
 
                 _has_delta = "neighbor_delta" in self._obs_keys
+                _has_ni    = "neighbor_last_atk_intensity" in self._obs_keys
                 for i, area_id in enumerate(area_ids):
-                    nbr_utils, nbr_deltas, nbr_atk = [], [], []
+                    nbr_utils, nbr_deltas, nbr_atk, nbr_intensities = [], [], [], []
                     for j in range(n_edges):
                         if j == i:
                             continue
                         nbr_utils.append(edge_ids_util[area_ids[j]])
                         nbr_atk.append(edge_atk_rate[area_ids[j]])
                         nbr_deltas.append(float(ctx.delta_in_flight_norm[j]))
+                        if _has_ni:
+                            nbr_intensities.append(float(self._last_atk_intensity[j]))
                     obs[i, self._obs_keys.index("neighbor_ids_util")] = float(np.mean(nbr_utils)) if nbr_utils else 0.0
                     obs[i, self._obs_keys.index("neighbor_atk_rate")] = float(np.mean(nbr_atk))   if nbr_atk   else 0.0
                     if _has_delta:
                         obs[i, self._obs_keys.index("neighbor_delta")] = float(np.mean(nbr_deltas)) if nbr_deltas else 0.0
+                    if _has_ni:
+                        obs[i, self._obs_keys.index("neighbor_last_atk_intensity")] = float(np.max(nbr_intensities)) if nbr_intensities else 0.0
 
         _slo_idx = self._obs_keys.index("prev_slo_vio")
         for i, area_id in enumerate(area_ids):

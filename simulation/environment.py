@@ -529,6 +529,20 @@ class Environment:
             for aid in self.area_ids
         }
 
+        # UPDATE YO-YO ATTACKER FEEDBACK STATE
+        for aid in self.area_ids:
+            util = float(ids_out_exec[aid].get("ids_cpu_util", 0.0))
+            if util > 0.8:
+                z_t = 1
+            elif util < 0.2 and edges[aid].ids_cpu < 1.0:
+                z_t = -1
+            else:
+                z_t = 0
+
+            for atk in edges[aid].cur_attacker:
+                if hasattr(atk, "z_t"):
+                    atk.z_t = z_t
+
         # Executor keeps admitted workload (no return to owner)
         admitted_user: Dict[str, int] = {
             aid: int(ids_out_exec[aid].get("user_pass_cnt", exec_user_in[aid]))

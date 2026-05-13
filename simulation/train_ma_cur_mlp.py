@@ -68,8 +68,9 @@ class IndepTorchRLEnvWrapper(EnvBase):
             "neighbor_ids_util",
             *( ["neighbor_delta"] if _ext else [] ),
             "neighbor_atk_rate",
+            "neighbor_last_atk_intensity",
             "prev_slo_vio",
-            *( ["transition_ticks_norm", "delta_in_flight_norm", "queue_ahead_norm"] if _ext else [] ),
+            *( ["delta_in_flight_norm"] if _ext else [] ),
         ]
 
         self.obs_dim = len(self.obs_keys)
@@ -222,6 +223,10 @@ class IndepTorchRLEnvWrapper(EnvBase):
         delta_effs = []
         for i in range(self.n_edges):
             ids_cpu_max = float(self.env.edge_areas[i].budget.cpu - VA_CPU_RESERVE)
+            if self.transition_ticks_remaining[i] > 0:
+                delta_effs.append(0.0)
+                continue
+
             prev = self.ids_cpu[i].item()
 
             _settled = float(self.ids_cpu_settled[i].item())
@@ -234,7 +239,7 @@ class IndepTorchRLEnvWrapper(EnvBase):
             delta_eff = float(self.ids_cpu[i].item() - prev)
             delta_effs.append(delta_eff)
 
-            if self.transition_ticks_remaining[i] <= 0 and abs(delta_eff) > 1e-9:
+            if abs(delta_eff) > 1e-9:
                 self.ids_cpu_target[i] = self.ids_cpu[i]
                 gap = abs(float(self.ids_cpu_target[i].item()) - float(self.ids_cpu_settled[i].item()))
                 dur = self._lookup_scaling_duration(gap)
@@ -414,11 +419,13 @@ class IndepTorchRLEnvWrapper(EnvBase):
                 nbr_utils = []
                 nbr_deltas = []
                 nbr_atk = []
+                nbr_last_intensity = []
                 for j in range(self.n_edges):
                     if j == i: continue
                     other_id = self.area_ids[j]
                     nbr_utils.append(edge_ids_util[other_id])
                     nbr_atk.append(edge_atk_rate[other_id])
+                    nbr_last_intensity.append(float(self.last_atk_intensity[j].item()))
                     delta = float(self.ids_cpu_target[j].item()) - float(self.ids_cpu_settled[j].item())
                     nbr_deltas.append(float(np.clip(delta / max(max_delta, 1e-6), -1.0, 1.0)))
 
@@ -426,6 +433,7 @@ class IndepTorchRLEnvWrapper(EnvBase):
                 if "neighbor_delta" in self.obs_keys:
                     obs[i, self.obs_keys.index("neighbor_delta")] = float(np.mean(nbr_deltas)) if nbr_deltas else 0.0
                 obs[i, self.obs_keys.index("neighbor_atk_rate")] = float(np.mean(nbr_atk)) if nbr_atk else 0.0
+                obs[i, self.obs_keys.index("neighbor_last_atk_intensity")] = float(np.max(nbr_last_intensity)) if nbr_last_intensity else 0.0
 
         for i, area_id in enumerate(self.area_ids):
             g = df[df["area_id"] == area_id]
@@ -434,15 +442,11 @@ class IndepTorchRLEnvWrapper(EnvBase):
                 threshold = float(self.env.edge_areas[i].slo_threshold)
                 obs[i, self.obs_keys.index("prev_slo_vio")] = 1.0 if last_qoe < threshold else 0.0
 
-        if "transition_ticks_norm" in self.obs_keys:
-            max_dur = float(self.scaling_time_steps[-1])
+        if "delta_in_flight_norm" in self.obs_keys:
             max_delta = self.scale_step * (self.n_actions - 1) / 2.0
             for i in range(self.n_edges):
-                obs[i, self.obs_keys.index("transition_ticks_norm")] = float(self.transition_ticks_remaining[i].item()) / max(max_dur, 1.0)
                 dif = float(self.ids_cpu_target[i].item()) - float(self.ids_cpu_settled[i].item())
                 obs[i, self.obs_keys.index("delta_in_flight_norm")] = float(np.clip(dif / max(max_delta, 1e-6), -1.0, 1.0))
-                qa = float(self.ids_cpu[i].item()) - float(self.ids_cpu_target[i].item())
-                obs[i, self.obs_keys.index("queue_ahead_norm")] = float(np.clip(qa / max(max_delta, 1e-6), -1.0, 1.0))
 
         return obs
 
@@ -562,7 +566,10 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
         _phase = "_phase2" if resume_ckpt else "_phase1"
         ckpt_dir = Path(ckpt_dir) if ckpt_dir else Path("checkpoints/_tcyc_adaptive") / _phase / run.name
         ckpt_every = 50
-        best_qoe = -1e9
+        ema_alpha = float(train_cfg.get("logger", {}).get("ema_alpha", 0.1))
+        ema_reward = ema_qoe = ema_vio = None
+        best_reward = best_qoe = -1e9
+        best_vio = 1e9
 
         hidden_dim = train_cfg["model"]["hidden_dim"]
         num_layers = int(train_cfg["model"].get("num_layers", 2))
@@ -759,18 +766,30 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
                     torch.nn.utils.clip_grad_norm_(all_params, float(train_cfg["optim"]["max_grad_norm"]))
                     optim.step()
 
-            qoe_score = float(batch["next", "qoe_mean"].mean().item())
-            if (it + 1) % ckpt_every == 0:
-                save_ckpt(ckpt_dir / f"ckpt_iter_{it+1:06d}.pt", collector_policy, value, optim, env_cfg, train_cfg, it + 1, device, env, obs_keys=base_env.obs_keys)
-            if qoe_score > best_qoe:
-                best_qoe = qoe_score
-                save_ckpt(ckpt_dir / "ckpt_best.pt", collector_policy, value, optim, env_cfg, train_cfg, it + 1, device, env, obs_keys=base_env.obs_keys)
-
+            qoe_score   = float(batch["next", "qoe_mean"].mean().item())
+            _raw_reward = float(batch["next", "reward"].mean().item())
             _r_lres = float(batch["next", "reward_lambda_res"].mean().item())
             _r_bcd  = float(batch["next", "reward_benign_col_dmg"].mean().item())
             _r_qoe  = float(batch["next", "reward_qoe_penalty"].mean().item())
             _r_sw   = float(batch["next", "reward_switch_pen"].mean().item())
             _vio    = float(batch["next", "qoe_vio_rate"].mean().item())
+
+            if (it + 1) % ckpt_every == 0:
+                save_ckpt(ckpt_dir / f"ckpt_iter_{it+1:06d}.pt", collector_policy, value, optim, env_cfg, train_cfg, it + 1, device, env, obs_keys=base_env.obs_keys)
+
+            ema_reward = _raw_reward if ema_reward is None else ema_alpha * _raw_reward + (1 - ema_alpha) * ema_reward
+            ema_qoe    = qoe_score   if ema_qoe    is None else ema_alpha * qoe_score   + (1 - ema_alpha) * ema_qoe
+            ema_vio    = _vio        if ema_vio    is None else ema_alpha * _vio        + (1 - ema_alpha) * ema_vio
+
+            if ema_reward > best_reward:
+                best_reward = ema_reward
+                save_ckpt(ckpt_dir / "ckpt_best_reward.pt", collector_policy, value, optim, env_cfg, train_cfg, it + 1, device, env, obs_keys=base_env.obs_keys)
+            if ema_qoe > best_qoe:
+                best_qoe = ema_qoe
+                save_ckpt(ckpt_dir / "ckpt_best_qoe.pt", collector_policy, value, optim, env_cfg, train_cfg, it + 1, device, env, obs_keys=base_env.obs_keys)
+            if ema_vio < best_vio:
+                best_vio = ema_vio
+                save_ckpt(ckpt_dir / "ckpt_best_vio.pt", collector_policy, value, optim, env_cfg, train_cfg, it + 1, device, env, obs_keys=base_env.obs_keys)
 
             print(f"Iter={it:4d} | rew={batch['next','reward'].mean().item():+.4f} | atk_pass={_r_lres:.3f} bcd={_r_bcd:.3f} qoe_sf={_r_qoe:.3f} sw={_r_sw:.3f} | qoe_vio={_vio:.1%}")
             wandb.log({

@@ -20,12 +20,13 @@ globals:
     n_types: 10
     active_len_factor: [0.3,0.7]
     dirichlet_alpha: 100.0  # symmetric Dirichlet concentration over edges per type; higher=uniform, lower=concentrated on one edge
-    pattern_types: ["sinus", "pw", "expo" ] #, "yoyo"]
+    # pattern_types: ["sinus", "pw", "expo", "yoyo"]
+    pattern_types: ["sinus", "pw", "expo" ] 
     # pattern_types: ["pw"]
     # pattern_types: ["yoyo"]
     level: "default"
     lambda_level:
-      default: [3000, 18000]
+      default: [3000, 16000]
       # default: [0, 0]
       low: [5000, 10000]
       mid: [12000, 16000]
@@ -45,17 +46,17 @@ globals:
       kappa: 0.25 
       sigma: 8 # Before Conversion to per step request = 0.9
       mu_level:
-        default: [20.0, 250.0]
+        default: [30.0, 250.0]
         low: [10.0, 100.0]
         mid: [30.0, 150.0]
         high: [50.0, 250.0]
 
   reward:
-    alpha_inv: 11.0   # QoE shortfall normalizer
-    beta_inv:  1.0   # Attack residual normalizer
-    gamma_inv: 10.0   # Benign collateral normalizer
-    q_th:      0.35   # QoE shortfall threshold
-    delta_switch: 0.3 # Binary switching penalty (any non-zero reallocation)
+    alpha_inv:    10.0  # QoE shortfall normalizer
+    beta_inv:      1.0  # Attack residual normalizer
+    gamma_inv:    11.0  # Benign collateral normalizer
+    q_th:          0.35 # QoE shortfall threshold
+    delta_switch:  0.3  # Binary switching penalty (any non-zero reallocation)
 
   # Offload mode comparison:
   #
