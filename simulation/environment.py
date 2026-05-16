@@ -115,9 +115,11 @@ class Environment:
         seed: int = 0,
         offload_mode: str = "balance",
         va_attack_offload: bool = False,
+        delay_ms_range: Optional[Tuple[float, float]] = None,
     ):
         self.edge_areas = edge_areas
         self.delay_ms = np.asarray(delay_ms, dtype=np.float32)
+        self.delay_ms_range = delay_ms_range
         self.offload_mode = str(offload_mode)  # "none" | "balance" | "delay_workload" | "full"
         self.va_attack_offload = bool(va_attack_offload)
         self.t_max = int(t_max)
@@ -173,6 +175,26 @@ class Environment:
         self.last_history = list(self.history)
         self.history.clear()
         self.final_qoe = 0
+
+        # Randomize propagation delay if a range is provided
+        if self.delay_ms_range is not None:
+            rng = np.random.default_rng(seed)
+            low, high = self.delay_ms_range
+            n = len(self.edge_areas)
+            new_delay = np.zeros((n, n), dtype=np.float32)
+            for i in range(n):
+                for j in range(i + 1, n):
+                    d = float(rng.uniform(low, high))
+                    new_delay[i, j] = d
+                    new_delay[j, i] = d
+            self.delay_ms = new_delay
+
+            # Re-populate prop_delay dict
+            for s in self.area_ids:
+                si = self.id_to_idx[s]
+                for r in self.area_ids:
+                    ri = self.id_to_idx[r]
+                    self.prop_delay[(s, r)] = float(self.delay_ms[si, ri])
 
         # Resample accuracy matrix (clients + run) for this episode
         acc_mat_data = getattr(self, "_acc_mat_data", None)
@@ -864,20 +886,26 @@ def build_env_from_cfg(cfg: dict):
                     slot_ms=globals_cfg.slot_ms,
                     t_max=cfg["run"]["t_max"],
                     seed=cfg["run"]["seed"],
-                    synth_cfg=global_user_cfg["synthetic"],
+                    synth_cfg=global_user_cfg.get("synthetic"),
+                    source_mode=global_user_cfg.get("source_mode", "synthetic"),
+                    csv_path=global_user_cfg.get("csv_path", "output/job_count_reconstructed.csv"),
+                    target_avg=global_user_cfg.get("target_avg"),
                 )
             )
         else:
             for u in area_users_cfg:
                 # Prefer global user_sampler if present
-                synth_cfg = global_user_cfg["synthetic"] if global_user_cfg else u["synthetic"]
+                base_cfg = global_user_cfg if global_user_cfg else u
                 users.append(
                     User(
                         user_id=u["user_id"],
                         slot_ms=globals_cfg.slot_ms,
                         t_max=cfg["run"]["t_max"],
                         seed=cfg["run"]["seed"],
-                        synth_cfg=synth_cfg,
+                        synth_cfg=base_cfg.get("synthetic"),
+                        source_mode=base_cfg.get("source_mode", "synthetic"),
+                        csv_path=base_cfg.get("csv_path", "output/job_count_reconstructed.csv"),
+                        target_avg=base_cfg.get("target_avg"),
                     )
                 )
 
@@ -906,8 +934,15 @@ def build_env_from_cfg(cfg: dict):
 
     # Build delay matrix from config if present, else default to 2 ms inter-edge
     n = len(edge_areas)
+    delay_ms_range = None
     if "delay_ms" in cfg["globals"]:
-        delay_ms = np.array(cfg["globals"]["delay_ms"], dtype=np.float32)
+        raw_delay = cfg["globals"]["delay_ms"]
+        # Check if it's a range [min, max] (flat list of 2 numbers)
+        if isinstance(raw_delay, list) and len(raw_delay) == 2 and not isinstance(raw_delay[0], list):
+            delay_ms_range = (float(raw_delay[0]), float(raw_delay[1]))
+            delay_ms = np.zeros((n, n), dtype=np.float32)
+        else:
+            delay_ms = np.array(raw_delay, dtype=np.float32)
     else:
         delay_ms = np.where(np.eye(n, dtype=bool), 0.0, 2.0).astype(np.float32)
 
@@ -918,6 +953,7 @@ def build_env_from_cfg(cfg: dict):
         seed=cfg["run"]["seed"],
         offload_mode=_resolve_offload_mode(cfg["globals"]),
         va_attack_offload=bool(cfg["globals"].get("va_attack_offload", False)),
+        delay_ms_range=delay_ms_range,
     )
     env.slot_ms = float(globals_cfg.slot_ms)
     env._max_prop_delay_ms = float(cfg["globals"].get("max_prop_delay_ms", 1e9))

@@ -66,6 +66,22 @@ class ScenarioGridEvaluator(BaseEvaluator):
         if self.args.replot:
             print(f"[replot] Loading data from {csv_path}...")
             accumulated_means, _ = self._load_existing_results(csv_path, methods_display)
+            
+            # If a custom threshold is provided during replot, we must re-extract metrics from cache
+            if self.args.slo_threshold is not None:
+                print(f"[replot] Recalculating SLO violations with threshold={self.args.slo_threshold}...")
+                for atk in LEVELS:
+                    for user in LEVELS:
+                        for pkey, label, om, amod in runs:
+                            cache_key = f"{label}_{atk}_{user}"
+                            # We need to reach into the cache to get the raw traces
+                            safe_label = "".join([c if c.isalnum() or c in ("_", "-") else "_" for c in cache_key])
+                            cache_path = self.cachedir / f"{safe_label}.npz"
+                            if cache_path.exists():
+                                with np.load(cache_path, allow_pickle=True) as data:
+                                    arrays = {k: data[k] for k in data.files}
+                                    accumulated_means[atk][user][label] = self.extract_metrics(arrays, slo_threshold=self.args.slo_threshold)
+
             plot_grid(accumulated_means, methods_display, self.outdir / "scenario_grid_by_user.png", x_dim="user")
             plot_grid(accumulated_means, methods_display, self.outdir / "scenario_grid_by_attack.png", x_dim="attack")
             return
@@ -105,7 +121,7 @@ class ScenarioGridEvaluator(BaseEvaluator):
                                     print(f"  [skip] {label} (already enough episodes in CSV)")
                                     continue
                                 res, _ = self.run_simulation(env, cfg, policies[pkey], label, cache_key=f"{label}_{atk}_{user}")
-                                cell_means[label] = self.extract_metrics(res)
+                                cell_means[label] = self.extract_metrics(res, slo_threshold=self.args.slo_threshold)
                         finally:
                             if os.path.exists(tmp_path): os.remove(tmp_path)
                     
@@ -207,6 +223,7 @@ def main():
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--offload_modes", nargs="+", default=None)
     ap.add_argument("--proposed_method", default=None)
+    ap.add_argument("--slo_threshold", type=float, default=None)
     ap.add_argument("--replot", action="store_true")
     args = ap.parse_args()
 

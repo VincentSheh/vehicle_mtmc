@@ -20,8 +20,8 @@ globals:
     n_types: 10
     active_len_factor: [0.3,0.7]
     dirichlet_alpha: 100.0  # symmetric Dirichlet concentration over edges per type; higher=uniform, lower=concentrated on one edge
-    # pattern_types: ["sinus", "pw", "expo", "yoyo"]
-    pattern_types: ["sinus", "pw", "expo"]
+    pattern_types: ["sinus", "pw", "expo", "yoyo"]
+    # pattern_types: ["sinus", "pw", "expo"]
     # pattern_types: ["pw"]
     # pattern_types: ["yoyo"]
     level: "default"
@@ -46,9 +46,9 @@ globals:
       sigma: 8 # Before Conversion to per step request = 0.9
       mu_level:
         default: [30.0, 250.0]
-        low: [30.0, 150.0]
-        mid: [40.0, 200.0]
-        high: [50.0, 250.0]
+        low: [50.0, 100.0]
+        mid: [80.0, 160.0]
+        high: [125.0, 250.0]
 
   reward:
     alpha_inv:    5.0  # QoE shortfall normalizer
@@ -118,6 +118,9 @@ globals:
     - [0.0,   60.0,  60.0]
     - [60.0,   0.0,  60.0]
     - [60.0,  60.0,  0.0]
+    # - [0.0,   20.0,  20.0]
+    # - [20.0,   0.0,  20.0]
+    # - [20.0,  20.0,  0.0]
     # - [0.0,  20.0,  20.0, 20.0, 20.0]
     # - [20.0,  0.0,  20.0, 20.0, 20.0]
     # - [20.0, 20.0,   0.0, 20.0, 20.0]

@@ -43,8 +43,8 @@ DEFAULT_METHODS = [
 ]
 
 PROPOSED_CONFIGS = [
-    # ("gm", "delay_workload"),
-    ("gm", "cto"),
+    ("gm", "delay_workload"),
+    # ("gm", "cto"),
     # ("lm", "delay_workload"),
     # ("lm", "cto_acc_inv"),
     # ("lm", "cto"),
@@ -241,7 +241,7 @@ def run_episode(
     decisions = math.ceil(int(cfg["run"]["t_max"]) / decision_interval)
 
     metrics_ts: Dict[str, List] = {
-        "qoe": [], "qoe_per_edge": [], "qoe_vio_rate": [], "benign_col_dmg": [],
+        "qoe": [], "qoe_all": [], "qoe_per_edge": [], "qoe_vio_rate": [], "benign_col_dmg": [],
         "cpu_util": [], "local_num_req": [], "attack_in_rate": [], "attack_in_rate_std": [],
         "attack_drop_rate": [], "ema_mom": [], "cpu_to_ids_ratio": [],
         "reward_lambda_res": [], "reward_benign_col_dmg": [], "reward_qoe_penalty": [], "reward": [],
@@ -315,6 +315,7 @@ def run_episode(
         qoe_vals = df["qoe_mean"].values.astype(np.float32) if "qoe_mean" in df.columns else np.array([])
         
         metrics_ts["qoe"].append(float(np.mean(qoe_vals)) if qoe_vals.size > 0 else 0.0)
+        metrics_ts["qoe_all"].extend(qoe_vals.tolist())
         metrics_ts["qoe_vio_rate"].append(float(np.mean(qoe_vals < reward_q_th)) if qoe_vals.size > 0 else 0.0)
         metrics_ts["benign_col_dmg"].append(float(np.mean(df["benign_col_dmg"].values)) if "benign_col_dmg" in df.columns else 0.0)
         metrics_ts["cpu_util"].append(cpu_util)
@@ -488,7 +489,7 @@ class BaseEvaluator:
         return accumulated, last_ids
 
     @staticmethod
-    def extract_metrics(arrays: Dict[str, np.ndarray]) -> Dict[str, float]:
+    def extract_metrics(arrays: Dict[str, np.ndarray], slo_threshold: Optional[float] = None) -> Dict[str, float]:
         atk_in, atk_drp = arrays.get("attack_in_rate", np.array([])), arrays.get("attack_drop_rate", np.array([]))
         if atk_in.size > 0 and atk_drp.size == atk_in.size:
             atk_pass = np.maximum(0.0, atk_in - atk_drp)
@@ -497,8 +498,18 @@ class BaseEvaluator:
             atk_leak = float(np.mean(lres[mask])) if mask.any() else 0.0
         else: atk_leak = np.nan
 
+        if slo_threshold is not None:
+            # Use qoe_all if available for precise sensitivity analysis, else fallback to interval means
+            if "qoe_all" in arrays:
+                qoe_data = arrays["qoe_all"]
+            else:
+                qoe_data = arrays.get("qoe", np.array([]))
+            slo_vio = float(np.mean(qoe_data < slo_threshold)) if qoe_data.size > 0 else np.nan
+        else:
+            slo_vio = float(np.mean(arrays["qoe_vio_rate"])) if "qoe_vio_rate" in arrays else np.nan
+
         return {
-            "slo_vio":   float(np.mean(arrays["qoe_vio_rate"])) if "qoe_vio_rate" in arrays else np.nan,
+            "slo_vio":   slo_vio,
             "bcd":       float(np.mean(arrays["reward_benign_col_dmg"])) if "reward_benign_col_dmg" in arrays else np.nan,
             "atk_leak":  atk_leak,
             "atk_drop":  1.0 - atk_leak if not np.isnan(atk_leak) else np.nan,

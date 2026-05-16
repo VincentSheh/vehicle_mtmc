@@ -51,10 +51,12 @@ class IndepTorchRLEnvWrapper(EnvBase):
         seed: int = 0,
         device: str | torch.device = "cpu",
         mode: str = "ima",
+        zero_neighbor_obs: bool = False,
     ):
         self.env = build_env_base(cfg_path)
         self.n_edges = len(self.env.edge_areas)
         self.mode = mode
+        self.zero_neighbor_obs = zero_neighbor_obs
         
         # Batch size is [n_edges] so agents are treated as independent parallel environments
         super().__init__(device=torch.device(device), batch_size=torch.Size([self.n_edges]))
@@ -433,6 +435,14 @@ class IndepTorchRLEnvWrapper(EnvBase):
 
             max_delta = self.scale_step * (self.n_actions - 1) / 2.0
             for i, area_id in enumerate(self.area_ids):
+                if self.zero_neighbor_obs:
+                    obs[i, self.obs_keys.index("neighbor_ids_util")] = 0.0
+                    if "neighbor_delta" in self.obs_keys:
+                        obs[i, self.obs_keys.index("neighbor_delta")] = 0.0
+                    obs[i, self.obs_keys.index("neighbor_atk_rate")] = 0.0
+                    obs[i, self.obs_keys.index("neighbor_last_atk_intensity")] = 0.0
+                    continue
+
                 nbr_utils = []
                 nbr_deltas = []
                 nbr_atk = []
@@ -554,7 +564,7 @@ def orthogonal_init(m, gain=1.0):
 
 import argparse
 
-def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/train.yaml", device="cuda", total_frames_override=None, resume_ckpt: str = None, ckpt_dir: str = None, mode: str = "ima"):
+def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/train.yaml", device="cuda", total_frames_override=None, resume_ckpt: str = None, ckpt_dir: str = None, mode: str = "ima", zero_neighbor_obs: bool = False):
     with open(env_cfg_path, "r") as f:
         env_cfg = yaml.safe_load(f)
     with open(train_cfg_path, "r") as f:
@@ -583,7 +593,7 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
     try:
         t_max = env_cfg["run"]["t_max"]
         run = wandb_init(env_cfg, train_cfg)
-        wandb.config.update({"env/atk_level": atk_lvl, "env/user_level": user_lvl, "mode": mode}, allow_val_change=True)
+        wandb.config.update({"env/atk_level": atk_lvl, "env/user_level": user_lvl, "mode": mode, "zero_neighbor_obs": zero_neighbor_obs}, allow_val_change=True)
 
         torch.manual_seed(env_cfg["run"]["seed"])
         np.random.seed(env_cfg["run"]["seed"])
@@ -608,6 +618,7 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
             device=device,
             decision_interval=decision_interval,
             mode=mode,
+            zero_neighbor_obs=zero_neighbor_obs,
         )
         n_edges = base_env.n_edges
         obs_dim = base_env.obs_dim
@@ -631,6 +642,7 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
                 device="cpu",
                 decision_interval=decision_interval,
                 mode=mode,
+                zero_neighbor_obs=zero_neighbor_obs,
             )
 
         penv = ParallelEnv(num_envs, [make_env(1000 + i) for i in range(num_envs)], device="cpu")
@@ -726,16 +738,59 @@ def train(env_cfg_path="./configs/simulation_0.yaml", train_cfg_path="./configs/
             ckpt = torch.load(resume_ckpt, map_location=device)
             collector_policy.load_state_dict(ckpt["policy"])
             value.load_state_dict(ckpt["value"])
-            # Re-init obsnorm: Phase 1 left neighbor dims at zero;
-            # Phase 2 multi-edge env will have non-zero values there.
-            _norm = env.transform[-1]
-            _norm.loc = torch.nn.UninitializedBuffer()
-            _norm.scale = torch.nn.UninitializedBuffer()
-            env.transform.train()
-            env.transform[-1].init_stats(num_iter=100, reduce_dim=(0, 1, 2), cat_dim=0)
-            env.transform[-1].to(device)
-            env.transform.eval()
-            print(f"[resume] Loaded weights from {resume_ckpt}, re-initialized obsnorm")
+
+            # 1. Load optimizer state
+            if "optim" in ckpt:
+                optim.load_state_dict(ckpt["optim"])
+
+            # 2. Conditional obsnorm loading
+            try:
+                if "obsnorm" in ckpt:
+                    if zero_neighbor_obs:
+                        # Direct Load for bit-identical verification
+                        env.load_state_dict(ckpt["obsnorm"])
+                        print(f"[resume] Direct ObsNorm Load: Applied P1 stats for bit-identical verification.")
+                    else:
+                        # Hybrid Resume for actual Phase 2 training
+                        _norm = env.transform[-1]
+                        # Fresh init for all features in the new multi-edge env
+                        _norm.loc = torch.nn.UninitializedBuffer()
+                        _norm.scale = torch.nn.UninitializedBuffer()
+                        env.transform.train()
+                        _norm.init_stats(num_iter=100, reduce_dim=(0, 1, 2), cat_dim=0)
+                        env.transform.eval()
+
+                        # Patch back local stats from Phase 1
+                        p1_sd = ckpt["obsnorm"]
+                        loc_key = next((k for k in p1_sd if k.endswith(".loc")), None)
+                        scale_key = next((k for k in p1_sd if k.endswith(".scale")), None)
+                        
+                        if loc_key and scale_key:
+                            p1_loc = p1_sd[loc_key]
+                            p1_scale = p1_sd[scale_key]
+                            if p1_loc.shape == _norm.loc.shape:
+                                neighbor_idx = [i for i, k in enumerate(base_env.obs_keys) if "neighbor" in k]
+                                local_mask = torch.ones(_norm.loc.shape[0], dtype=torch.bool)
+                                local_mask[neighbor_idx] = False
+                                
+                                _norm.loc[local_mask] = p1_loc[local_mask].to(device)
+                                _norm.scale[local_mask] = p1_scale[local_mask].to(device)
+                                print(f"[resume] Hybrid ObsNorm: Loaded P1 stats for local features, fresh stats for {len(neighbor_idx)} neighbor features.")
+                            else:
+                                print(f"[resume] Warning: ObsNorm shape mismatch. Using fresh stats for all.")
+                        else:
+                            print(f"[resume] Warning: loc/scale not found in ckpt. Using fresh stats for all.")
+                else:
+                    raise KeyError("obsnorm not found in checkpoint")
+            except Exception as e:
+                print(f"[resume] Warning: Could not perform conditional obsnorm ({e}). Falling back to full re-init.")
+                _norm = env.transform[-1]
+                _norm.loc = torch.nn.UninitializedBuffer()
+                _norm.scale = torch.nn.UninitializedBuffer()
+                env.transform.train()
+                _norm.init_stats(num_iter=100, reduce_dim=(0, 1, 2), cat_dim=0)
+                env.transform[-1].to(device)
+                env.transform.eval()
 
         for it, batch in enumerate(collector):
             assert_finite(batch, "BATCH")
@@ -852,8 +907,9 @@ if __name__ == "__main__":
     parser.add_argument("--resume_ckpt", type=str, default=None)
     parser.add_argument("--ckpt_dir", type=str, default=None)
     parser.add_argument("--mode", type=str, default="ima", choices=["ima", "cma"])
+    parser.add_argument("--zero_neighbor_obs", action="store_true")
     args = parser.parse_args()
-    train(env_cfg_path=args.cfg, train_cfg_path=args.train_cfg, total_frames_override=args.total_frames, resume_ckpt=args.resume_ckpt, ckpt_dir=args.ckpt_dir, mode=args.mode)
+    train(env_cfg_path=args.cfg, train_cfg_path=args.train_cfg, total_frames_override=args.total_frames, resume_ckpt=args.resume_ckpt, ckpt_dir=args.ckpt_dir, mode=args.mode, zero_neighbor_obs=args.zero_neighbor_obs)
 
 """
   Usage:

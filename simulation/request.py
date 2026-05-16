@@ -331,6 +331,7 @@ class User:
         csv_path: Optional[str] = "output/job_count_reconstructed.csv",
         arrival_col: str = "recon_value",
         random_slice: bool = True,
+        target_avg: Optional[float] = None,
     ):
         self.user_id = str(user_id)
         self.slot_ms = float(slot_ms)
@@ -343,6 +344,7 @@ class User:
         self.csv_path = csv_path
         self.arrival_col = str(arrival_col)
         self.random_slice = bool(random_slice)
+        self.target_avg = target_avg
 
         self.steps_per_sec = int(round(1000.0 / self.slot_ms))
         if self.steps_per_sec <= 0:
@@ -485,7 +487,16 @@ class User:
         start_idx = self._sample_start_index()
         end_idx = start_idx + self.t_max
 
-        chunk = self.full_trace[start_idx:end_idx]
+        chunk = self.full_trace[start_idx:end_idx].copy()
+        
+        if self.target_avg is not None:
+            curr_mean = np.mean(chunk)
+            if curr_mean > 1e-9:
+                chunk = chunk * (self.target_avg / curr_mean)
+            
+            # Cap at 2x target_avg
+            chunk = np.clip(chunk, 0, 2 * self.target_avg)
+        
         self._req = np.maximum(np.rint(chunk), 0).astype(np.int32)
 
         self.slice_start = start_idx

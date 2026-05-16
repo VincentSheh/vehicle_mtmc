@@ -504,10 +504,20 @@ def score_based_offload(
     cap_dst: Optional[Dict[Any, float]] = None,
     max_prop_delay: float = 1e9,
     slot_ms: float = 200.0,
+    balance_floor: float = 0.5,
 ) -> OffloadPlan:
     """
-    Score-based offloading with Fair Share balancing.
-    Goal: Minimize delay by balancing utilization and maximize accuracy via scores.
+    Score-based offloading (Delay Workload) with Fair Share balancing.
+    Goal: Minimize delay by balancing utilization. Accuracy is NOT considered.
+
+    balance_floor: per-link proactive threshold scales with the offload tax τ = d_prop/slot_ms:
+
+        threshold(src→r) = balance_floor + (1 − balance_floor) × τ
+
+    A sender at utilisation u_src may only proactively offload to receiver r when
+    u_src > threshold(src→r). Near receivers (small τ, small tax) are engaged early;
+    distant receivers (large τ, large tax) are only used when the sender is genuinely
+    stressed. Phase 2 emergency overflow is always unconditional.
     """
     w1, w2, w3 = weights
 
@@ -522,11 +532,13 @@ def score_based_offload(
     # 1. Calculate Fair Share (Target utilization)
     if C_tot > EPS:
         # Every node targets the same utilization ratio (W_tot / C_tot)
-        fair_share = {e: float(c_dst[e]) * (W_tot / C_tot) for e in area_ids}
+        # but we MUST NOT target more than 100% utilization in the balancing phase.
+        util_target = min(1.0, W_tot / C_tot)
+        fair_share = {e: float(c_dst[e]) * util_target for e in area_ids}
     else:
         fair_share = {e: W_tot / len(area_ids) for e in area_ids}
 
-    # Senders: All nodes can be senders (proactive)
+    # Senders: Nodes that have work
     supply = {e: W[e] for e in area_ids}
     
     senders = [e for e in area_ids if supply[e] > EPS]
@@ -539,8 +551,7 @@ def score_based_offload(
         return {r: max(0.0, fair_share[r] - current_W[r]) for r in area_ids}
 
     for src in senders:
-        si = id_to_idx[src] if id_to_idx is not None else None
-        
+        # Link scoring based PURELY on negative delay penalty
         raw: Dict[Any, float] = {}
         eff_cap_raw: Dict[Any, float] = {}
         for r in area_ids:
@@ -548,91 +559,95 @@ def score_based_offload(
             d_prop = float(propagation_delays[src][r])
             if d_prop > max_prop_delay: continue
             
-            # Effective capacity at receiver r for tasks from sender src
-            eff_cap = float(c_dst[r]) * max(0.0, 1.0 - d_prop / slot_ms)
-            r_spare = max(0.0, eff_cap - current_W[r])
+            # Correct physical capacity check
+            r_spare = (float(c_dst[r]) - current_W[r]) * max(0.0, 1.0 - d_prop / slot_ms)
             if r_spare <= EPS: continue
             
             eff_cap_raw[r] = r_spare
             delay_penalty = d_prop * w3
-            acc = 0.0
-            if (fnr_matrix is not None and fpr_matrix is not None
-                    and si is not None and id_to_idx is not None):
-                ri  = id_to_idx[r]
-                acc = (
-                    (float(fnr_matrix[si, si]) - float(fnr_matrix[si, ri])) * w1
-                    + (float(fpr_matrix[si, si]) - float(fpr_matrix[si, ri])) * w2
-                )
-            raw[r] = acc - delay_penalty
+            raw[r] = -delay_penalty
 
         if not raw: continue
 
-        # --- Phase 1: Proactive Accuracy Offloading (Score > 0) ---
-        # Move workload to nodes that are strictly BETTER than local, 
-        # up to their physical capacity (time-window adjusted).
-        pos = {r: sc for r, sc in raw.items() if sc > 0.0}
-        total_pos = sum(pos.values())
-        if total_pos > EPS:
-            items = list(pos.items())
-            random.shuffle(items)
-            sorted_items = sorted(items, key=lambda kv: -kv[1])
-            initial_w = flow_float[src][src]
-            for r, p in sorted_items:
-                to_move = flow_float[src][src]
-                if to_move <= EPS: break
-                
-                # Accuracy moves can fill nodes beyond fair_share if they are better
-                ceiling = eff_cap_raw.get(r, 0.0)
-                share = min((p / total_pos) * initial_w, ceiling, to_move)
-                if share <= EPS: continue
-                
-                flow_float[src][src] -= share
-                flow_float[src][r]    = flow_float[src].get(r, 0.0) + share
-                current_W[r]         += share
-                eff_cap_raw[r]       -= share
-
-        # --- Phase 2: Load Balancing (W > Fair Share) ---
-        # Move surplus to reach fair_share, even if scores are negative.
+        # --- Phase 1: Load Balancing (W > Fair Share) ---
+        # Per-link threshold: threshold(src→r) = balance_floor + (1−balance_floor) × τ
+        # where τ = d_prop/slot_ms is the offload tax for that link.
+        # Near receivers (low tax) are engaged early; distant receivers only when stressed.
+        util_src = W[src] / max(EPS, float(c_dst[src]))
         target = fair_share[src]
         if flow_float[src][src] > target + EPS:
-            surplus = flow_float[src][src] - target
-            
-            # Only consider receivers (nodes below their fair share)
             rem_demand = get_fair_demand()
-            bal_targets = {r: sc for r, sc in raw.items() if r in rem_demand and rem_demand[r] > EPS}
-            if bal_targets:
+            # Include a receiver only when sender utilisation exceeds its per-link threshold.
+            bal_targets = {}
+            for r, sc in raw.items():
+                if rem_demand.get(r, 0.0) <= EPS:
+                    continue
+                tau = float(propagation_delays[src][r]) / max(EPS, slot_ms)
+                link_threshold = balance_floor + (1.0 - balance_floor) * tau
+                if util_src > link_threshold:
+                    bal_targets[r] = sc
+            
+            while bal_targets and flow_float[src][src] > target + EPS:
+                surplus = flow_float[src][src] - target
                 min_sc = min(bal_targets.values())
                 # Shift scores to be positive for proportional distribution
                 pos_bal = {r: (sc - min_sc + EPS) for r, sc in bal_targets.items()}
                 total_bal = sum(pos_bal.values())
                 
-                items = list(pos_bal.items())
-                random.shuffle(items)
-                sorted_items = sorted(items, key=lambda kv: -kv[1])
-                for r, p in sorted_items:
-                    to_move_bal = flow_float[src][src] - target
-                    if to_move_bal <= EPS: break
+                # In each iteration, we try to move work to all candidates
+                next_bal_targets = {}
+                any_moved = False
+                
+                # To avoid ordering bias, shuffle but maintain the proportional logic
+                target_ids = list(bal_targets.keys())
+                random.shuffle(target_ids)
+                
+                for r in target_ids:
+                    p = pos_bal[r]
+                    d_p = float(propagation_delays[src][r])
+                    window = max(EPS, 1.0 - d_p / slot_ms)
                     
-                    # Balancing moves are restricted by the receiver's fair_share demand
-                    ceiling = min(eff_cap_raw.get(r, 0.0), rem_demand.get(r, 0.0))
-                    share = min((p / total_bal) * surplus, ceiling, to_move_bal)
-                    if share <= EPS: continue
+                    # Target share based on this iteration's surplus
+                    share = (p / total_bal) * surplus
                     
-                    flow_float[src][src] -= share
-                    flow_float[src][r]    = flow_float[src].get(r, 0.0) + share
-                    current_W[r]         += share
-                    rem_demand[r]        -= share
-                    eff_cap_raw[r]       -= share
+                    # Ceiling: physical room within fair_share
+                    ceiling = min(eff_cap_raw.get(r, 0.0), rem_demand.get(r, 0.0) * window)
+                    
+                    if ceiling <= EPS:
+                        continue
+                    
+                    actual_move = min(share, ceiling)
+                    if actual_move <= EPS:
+                        continue
+                        
+                    flow_float[src][src] -= actual_move
+                    flow_float[src][r]    = flow_float[src].get(r, 0.0) + actual_move
+                    
+                    # Cycle-aware update
+                    current_W[r]         += actual_move / window
+                    current_W[src]       -= actual_move
+                    rem_demand[r]        -= actual_move / window
+                    eff_cap_raw[r]       -= actual_move
+                    any_moved = True
+                    
+                    # If we didn't hit the ceiling, it might still take more in next round
+                    if ceiling - actual_move > EPS:
+                        next_bal_targets[r] = bal_targets[r]
+                
+                if not any_moved: break
+                bal_targets = next_bal_targets
 
-            # --- Phase 3: Survival Fallback (W > Capacity) ---
-            # If still above physical capacity, dump to anywhere with spare cycles.
+            # --- Phase 2: Survival Fallback (W > Capacity) ---
+            # Emergency dumping uses Greedy Fill to prioritize efficiency during saturation.
             local_cap = float(c_dst[src])
             if flow_float[src][src] > local_cap + EPS:
-                # Same as Phase 2 but uses physical spare capacity as ceiling
                 all_items = sorted(raw.items(), key=lambda x: -x[1])
                 for r, _ in all_items:
                     to_move_emergency = flow_float[src][src] - local_cap
                     if to_move_emergency <= EPS: break
+                    
+                    d_p = float(propagation_delays[src][r])
+                    window = max(EPS, 1.0 - d_p / slot_ms)
                     
                     ceiling = eff_cap_raw.get(r, 0.0)
                     share = min(ceiling, to_move_emergency)
@@ -640,7 +655,9 @@ def score_based_offload(
                     
                     flow_float[src][src] -= share
                     flow_float[src][r]    = flow_float[src].get(r, 0.0) + share
-                    current_W[r]         += share
+                    
+                    current_W[r]         += share / window
+                    current_W[src]       -= share
                     eff_cap_raw[r]       -= share
 
     return _build_plan(_round_and_conserve(flow_float, W), area_ids)
