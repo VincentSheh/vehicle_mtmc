@@ -167,9 +167,11 @@ def balance_workload_cto(
         if rem_supply[s] <= EPS:
             continue
         
-        # Effective capacity at receiver r for tasks from sender s
-        eff_cap = N_star[r] * max(0.0, 1.0 - d_prop / slot_ms)
-        r_demand = max(0.0, eff_cap - current_W[r])
+        # Correct physical capacity check:
+        # W_local + W_offloaded/(1-d/tau) <= C_raw
+        # => W_offloaded <= (Raw_Cap - W_local) * (1 - d/tau)
+        r_spare = (float(N_star[r]) - current_W[r]) * max(0.0, 1.0 - d_prop / slot_ms)
+        r_demand = max(0.0, r_spare)
         
         if r_demand <= EPS:
             continue
@@ -178,7 +180,11 @@ def balance_workload_cto(
         flow_float[s][s] -= u
         flow_float[s][r]  = flow_float[s].get(r, 0.0) + u
         rem_supply[s]    -= u
-        current_W[r]     += u
+        
+        # Cycle-aware update: remote tasks are "heavier"
+        window = max(EPS, 1.0 - d_prop / slot_ms)
+        current_W[r]     += u / window
+        current_W[s]     -= u # Update sender workload (local cycles saved)
 
     return _build_plan(_round_and_conserve(flow_float, W), area_ids)
 
@@ -206,6 +212,7 @@ def balance_workload_cto_acc(
     fpr_matrix: Optional[np.ndarray] = None,
     id_to_idx: Optional[Dict[Any, int]] = None,
     cap_dst: Optional[Dict[Any, float]] = None,
+    max_prop_delay: float = 1e9,
     slot_ms: float = 200.0,
 ) -> OffloadPlan:
     """
@@ -237,6 +244,9 @@ def balance_workload_cto_acc(
             if s == r:
                 continue
             d_prop = float(propagation_delays[s][r])
+            if d_prop > max_prop_delay:
+                continue
+
             delay_penalty = d_prop * w3
 
             # Improvement (acc) calculation with TPR/TNR (higher is better):
@@ -268,8 +278,12 @@ def balance_workload_cto_acc(
         if rem_supply[s] <= EPS:
             continue
             
-        eff_cap = N_star[r] * max(0.0, 1.0 - d_prop / slot_ms)
-        r_demand = max(0.0, eff_cap - current_W[r])
+        # Correct physical capacity check:
+        # W_local + W_offloaded/(1-d/tau) <= C_raw
+        # => W_offloaded <= (Raw_Cap - W_local) * (1 - d/tau)
+        r_spare = (float(N_star[r]) - current_W[r]) * max(0.0, 1.0 - d_prop / slot_ms)
+        r_demand = max(0.0, r_spare)
+
         if r_demand <= EPS:
             continue
             
@@ -277,7 +291,114 @@ def balance_workload_cto_acc(
         flow_float[s][s] -= u
         flow_float[s][r]  = flow_float[s].get(r, 0.0) + u
         rem_supply[s]    -= u
-        current_W[r]     += u
+        
+        # Cycle-aware update: remote tasks are "heavier"
+        window = max(EPS, 1.0 - d_prop / slot_ms)
+        current_W[r]     += u / window
+        current_W[s]     -= u # Update sender workload (local cycles saved)
+
+    return _build_plan(_round_and_conserve(flow_float, W), area_ids)
+
+
+def balance_workload_cto_acc_rnd(
+    area_ids: List[Any],
+    W_src: Dict[Any, float],
+    c_dst: Dict[Any, float],
+    propagation_delays: Dict[Any, Dict[Any, float]],
+    weights: Tuple[float, float, float] = (1.0, 1.0, 0.01),
+    fnr_matrix: Optional[np.ndarray] = None,
+    fpr_matrix: Optional[np.ndarray] = None,
+    id_to_idx: Optional[Dict[Any, int]] = None,
+    cap_dst: Optional[Dict[Any, float]] = None,
+    max_prop_delay: float = 1e9,
+    slot_ms: float = 200.0,
+) -> OffloadPlan:
+    """
+    CTO with randomized accuracy-aware link scoring: similar to cto_acc,
+    but instead of using the exact remote accuracy, it uses the AVERAGE 
+    FPR and FNR of all local models sampled for this run.
+    """
+    w1, w2, w3 = weights
+
+    W_tot = float(sum(W_src[e] for e in area_ids))
+    W     = {e: float(W_src[e]) for e in area_ids}
+
+    if W_tot <= EPS:
+        flow = {e: {e: int(round(W[e]))} for e in area_ids}
+        return _build_plan(flow, area_ids)
+
+    N_star = {e: float(c_dst[e]) for e in area_ids}
+    if cap_dst is not None:
+        N_star = {e: min(N_star[e], float(cap_dst[e])) for e in area_ids}
+
+    supply    = {e: max(0.0, W[e] - N_star[e]) for e in area_ids}
+    senders   = [e for e in area_ids if supply[e] > EPS]
+    receivers = [e for e in area_ids if W[e] < N_star[e] + EPS]
+
+    # Calculate per-source average of cross-edge (non-diagonal) FPR/FNR
+    avg_fpr_per_src = {}
+    avg_fnr_per_src = {}
+    if fpr_matrix is not None and fnr_matrix is not None:
+        n = fpr_matrix.shape[0]
+        for i in range(n):
+            # Mask the diagonal to get only cross-edge performance
+            mask = np.ones(n, dtype=bool)
+            mask[i] = False
+            avg_fpr_per_src[i] = float(np.mean(fpr_matrix[i, mask]))
+            avg_fnr_per_src[i] = float(np.mean(fnr_matrix[i, mask]))
+
+    scored_links: List[Tuple[float, Any, Any, float]] = []
+    for s in senders:
+        si = id_to_idx[s] if id_to_idx is not None else None
+        for r in receivers:
+            if s == r:
+                continue
+            d_prop = float(propagation_delays[s][r])
+            if d_prop > max_prop_delay:
+                continue
+
+            delay_penalty = d_prop * w3
+
+            # Improvement (acc) calculation: (Local_Rate - Remote_Rate)
+            # Remote_Rate is the average of how other models perform on this data.
+            acc = 0.0
+            if (fnr_matrix is not None and fpr_matrix is not None
+                    and si is not None):
+                acc = (
+                    (float(fnr_matrix[si, si]) - avg_fnr_per_src[si]) * w1
+                    + (float(fpr_matrix[si, si]) - avg_fpr_per_src[si]) * w2
+                )
+
+            # cost = delay_penalty - acc
+            cost = delay_penalty - acc
+            scored_links.append((cost, s, r, d_prop))
+
+    random.shuffle(scored_links)
+    scored_links.sort(key=lambda x: x[0])
+
+    flow_float: Dict[Any, Dict[Any, float]] = {e: {e: W[e]} for e in area_ids}
+    rem_supply = {e: supply[e] for e in senders}
+    current_W = {e: W[e] for e in area_ids}
+
+    for _, s, r, d_prop in scored_links:
+        if rem_supply[s] <= EPS:
+            continue
+            
+        r_spare = (float(N_star[r]) - current_W[r]) * max(0.0, 1.0 - d_prop / slot_ms)
+        r_demand = max(0.0, r_spare)
+
+        if r_demand <= EPS:
+            continue
+            
+        u = min(rem_supply[s], r_demand)
+        flow_float[s][s] -= u
+        flow_float[s][r]  = flow_float[s].get(r, 0.0) + u
+        rem_supply[s]    -= u
+        
+        # Cycle-aware update: remote tasks are "heavier"
+        window = max(EPS, 1.0 - d_prop / slot_ms)
+        current_W[r]     += u / window
+        current_W[s]     -= u 
 
     return _build_plan(_round_and_conserve(flow_float, W), area_ids)
 
@@ -292,6 +413,7 @@ def balance_workload_cto_acc_inv(
     fpr_matrix: Optional[np.ndarray] = None,
     id_to_idx: Optional[Dict[Any, int]] = None,
     cap_dst: Optional[Dict[Any, float]] = None,
+    max_prop_delay: float = 1e9,
     slot_ms: float = 200.0,
 ) -> OffloadPlan:
     """
@@ -322,6 +444,9 @@ def balance_workload_cto_acc_inv(
             if s == r:
                 continue
             d_prop = float(propagation_delays[s][r])
+            if d_prop > max_prop_delay:
+                continue
+
             delay_penalty = d_prop * w3
 
             # Improvement (acc) calculation: (Local_Rate - Remote_Rate)
@@ -353,8 +478,12 @@ def balance_workload_cto_acc_inv(
         if rem_supply[s] <= EPS:
             continue
             
-        eff_cap = N_star[r] * max(0.0, 1.0 - d_prop / slot_ms)
-        r_demand = max(0.0, eff_cap - current_W[r])
+        # Correct physical capacity check:
+        # W_local + W_offloaded/(1-d/tau) <= C_raw
+        # => W_offloaded <= (Raw_Cap - W_local) * (1 - d/tau)
+        r_spare = (float(N_star[r]) - current_W[r]) * max(0.0, 1.0 - d_prop / slot_ms)
+        r_demand = max(0.0, r_spare)
+
         if r_demand <= EPS:
             continue
             
@@ -362,13 +491,101 @@ def balance_workload_cto_acc_inv(
         flow_float[s][s] -= u
         flow_float[s][r]  = flow_float[s].get(r, 0.0) + u
         rem_supply[s]    -= u
-        current_W[r]     += u
+        
+        # Cycle-aware update: remote tasks are "heavier"
+        window = max(EPS, 1.0 - d_prop / slot_ms)
+        current_W[r]     += u / window
+        current_W[s]     -= u # Update sender workload (local cycles saved)
 
     return _build_plan(_round_and_conserve(flow_float, W), area_ids)
 
 
 # ---------------------------------------------------------------------------
-# Modes c & d — score-based routing
+# Mode b4 — PD-BTO (Propagation-Delay-Based Balanced Task Offloading)
+# ---------------------------------------------------------------------------
+# Algorithm 3: balances load ratios (W/C) across nodes instead of just
+# offloading overflow. Uses propagation delay as the sorting cost.
+# ---------------------------------------------------------------------------
+
+def pd_bto(
+    area_ids: List[Any],
+    W_src: Dict[Any, float],
+    c_dst: Dict[Any, float],
+    propagation_delays: Dict[Any, Dict[Any, float]],
+    max_prop_delay: float = 1e9,
+    slot_ms: float = 200.0,
+) -> OffloadPlan:
+    W_tot = float(sum(W_src[e] for e in area_ids))
+    C_tot = float(sum(c_dst[e] for e in area_ids))
+    W     = {e: float(W_src[e]) for e in area_ids}
+
+    if W_tot <= EPS or C_tot <= EPS:
+        flow = {e: {e: int(round(W[e]))} for e in area_ids}
+        return _build_plan(flow, area_ids)
+
+    # Load ratios
+    ell = {e: W[e] / max(EPS, float(c_dst[e])) for e in area_ids}
+
+    # Build candidate links: sender → receiver where sender is more loaded
+    all_links: List[Tuple[float, Any, Any, float]] = []
+    for s in area_ids:
+        for r in area_ids:
+            if s == r:
+                continue
+            d_prop = float(propagation_delays[s][r])
+            if d_prop > max_prop_delay:
+                continue
+            delta = max(0.0, 1.0 - d_prop / slot_ms)
+            if delta <= EPS:
+                continue
+            # Only consider if sender is more loaded than receiver
+            # after accounting for the delay tax
+            if ell[s] > ell[r]:
+                all_links.append((d_prop, s, r, delta))
+
+    all_links.sort(key=lambda x: x[0])
+
+    flow_float: Dict[Any, Dict[Any, float]] = {e: {e: W[e]} for e in area_ids}
+    current_W = {e: float(W[e]) for e in area_ids}
+
+    for d_prop, s, r, delta in all_links:
+        C_s = max(EPS, float(c_dst[s]))
+        C_r = max(EPS, float(c_dst[r]))
+        
+        u_s = current_W[s] / C_s
+        u_r = current_W[r] / C_r
+        
+        # Delay tax: each offloaded task costs 1/(delta * C_r) utilization at receiver
+        delay_tax = 1.0 / (delta * C_r)
+        
+        # Only offload if sender util > receiver util + delay tax per task
+        if u_s <= u_r + delay_tax:
+            continue
+        
+        # How many tasks can we move before utilizations equalize (accounting for delay)?
+        # Moving u tasks: sender util becomes (W_s - u) / C_s
+        #                 receiver util becomes (W_r + u/delta) / C_r
+        # Equalize: (W_s - u) / C_s = (W_r + u/delta) / C_r
+        # => u = (W_s/C_s - W_r/C_r) / (1/C_s + 1/(delta * C_r))
+        u_max = (u_s - u_r) / (1.0/C_s + 1.0/(delta * C_r))
+        u_max = max(0.0, u_max)
+        
+        # Also cap at physical spare at receiver
+        phys_spare = max(0.0, float(c_dst[r]) - current_W[r]) * delta
+        
+        u = min(u_max, phys_spare)
+        if u <= EPS:
+            continue
+        
+        flow_float[s][s] -= u
+        flow_float[s][r]  = flow_float[s].get(r, 0.0) + u
+        current_W[s]     -= u
+        current_W[r]     += u / delta
+
+    return _build_plan(_round_and_conserve(flow_float, W), area_ids)
+
+# ---------------------------------------------------------------------------
+# Mode c & d — score-based routing
 # ---------------------------------------------------------------------------
 
 
@@ -426,9 +643,10 @@ def cto_balanced(
             if d_prop > max_prop_delay:
                 continue
             
-            # Effective capacity at receiver r for tasks from sender src
-            eff_cap = float(c_dst[r]) * max(0.0, 1.0 - d_prop / slot_ms)
-            r_spare = max(0.0, eff_cap - current_W[r])
+            # Correct physical capacity check:
+            # W_local + W_offloaded/(1-d/tau) <= C_raw
+            # => W_offloaded <= (Raw_Cap - W_local) * (1 - d/tau)
+            r_spare = (float(c_dst[r]) - current_W[r]) * max(0.0, 1.0 - d_prop / slot_ms)
             if r_spare <= EPS:
                 continue
                 
@@ -473,6 +691,7 @@ def cto_balanced(
             flow_float[src][r]    = flow_float[src].get(r, 0.0) + share
             to_move              -= share
             current_W[r]         += share
+            current_W[src]       -= share # Update sender workload
             eff_cap_raw[r]       -= share
 
         if to_move > EPS:
@@ -487,6 +706,7 @@ def cto_balanced(
                 flow_float[src][r]    = flow_float[src].get(r, 0.0) + extra
                 to_move              -= extra
                 current_W[r]         += extra
+                current_W[src]       -= extra # Update sender workload
                 eff_cap_raw[r]       -= extra
 
     return _build_plan(_round_and_conserve(flow_float, W), area_ids)

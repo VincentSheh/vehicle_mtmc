@@ -24,31 +24,50 @@ class TradeoffEvaluator(BaseEvaluator):
         cfg_mut["globals"]["offload_mode"] = offload_mode
         if "accuracy_matrix" in cfg_mut.get("globals", {}):
             cfg_mut["globals"]["accuracy_matrix"]["model"] = acc_model
+        
+        # Enforce lambda_level and mu_level to be mid
+        if "attack_sampler" in cfg_mut.get("globals", {}):
+            cfg_mut["globals"]["attack_sampler"]["level"] = "mid"
+        if "user_sampler" in cfg_mut.get("globals", {}):
+            cfg_mut["globals"]["user_sampler"]["level"] = "mid"
+            if "synthetic" in cfg_mut["globals"]["user_sampler"]:
+                cfg_mut["globals"]["user_sampler"]["synthetic"]["level"] = "mid"
+
         return cfg_mut
 
     def run_sweep(self, eta_steps=11):
         etas = np.linspace(0.0, 0.6, eta_steps)
         results = []
 
-        # We assume all edge areas have the same budget for simplicity in the sweep label,
-        # but the policy handles per-edge budgets correctly.
-        env = build_env_base(self.args.cfg)
-        max_cpu = env.edge_areas[0].budget.cpu
+        # Enforce mid level for sweep env
+        cfg_mut = self.mutate_cfg(self.cfg_original)
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as tmp:
+            yaml.dump(cfg_mut, tmp)
+            tmp_path = tmp.name
         
-        for eta in tqdm(etas, desc="Sweeping eta"):
-            cpu_val = eta * max_cpu
-            policy = ConstantPolicy(cpu_val)
-            label = f"static_{eta:.2f}"
+        try:
+            # We assume all edge areas have the same budget for simplicity in the sweep label,
+            # but the policy handles per-edge budgets correctly.
+            env = build_env_base(tmp_path)
+            max_cpu = env.edge_areas[0].budget.cpu
             
-            res_dict, _ = self.run_simulation(env, self.cfg_original, policy, label)
-            metrics = self.extract_metrics(res_dict)
-            
-            results.append({
-                "eta": eta,
-                "residual_atk": metrics["atk_leak"],
-                "slo_vio": metrics["slo_vio"],
-                "bcd": metrics["bcd"]
-            })
+            for eta in tqdm(etas, desc="Sweeping eta"):
+                cpu_val = eta * max_cpu
+                policy = ConstantPolicy(cpu_val)
+                label = f"static_{eta:.2f}"
+                
+                res_dict, _ = self.run_simulation(env, cfg_mut, policy, label)
+                metrics = self.extract_metrics(res_dict)
+                
+                results.append({
+                    "eta": eta,
+                    "residual_atk": metrics["atk_leak"],
+                    "slo_vio": metrics["slo_vio"],
+                    "bcd": metrics["bcd"]
+                })
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
             
         return results
 
@@ -124,6 +143,14 @@ def main():
 
     evaluator = TradeoffEvaluator(args)
     
+    # Enforce mid level globally
+    if "attack_sampler" in evaluator.cfg_original.get("globals", {}):
+        evaluator.cfg_original["globals"]["attack_sampler"]["level"] = "mid"
+    if "user_sampler" in evaluator.cfg_original.get("globals", {}):
+        evaluator.cfg_original["globals"]["user_sampler"]["level"] = "mid"
+        if "synthetic" in evaluator.cfg_original["globals"]["user_sampler"]:
+            evaluator.cfg_original["globals"]["user_sampler"]["synthetic"]["level"] = "mid"
+
     print("Running static sweep...")
     sweep_results = evaluator.run_sweep(eta_steps=args.eta_steps)
     

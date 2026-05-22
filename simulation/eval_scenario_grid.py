@@ -35,7 +35,10 @@ class ScenarioGridEvaluator(BaseEvaluator):
     def mutate_cfg(self, cfg: dict, atk_lvl: str, user_lvl: str, offload_mode: str, acc_model: str) -> dict:
         cfg_mut = copy.deepcopy(cfg)
         cfg_mut["globals"]["attack_sampler"]["level"] = atk_lvl
-        cfg_mut["globals"]["user_sampler"]["synthetic"]["level"] = user_lvl
+        if "user_sampler" in cfg_mut["globals"]:
+            cfg_mut["globals"]["user_sampler"]["level"] = user_lvl
+            if "synthetic" in cfg_mut["globals"]["user_sampler"]:
+                cfg_mut["globals"]["user_sampler"]["synthetic"]["level"] = user_lvl
         cfg_mut["globals"]["offload_mode"] = offload_mode
         if "accuracy_matrix" in cfg_mut.get("globals", {}):
             cfg_mut["globals"]["accuracy_matrix"]["model"] = acc_model

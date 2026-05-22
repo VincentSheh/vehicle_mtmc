@@ -325,7 +325,7 @@ class User:
         user_id: Union[str, int],
         slot_ms: float,
         t_max: int,
-        seed: int = 0,
+        seed: Optional[int] = None,
         synth_cfg=None,
         source_mode: str = "synthetic",   # "synthetic" or "trace"
         csv_path: Optional[str] = "trace_arrival_rate.csv",
@@ -336,7 +336,7 @@ class User:
         self.user_id = str(user_id)
         self.slot_ms = float(slot_ms)
         self.t_max = int(t_max)
-        self.base_seed = int(seed)
+        self.base_seed = seed
         self.rng = np.random.default_rng(self.base_seed)
 
         self.synth_cfg = synth_cfg

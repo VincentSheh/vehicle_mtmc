@@ -18,7 +18,7 @@ logger:
   backend: wandb
   entity: asture123-national-taiwan-university
   project_name: edgeids
-  exp_name: phase1_mlp_act9_gm16
+  exp_name: phase1_mlp_act5_sp1
   # exp_name: phase1_lstm_sp
   plots:
     enabled: true

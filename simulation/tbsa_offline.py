@@ -243,7 +243,7 @@ def main():
                     help="Output .npz path for the lookup table")
     ap.add_argument("--n_episodes", type=int, default=10,
                     help="Episodes per IDS CPU value")
-    ap.add_argument("--decision_interval", type=int, default=500,
+    ap.add_argument("--decision_interval", type=int, default=300,
                     help="Ticks between decisions (should match eval)")
     ap.add_argument("--n_attack_bins", type=int, default=10)
     ap.add_argument("--n_req_bins", type=int, default=10)

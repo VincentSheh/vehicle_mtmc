@@ -29,11 +29,11 @@ SCALING_QUANTA = [0.5, 1.0, 1.5, 2.0]
 
 DEFAULT_METHODS = [
     "constant_0.0",
-    "constant_1.0",
+    # "constant_1.0",
     "constant_2.0",
-    "constant_3.0",
+    # "constant_3.0",
     "constant_4.0",
-    "constant_5.0",
+    # "constant_5.0",
     # "no_ids",
     # "static_low",
     # "static_high",
@@ -45,17 +45,19 @@ DEFAULT_METHODS = [
 PROPOSED_CONFIGS = [
     ("gm", "delay_workload"),
     # ("gm", "cto"),
-    # ("lm", "delay_workload"),
+    ("lm", "delay_workload"),
     # ("lm", "cto_acc_inv"),
     # ("lm", "cto"),
-    # ("lm", "cto_acc"),
+    ("lm", "cto_acc"),
 ]
 
 DISPLAY_NAMES: Dict[str, str] = {
     "no_ids":          "No IDS",
-    "static_low":      "Static Low",
-    "static_balanced": "Static Balanced",
-    "static_high":     "Static High",
+    # "constant_0.0":      "Static Low",
+    # "constant_2.0":      "Static Medium",
+    # "constant_4.0":      "Static High",
+    # "static_balanced": "Static Balanced",
+    # "static_high":     "Static High",
     "autoscale_app":   "Autoscale (App)",
     "autoscale_def":   "Autoscale (Def)",
     "offline_optimal": "TBSA Optimal",
@@ -521,12 +523,18 @@ class BaseEvaluator:
     @staticmethod
     def make_display_label(mname: str, offload_mode: str, show_offload: bool) -> str:
         base = DISPLAY_NAMES.get(mname, mname)
-        if show_offload:
+        if show_offload and offload_mode != "delay_workload":
             ol = OFFLOAD_DISPLAY_NAMES.get(offload_mode, offload_mode)
-            return f"{base} ({ol})"
+            return f"{base} + {ol}"
         return base
 
     @staticmethod
     def make_proposed_display_label(mname: str, model_key: str, offload_mode: str) -> str:
-        ol = OFFLOAD_DISPLAY_NAMES.get(offload_mode, offload_mode)
-        return f"{mname} {ol}_{model_key}"
+        base = DISPLAY_NAMES.get(mname, mname)
+        ol_name = OFFLOAD_DISPLAY_NAMES.get(offload_mode, offload_mode) if offload_mode != "delay_workload" else ""
+        md_name = MODEL_DISPLAY_NAMES.get(model_key, model_key) if model_key != "gm" else ""
+        
+        parts = [base]
+        if ol_name: parts.append(ol_name)
+        if md_name: parts.append(md_name)
+        return " + ".join(parts)

@@ -41,12 +41,30 @@ class NumEdgeEvaluator(BaseEvaluator):
             area["area_id"] = f"E{i+1}"
             cfg_mut["edge_areas"].append(area)
         
-        # Update Delay Matrix (20ms default cross-edge delay)
-        cfg_mut["globals"]["delay_ms"] = [[0.0 if i == j else 20.0 for j in range(n_edge)] for i in range(n_edge)]
+        # Update Delay Matrix (pass through range or generate symmetric matrix)
+        delay_cfg = cfg_mut["globals"].get("delay_ms", 20.0)
+        if isinstance(delay_cfg, list) and len(delay_cfg) == 2 and not isinstance(delay_cfg[0], list):
+            # Range: Keep as is, Environment.reset will handle scaling and randomization
+            cfg_mut["globals"]["delay_ms"] = delay_cfg
+        else:
+            val = 20.0
+            if isinstance(delay_cfg, (int, float)): val = delay_cfg
+            elif isinstance(delay_cfg, list) and len(delay_cfg) > 1 and isinstance(delay_cfg[0], list):
+                val = delay_cfg[0][1] # Use first off-diagonal as template
+            cfg_mut["globals"]["delay_ms"] = [[0.0 if i == j else float(val) for j in range(n_edge)] for i in range(n_edge)]
         
         cfg_mut["globals"]["offload_mode"] = offload_mode
         if "accuracy_matrix" in cfg_mut.get("globals", {}):
             cfg_mut["globals"]["accuracy_matrix"]["model"] = acc_model
+
+        # Enforce lambda_level and mu_level to be mid
+        if "attack_sampler" in cfg_mut.get("globals", {}):
+            cfg_mut["globals"]["attack_sampler"]["level"] = "mid"
+        if "user_sampler" in cfg_mut.get("globals", {}):
+            cfg_mut["globals"]["user_sampler"]["level"] = "mid"
+            if "synthetic" in cfg_mut["globals"]["user_sampler"]:
+                cfg_mut["globals"]["user_sampler"]["synthetic"]["level"] = "mid"
+
         return cfg_mut
 
     def run(self):

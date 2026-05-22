@@ -10,29 +10,30 @@ globals:
   cpu_clock_cycle: 3.8 # Used to convert detection latency to cycle
   cpu_cores: 8
   fps: 5
-  decision_interval: 100
+  decision_interval: 300
 
-  ids: # Capacity with 8 CPU is 1 / 0.0357 = 28011 Flows / second
+  ids:
     latency_ms: 0.0357 #0.357
     cycles_ms: 0.0
 
   attack_sampler:
     n_types: 10
-    active_len_factor: 0.5
+    active_len_factor: [0.3,0.7]
     dirichlet_alpha: 100.0  # symmetric Dirichlet concentration over edges per type; higher=uniform, lower=concentrated on one edge
-    pattern_types: ["sinus", "pw", "expo" ] #, "yoyo"]
+    pattern_types: ["sinus", "pw", "expo", "yoyo", "static"]
+    # pattern_types: ["sinus", "pw", "expo" ] 
     # pattern_types: ["pw"]
     # pattern_types: ["yoyo"]
     level: "default"
     lambda_level:
-      default: [7000, 16000] # Per Second
+      default: [3000, 16000]
       # default: [0, 0]
       low: [5000, 10000]
       mid: [12000, 16000]
       high: [18000, 24000]
     noise_std:        [0.05, 0.10]
-    t_cycle_min:      [300, 500]     # seconds (lower bound on cycle duration)
-    t_cycle_delta:    [300, 800]   # seconds added to t_min to get t_max
+    # t_cycle_min:      [300, 500]     # seconds (lower bound on cycle duration)
+    # t_cycle_delta:    [300, 800]   # seconds added to t_min to get t_max
     latency_per_flow: [2,4]      # ms per flow  (latency_per_flow * 1000 * va_cpu / lambda_base)
     bw_per_flow:      [0.0, 0.0]   # Mbps per flow
     # bw_per_flow:      [0.15, 0.30]   # Mbps per flow
@@ -40,18 +41,26 @@ globals:
   
   user_sampler:
     source_mode: "trace" # Options: "synthetic" or "trace"
-    csv_path: "output/job_count_reconstructed.csv"
-    target_avg: 25.0     # Optional: The mean to force the trace to. Request rate will be capped at 2x this value.
+    csv_path: "output/trace_arrival_rate.csv"
+    level: "default"
+    target_avg_level: #(per slot (200ms))
+      default: [20,60]
+      low: [10, 30]
+      mid: [15, 45]
+      high: [20, 60]
+      # low: [13, 27]
+      # mid: [20, 40]
+      # high: [27, 53]
     synthetic:
       level: "default"
       rw_sigma_per_sqrt_sec: 1.2      
       kappa: 0.25 
       sigma: 8 # Before Conversion to per step request = 0.9
       mu_level:
-        default: [20.0, 250.0]
-        low: [30.0, 150.0]
-        mid: [40.0, 200.0]
-        high: [50.0, 250.0]
+        default: [30.0, 250.0]
+        low: [50.0, 100.0]
+        mid: [80.0, 160.0]
+        high: [125.0, 250.0]
 
   reward:
     alpha_inv: 11.0   # QoE shortfall normalizer   
@@ -73,7 +82,7 @@ globals:
   #  All modes: capacity in pkts/slot (IDS) and tasks/slot (VA); balance caps receivers at c[e].
   #  delay_workload vs cto: same trigger/target but delay_workload splits supply proportionally
   #  across receivers by score whereas cto fills the closest receiver first (winner-takes-all).
-  offload_mode: "delay_workload"  # "none" | "balance" | "delay_workload" | "full" | "cto" | "cto_acc"
+  offload_mode: "qos_offloading"  # "none" | "balance" | "delay_workload" | "full" | "cto" | "cto_acc"
   # VA-stage attack offload mode:
   #   false (default) — admitted attacks stay at their IDS executor; VA capacity is
   #                     pre-reduced by attack load before the benign-user offload plan.
@@ -112,32 +121,13 @@ globals:
   # - Campus LAN: 1–5 ms
   # - City-scale (intersection to intersection): 5–20 ms
   # - Metro area / across districts: 20–50 ms
-  delay_ms: #[0.0, 80.0]
-    # Asymmetric: E2 is close (5 ms), E3 is far (30 ms from E1).
-    # delay_workload prefers E2 (lower delay penalty); full overrides to E3 (accuracy wins).
-    # - [0.0,   5.0,  30.0]
-    # - [5.0,   0.0,  25.0]
-    # - [30.0, 25.0,   0.0]
-    # - [0.0,   0.0,  0.0]
-    # - [0.0,   0.0,  0.0]
-    # - [0.0,  0.0,  0.0]
-    # - [0.0,   20.0,  20.0]
-    # - [20.0,   0.0,  20.0]
-    # - [20.0,  20.0,  0.0]
-    - [0.0,   60.0,  60.0]
-    - [60.0,   0.0,  60.0]
-    - [60.0,  60.0,  0.0]
-    # - [0.0,   20.0,  20.0]
-    # - [20.0,   0.0,  20.0]
-    # - [20.0,  20.0,  0.0]
-    # - [0.0,  20.0,  20.0, 20.0, 20.0]
-    # - [20.0,  0.0,  20.0, 20.0, 20.0]
-    # - [20.0, 20.0,   0.0, 20.0, 20.0]
-    # - [20.0, 20.0,  20.0,  0.0, 20.0]
-    # - [20.0, 20.0,  20.0, 20.0,  0.0]
+  delay_ms:  [0.0, 80.0]
+    # - [0.0,   60.0,  60.0]
+    # - [60.0,   0.0,  60.0]
+    # - [60.0,  60.0,  0.0]  
 
   video_pipeline:
-    reid_latency: 20 #! Should consider batch processing
+    reid_latency: 20 #! Deprecated
 
     configs:
       - detector: nanoDet-m
@@ -198,30 +188,30 @@ edge_areas:
     dirichlet_concentration: 1.0  # Dirichlet alpha for P(a|e); 1.0 = uniform over attack types
 
 
-  - area_id: "E2"
-    cpu_cycle_per_ms: 3.8 #3.8GHz #3.8E6 / ms
-    slo_beta: 3.0
-    slo_threshold: 0.2
-    budget: { cpu: 8.0, mem: 8.0, uplink: 10000 } #100Mbps
-    constraints:
-      D_Max: 250.0
-      MOTA_min: 0.1
-      Gamma: 0.0005
+  # - area_id: "E2"
+  #   cpu_cycle_per_ms: 3.8 #3.8GHz #3.8E6 / ms
+  #   slo_beta: 3.0
+  #   slo_threshold: 0.2
+  #   budget: { cpu: 8.0, mem: 8.0, uplink: 10000 } #100Mbps
+  #   constraints:
+  #     D_Max: 250.0
+  #     MOTA_min: 0.1
+  #     Gamma: 0.0005
 
-    dirichlet_concentration: 1.0  # Dirichlet alpha for P(a|e); 1.0 = uniform over attack types
+  #   dirichlet_concentration: 1.0  # Dirichlet alpha for P(a|e); 1.0 = uniform over attack types
 
 
-  - area_id: "E3"
-    cpu_cycle_per_ms: 3.8 #3.8GHz #3.8E6 / ms
-    slo_beta: 3.0
-    slo_threshold: 0.2
-    budget: { cpu: 8.0, mem: 8.0, uplink: 10000 } #100Mbps
-    constraints:
-      D_Max: 250.0
-      MOTA_min: 0.1
-      Gamma: 0.0005
+  # - area_id: "E3"
+  #   cpu_cycle_per_ms: 3.8 #3.8GHz #3.8E6 / ms
+  #   slo_beta: 3.0
+  #   slo_threshold: 0.2
+  #   budget: { cpu: 8.0, mem: 8.0, uplink: 10000 } #100Mbps
+  #   constraints:
+  #     D_Max: 250.0
+  #     MOTA_min: 0.1
+  #     Gamma: 0.0005
 
-    dirichlet_concentration: 1.0  # Dirichlet alpha for P(a|e); 1.0 = uniform over attack types
+  #   dirichlet_concentration: 1.0  # Dirichlet alpha for P(a|e); 1.0 = uniform over attack types
 
 
   # - area_id: "E4"

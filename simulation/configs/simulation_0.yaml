@@ -56,7 +56,7 @@ globals:
     beta_inv:      1.0  # Attack residual normalizer
     gamma_inv:    11.0  # Benign collateral normalizer
     q_th:          0.35 # QoE shortfall threshold
-    delta_switch:  0.3  # Binary switching penalty (any non-zero reallocation)
+    delta_switch:  1.0  # Binary switching penalty (any non-zero reallocation)
 
   # Offload mode comparison:
   #
