@@ -69,7 +69,7 @@ class IDS:
         if ids_cpu <= 0:
             coverage = 0.0
         elif total_attack > 0:
-            coverage = float(min(1.0, speed / total_attack))
+            coverage = float(min(1.0, speed / total_in))
         else:
             coverage = 1.0
 

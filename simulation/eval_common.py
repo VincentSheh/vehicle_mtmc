@@ -38,16 +38,25 @@ DEFAULT_METHODS = [
     # "static_low",
     # "static_high",
     # "static_balanced",
-    "autoscale_def",
-    "offline_optimal",
+    # "autoscale_def",
+    # "offline_optimal",
 ]
 
 PROPOSED_CONFIGS = [
     ("gm", "delay_workload"),
+<<<<<<< HEAD
     # ("gm", "cto"),
     ("lm", "delay_workload"),
     # ("lm", "cto_acc_inv"),
     # ("lm", "cto"),
+=======
+    # ("gm", "pd_bto"),
+    ("gm", "cto"),
+    ("lm", "delay_workload"),
+    # ("lm", "pd_bto"),
+    ("lm", "cto_acc_rnd"),
+    ("lm", "cto"),
+>>>>>>> Fix PDBTO and CTO
     ("lm", "cto_acc"),
 ]
 
@@ -245,9 +254,15 @@ def run_episode(
     metrics_ts: Dict[str, List] = {
         "qoe": [], "qoe_all": [], "qoe_per_edge": [], "qoe_vio_rate": [], "benign_col_dmg": [],
         "cpu_util": [], "local_num_req": [], "attack_in_rate": [], "attack_in_rate_std": [],
+<<<<<<< HEAD
         "attack_drop_rate": [], "ema_mom": [], "cpu_to_ids_ratio": [],
         "reward_lambda_res": [], "reward_benign_col_dmg": [], "reward_qoe_penalty": [], "reward": [],
         "last_atk_intervals": [], "last_atk_intensity": [],
+=======
+        "attack_drop_rate": [], "user_drop_rate": [], "ema_mom": [], "cpu_to_ids_ratio": [],
+        "drop_ids": [], "drop_uplink": [], "drop_compute": [],
+        "reward_lambda_res": [], "reward_benign_col_dmg": [], "reward_qoe_penalty": [], "reward": []
+>>>>>>> Fix PDBTO and CTO
     }
 
     last_atk_intervals = np.full(n_edges, 10, dtype=np.int32)
@@ -328,8 +343,27 @@ def run_episode(
             per_edge_qoes.append(float(np.mean(g["qoe_mean"].values)) if not g.empty and "qoe_mean" in g.columns else 0.0)
         metrics_ts["qoe_per_edge"].append(per_edge_qoes)
         
-        for k in ["local_num_req", "attack_in_rate", "attack_drop_rate", "ema_mom"]:
+        for k in ["local_num_req", "attack_in_rate", "attack_drop_rate", "user_drop_rate", "ema_mom"]:
             metrics_ts[k].append(float(df[k].mean()) if k in df.columns else 0.0)
+
+        for k, col in [("drop_ids", "ids_user_drop_rate"), ("drop_uplink", "uplink_user_drop_rate"), ("drop_compute", "compute_user_drop_rate")]:
+            metrics_ts[k].append(float(df[col].mean()) if col in df.columns else 0.0)
+        
+        # Collect detector counts from od_plan
+        if "od_plan" in df.columns:
+            window_counts = {}
+            for plan in df["od_plan"].values:
+                for det, count in plan.items():
+                    window_counts[det] = window_counts.get(det, 0) + count
+            for det, count in window_counts.items():
+                k = f"count_{det}"
+                if k not in metrics_ts: metrics_ts[k] = [0.0] * (len(metrics_ts["qoe"]) - 1)
+                metrics_ts[k].append(float(count))
+        # Ensure all existing count_ keys are padded if missing in this window
+        for k in metrics_ts:
+            if k.startswith("count_") and len(metrics_ts[k]) < len(metrics_ts["qoe"]):
+                metrics_ts[k].append(0.0)
+
         metrics_ts["attack_in_rate_std"].append(float(df["attack_in_rate"].std()) if "attack_in_rate" in df.columns else 0.0)
 
         # Last-attack tracking (mirrors train_ma_cur_mlp.py wrapper logic)
@@ -493,6 +527,8 @@ class BaseEvaluator:
     @staticmethod
     def extract_metrics(arrays: Dict[str, np.ndarray], slo_threshold: Optional[float] = None) -> Dict[str, float]:
         atk_in, atk_drp = arrays.get("attack_in_rate", np.array([])), arrays.get("attack_drop_rate", np.array([]))
+        user_in, user_drp = arrays.get("local_num_req", np.array([])), arrays.get("user_drop_rate", np.array([]))
+        
         if atk_in.size > 0 and atk_drp.size == atk_in.size:
             atk_pass = np.maximum(0.0, atk_in - atk_drp)
             lres = np.divide(atk_pass, atk_in, out=np.zeros_like(atk_pass), where=atk_in > 1e-6)
@@ -500,6 +536,7 @@ class BaseEvaluator:
             atk_leak = float(np.mean(lres[mask])) if mask.any() else 0.0
         else: atk_leak = np.nan
 
+<<<<<<< HEAD
         if slo_threshold is not None:
             # Use qoe_all if available for precise sensitivity analysis, else fallback to interval means
             if "qoe_all" in arrays:
@@ -512,13 +549,38 @@ class BaseEvaluator:
 
         return {
             "slo_vio":   slo_vio,
+=======
+        m = {
+            "slo_vio":   float(np.mean(arrays["qoe_vio_rate"])) if "qoe_vio_rate" in arrays else np.nan,
+>>>>>>> Fix PDBTO and CTO
             "bcd":       float(np.mean(arrays["reward_benign_col_dmg"])) if "reward_benign_col_dmg" in arrays else np.nan,
             "atk_leak":  atk_leak,
             "atk_drop":  1.0 - atk_leak if not np.isnan(atk_leak) else np.nan,
+            "bng_drop":  float(user_drp.sum() / user_in.sum()) if user_in.sum() > 1e-6 else 0.0,
             "realloc":   float(np.mean(arrays["reallocations"])) if "reallocations" in arrays else np.nan,
             "reward":    float(np.mean(arrays["reward"])) if "reward" in arrays else np.nan,
             "n_episodes": float(len(arrays["reallocations"])) if "reallocations" in arrays else 0.0,
         }
+
+        total_in = float(np.sum(arrays.get("local_num_req", 0.0)))
+        if total_in > 1e-6:
+            m["ratio_drop_ids"]     = float(np.sum(arrays.get("drop_ids",     0.0))) / total_in
+            m["ratio_drop_uplink"]  = float(np.sum(arrays.get("drop_uplink",  0.0))) / total_in
+            m["ratio_drop_compute"] = float(np.sum(arrays.get("drop_compute", 0.0))) / total_in
+        else:
+            m["ratio_drop_ids"] = m["ratio_drop_uplink"] = m["ratio_drop_compute"] = 0.0
+
+        # Flavor ratios
+        det_total = 0.0
+        for k, v in arrays.items():
+            if k.startswith("count_"):
+                det_total += float(np.sum(v))
+        if det_total > 1e-6:
+            for k, v in arrays.items():
+                if k.startswith("count_"):
+                    m[f"ratio_{k[6:]}"] = float(np.sum(v)) / det_total
+
+        return m
 
     @staticmethod
     def make_display_label(mname: str, offload_mode: str, show_offload: bool) -> str:

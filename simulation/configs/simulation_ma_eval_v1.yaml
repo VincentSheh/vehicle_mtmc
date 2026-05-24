@@ -20,7 +20,8 @@ globals:
     n_types: 10
     active_len_factor: [0.3,0.7]
     dirichlet_alpha: 100.0  # symmetric Dirichlet concentration over edges per type; higher=uniform, lower=concentrated on one edge
-    pattern_types: ["sinus", "pw", "expo", "yoyo", "static"]
+    # pattern_types: ["sinus", "pw", "expo", "yoyo", "static"]
+    pattern_types: ["sinus", "pw", "expo", "yoyo"]
     # pattern_types: ["sinus", "pw", "expo" ] 
     # pattern_types: ["pw"]
     # pattern_types: ["yoyo"]
@@ -188,30 +189,30 @@ edge_areas:
     dirichlet_concentration: 1.0  # Dirichlet alpha for P(a|e); 1.0 = uniform over attack types
 
 
-  # - area_id: "E2"
-  #   cpu_cycle_per_ms: 3.8 #3.8GHz #3.8E6 / ms
-  #   slo_beta: 3.0
-  #   slo_threshold: 0.2
-  #   budget: { cpu: 8.0, mem: 8.0, uplink: 10000 } #100Mbps
-  #   constraints:
-  #     D_Max: 250.0
-  #     MOTA_min: 0.1
-  #     Gamma: 0.0005
+  - area_id: "E2"
+    cpu_cycle_per_ms: 3.8 #3.8GHz #3.8E6 / ms
+    slo_beta: 3.0
+    slo_threshold: 0.2
+    budget: { cpu: 8.0, mem: 8.0, uplink: 10000 } #100Mbps
+    constraints:
+      D_Max: 250.0
+      MOTA_min: 0.1
+      Gamma: 0.0005
 
-  #   dirichlet_concentration: 1.0  # Dirichlet alpha for P(a|e); 1.0 = uniform over attack types
+    dirichlet_concentration: 1.0  # Dirichlet alpha for P(a|e); 1.0 = uniform over attack types
 
 
-  # - area_id: "E3"
-  #   cpu_cycle_per_ms: 3.8 #3.8GHz #3.8E6 / ms
-  #   slo_beta: 3.0
-  #   slo_threshold: 0.2
-  #   budget: { cpu: 8.0, mem: 8.0, uplink: 10000 } #100Mbps
-  #   constraints:
-  #     D_Max: 250.0
-  #     MOTA_min: 0.1
-  #     Gamma: 0.0005
+  - area_id: "E3"
+    cpu_cycle_per_ms: 3.8 #3.8GHz #3.8E6 / ms
+    slo_beta: 3.0
+    slo_threshold: 0.2
+    budget: { cpu: 8.0, mem: 8.0, uplink: 10000 } #100Mbps
+    constraints:
+      D_Max: 250.0
+      MOTA_min: 0.1
+      Gamma: 0.0005
 
-  #   dirichlet_concentration: 1.0  # Dirichlet alpha for P(a|e); 1.0 = uniform over attack types
+    dirichlet_concentration: 1.0  # Dirichlet alpha for P(a|e); 1.0 = uniform over attack types
 
 
   # - area_id: "E4"

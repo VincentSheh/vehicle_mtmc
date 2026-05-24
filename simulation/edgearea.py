@@ -316,18 +316,20 @@ class EdgeArea:
         avail_cycles_aft_atk_per_ms = max(0.0, avail_cycles_per_ms - attack_cycles_per_ms)
 
         if avail_cycles_aft_atk_per_ms <= 1e-12 or uplink_available <= 1e-12:
+            drp_up = benign_req_in if uplink_available <= 1e-12 else 0
+            drp_cp = benign_req_in - drp_up
             return {
                 "ids_out": ids_out,
                 "local_num_request": local_num_request,
                 "ema": attack_ema,
                 "ema_mom": attack_mom,
-                "dropped_uplink": benign_req_in,
+                "dropped_uplink": drp_up,
                 "od_plan": {},
                 "served_req": 0,
-                "dropped_compute": benign_req_in,
+                "dropped_compute": drp_cp,
                 "va_cpu_utilization": min(1.0, (attack_cycles_per_ms + self.ids_cpu * self.cpu_cycle_per_ms) / max(total_cycles_per_ms, 1e-9)),
                 "attack_cpu_frac": min(1.0, attack_cycles_per_ms / max(avail_cycles_per_ms, 1e-9)),
-                "uplink_util": 1.0,
+                "uplink_util": 1.0 if uplink_available <= 1e-12 else (attack_uplink_in / max(1e-9, uplink_total_mb)),
                 "mean_latency_ms": float("inf"),
                 "qoe": 0.0,
             }

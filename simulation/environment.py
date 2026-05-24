@@ -30,6 +30,7 @@ from offload import (
     balance_workload_cto_acc,
     balance_workload_cto_acc_inv,
     balance_with_caps_and_prop_filter,
+    pd_bto,
 )
 
 
@@ -62,7 +63,7 @@ class StepMetrics:
     ids_coverage: float
     attack_in_rate: float
     attack_drop_rate: float
-    user_drop_rate: float
+    user_drop_rate: float               # Total drops (sum of below)
     cpu_to_ids_ratio: float
     ids_cpu_utilization: float
 
@@ -72,6 +73,11 @@ class StepMetrics:
     bw_utilization: float
 
     overhead: float
+
+    # Fields with defaults must come last
+    ids_user_drop_rate: float = 0.0     # Drops from IDS false positives
+    uplink_user_drop_rate: float = 0.0  # Drops from bandwidth constraints
+    compute_user_drop_rate: float = 0.0 # Drops from CPU timeout
 
     # Multi-edge additions
     qoe_weighted: float = 0.0
@@ -286,7 +292,10 @@ class Environment:
 
                     ids_coverage=float(ids_out.get("coverage", 0.0)),
                     attack_in_rate=float(ids_out.get("attack_in_rate", 0.0)),
-                    user_drop_rate=float(ids_out.get("user_drop_rate", 0.0)),
+                    user_drop_rate=float(ids_out.get("user_drop_rate", 0.0)) + float(cache.get("dropped_uplink", 0)) + float(cache.get("dropped_compute", 0)),
+                    ids_user_drop_rate=float(ids_out.get("user_drop_rate", 0.0)),
+                    uplink_user_drop_rate=float(cache.get("dropped_uplink", 0)),
+                    compute_user_drop_rate=float(cache.get("dropped_compute", 0)),
                     attack_drop_rate=float(ids_out.get("attack_drop_rate", 0.0)),
                     od_plan=cache["od_plan"],
 
@@ -390,6 +399,22 @@ class Environment:
                 slot_ms=self.slot_ms,
             )
 
+        if mode == "cto_acc_rnd":
+            # Routing is plain CTO (delay-aware, no accuracy in link scoring).
+            # The accuracy model (average of all local models) is applied at
+            # IDS processing time in _run_step_multi_edge, not here.
+            nested = {
+                s: {r: float(self.prop_delay.get((s, r), 0.0)) for r in self.area_ids}
+                for s in self.area_ids
+            }
+            return balance_workload_cto(
+                area_ids=self.area_ids,
+                W_src=W_src,
+                c_dst=c_dst,
+                propagation_delays=nested,
+                slot_ms=self.slot_ms,
+            )
+
         if mode == "cto_balanced":
             nested = {
                 s: {r: float(self.prop_delay.get((s, r), 0.0)) for r in self.area_ids}
@@ -408,6 +433,20 @@ class Environment:
                 fpr_matrix=fpr_mat,
                 weights=self._offload_weights,
                 id_to_idx=self.id_to_idx,
+                max_prop_delay=self._max_prop_delay_ms,
+                slot_ms=self.slot_ms,
+            )
+
+        if mode == "pd_bto":
+            nested = {
+                s: {r: float(self.prop_delay.get((s, r), 0.0)) for r in self.area_ids}
+                for s in self.area_ids
+            }
+            return pd_bto(
+                area_ids=self.area_ids,
+                W_src=W_src,
+                c_dst=c_dst,
+                propagation_delays=nested,
                 max_prop_delay=self._max_prop_delay_ms,
                 slot_ms=self.slot_ms,
             )
@@ -475,11 +514,24 @@ class Environment:
         obs = {aid: edges[aid].observe_arrivals(self.t) for aid in self.area_ids}
 
         # Stage B: IDS offload plan
+        # Apply one-way propagation delay tax: remote packets arrive late, shrinking
+        # the effective processing window at each IDS executor.
+        # pd_bto owns this internally via delta_r on (C_raw - W_local) and tau gating;
+        # pre-taxing C would corrupt the W_local accounting and double-count the delay.
         W_ids = {aid: float(obs[aid]["total_workload_in"]) for aid in self.area_ids}
-        c_ids = {
-            aid: float(edges[aid].ids.effective_speed_pkt_per_step(edges[aid].ids_cpu))
-            for aid in self.area_ids
-        }
+        effective_ids_mode = forced_mode if forced_mode is not None else self.offload_mode
+        c_ids = {}
+        for aid in self.area_ids:
+            base_speed = float(edges[aid].ids.effective_speed_pkt_per_step(edges[aid].ids_cpu))
+            if effective_ids_mode == "balance":
+                # balance_workload has no per-link delay factor; pre-discount by avg incoming delay
+                avg_incoming_delay = float(np.mean([
+                    self.prop_delay.get((src, aid), 0.0) for src in self.area_ids
+                ]))
+                c_ids[aid] = base_speed * max(0.0, 1.0 - avg_incoming_delay / self.slot_ms)
+            else:
+                # all other modes apply per-link delay internally; pass raw capacity
+                c_ids[aid] = base_speed
         plan_ids = self._make_offload_plan(W_ids, c_ids, stage="ids", forced_mode=forced_mode)
 
         exec_user_in: Dict[str, int] = {aid: 0 for aid in self.area_ids}
@@ -523,6 +575,7 @@ class Environment:
         exec_fpr_ov: Dict[str, Optional[float]] = {aid: None for aid in self.area_ids}
         exec_tpr_ov: Dict[str, Optional[float]] = {aid: None for aid in self.area_ids}
         if self.acc_by_region is not None:
+            use_avg_acc = (effective_ids_mode == "cto_acc_rnd")
             for e_exec in self.area_ids:
                 exec_idx = self.id_to_idx[e_exec]
                 total_dst = float(plan_ids.assigned_dst.get(e_exec, 0))
@@ -532,8 +585,13 @@ class Environment:
                 for e_src in self.area_ids:
                     src_idx = self.id_to_idx[e_src]
                     n = float(plan_ids.flow.get(e_src, {}).get(e_exec, 0))
-                    fpr_w += n * float(self.acc_by_region[src_idx, exec_idx, 0])
-                    fnr_w += n * float(self.acc_by_region[src_idx, exec_idx, 1])
+                    if use_avg_acc:
+                        # Average of all local models on source src's data (global model proxy)
+                        fpr_w += n * float(self.acc_by_region[src_idx, :, 0].mean())
+                        fnr_w += n * float(self.acc_by_region[src_idx, :, 1].mean())
+                    else:
+                        fpr_w += n * float(self.acc_by_region[src_idx, exec_idx, 0])
+                        fnr_w += n * float(self.acc_by_region[src_idx, exec_idx, 1])
                 exec_fpr_ov[e_exec] = fpr_w / total_dst
                 exec_tpr_ov[e_exec] = 1.0 - (fnr_w / total_dst)
 
@@ -617,7 +675,7 @@ class Environment:
                 )
                 min_det_cycles = min(edge.pipeline.det_cycles.values())
                 c_va[aid] = avail_cycles / min_det_cycles if min_det_cycles > 0 else 0.0
-            plan_va = self._make_offload_plan(W_va, c_va, stage="va", forced_mode=forced_mode)
+            plan_va = self._make_offload_plan(W_va, c_va, stage="va", forced_mode=None)
 
             # Admitted attacks stay local — seed bw/cycles at their IDS executor
             va_atk_bw_mb:  Dict[str, float] = {aid: float(exec_atk_bw_mb[aid])  for aid in self.area_ids}
@@ -639,6 +697,7 @@ class Environment:
                         va_remote_n[dst]     += n_sent_f
         else:
             # Mode 2: attacks offloaded with benign users; full VA capacity offered.
+            print("Warning: va_attack_offload=True")
             W_va = {aid: float(admitted_user[aid] + admitted_atk[aid]) for aid in self.area_ids}
             c_va = {}
             for aid in self.area_ids:
@@ -646,7 +705,7 @@ class Environment:
                 avail_cycles = float(edge.va_cpu) * edge.cpu_cycle_per_ms * edge.slot_ms
                 min_det_cycles = min(edge.pipeline.det_cycles.values())
                 c_va[aid] = avail_cycles / min_det_cycles if min_det_cycles > 0 else 0.0
-            plan_va = self._make_offload_plan(W_va, c_va, stage="va", forced_mode=forced_mode)
+            plan_va = self._make_offload_plan(W_va, c_va, stage="va", forced_mode=None)
 
             # Attack bw/cycles distributed to VA executors proportional to routed attack count
             va_atk_bw_mb  = {aid: 0.0 for aid in self.area_ids}
@@ -679,7 +738,7 @@ class Environment:
             for aid in self.area_ids
         }
 
-        # Execute VA at each executor — combine IDS-stage and VA-stage propagation delays
+        # Execute VA at each executor — VA hop delay only (IDS hop is already taxed at Stage B)
         local_cache: Dict[str, dict] = {
             aid: edges[aid].process_va(
                 t=self.t,
@@ -689,7 +748,7 @@ class Environment:
                 attack_cycles_per_step=va_atk_cycles[aid],
                 n_local_user=va_local_user_in[aid],
                 original_user_in=va_original_user_in[aid],
-                d_remote_avg_ms=ids_d_remote_avg[aid] + va_d_remote_avg[aid],
+                d_remote_avg_ms=va_d_remote_avg[aid],
                 ids_out=ids_out_exec[aid],
             )
             for aid in self.area_ids

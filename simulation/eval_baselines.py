@@ -39,6 +39,10 @@ class BaselineEvaluator(BaseEvaluator):
         return cfg_mut
 
     def run(self):
+        # Print dirichlet_alpha from config
+        alpha = self.cfg_original.get("globals", {}).get("attack_sampler", {}).get("dirichlet_alpha", "N/A")
+        print(f"\n[Config] dirichlet_alpha: {alpha}")
+
         methods = self.get_methods()
         policies = self.build_policies(methods)
         
@@ -143,7 +147,7 @@ class BaselineEvaluator(BaseEvaluator):
 
     def _print_table(self, results, csv_path: Path):
         col_w = 32
-        header = f"{'Method':<{col_w}} {'qoe_vio_rate':>12} {'reward/mean':>12} {'qoe_penalty':>12} {'atk_drop_pct':>12} {'n_eps':>8}"
+        header = f"{'Method':<{col_w}} {'qoe_vio_rate':>12} {'reward/mean':>12} {'qoe_penalty':>12} {'atk_drop_pct':>12} {'bng_drop_pct':>12} {'n_eps':>8}"
         print("\n" + header + "\n" + "-" * len(header))
         
         rows = []
@@ -151,16 +155,31 @@ class BaselineEvaluator(BaseEvaluator):
             m = self.extract_metrics(r)
             atk_in, atk_drp = r['attack_in_rate'].sum(), r['attack_drop_rate'].sum()
             atk_drop_pct = atk_drp / atk_in if atk_in > 1e-6 else 0.0
+            
+            bng_drop_pct = m.get('bng_drop', 0.0)
+
             label = self._display_label(rkey)
             print(f"{label:<{col_w}} {m['slo_vio']:>12.1%} {m['reward']:>12.4f} "
-                  f"{float(np.mean(r['reward_qoe_penalty'])):>12.4f} {atk_drop_pct:>12.1%} {int(m['n_episodes']):>8}")
+                  f"{float(np.mean(r['reward_qoe_penalty'])):>12.4f} {atk_drop_pct:>12.1%} {bng_drop_pct:>12.1%} {int(m['n_episodes']):>8}")
+            
+            # Print flavor ratios and drop breakdown
+            flavors = [f"{k[6:]}:{v:.1%}" for k, v in m.items() if k.startswith("ratio_") and not k.startswith("ratio_drop") and v > 0.001]
+            if flavors:
+                print(f"  > Flavors: {', '.join(flavors)}")
+            
+            drops = [f"IDS:{m.get('ratio_drop_ids', 0.0):.1%}", f"Uplink:{m.get('ratio_drop_uplink', 0.0):.1%}", f"Compute:{m.get('ratio_drop_compute', 0.0):.1%}"]
+            print(f"  > Drops  : {', '.join(drops)}")
             
             # Save for replot
             rows.append({"Method": label, "Metric": "SLO Violation Rate", "MetricKey": "slo_vio", "Value": m["slo_vio"]})
             rows.append({"Method": label, "Metric": "Benign Collateral Damage", "MetricKey": "bcd", "Value": m["bcd"]})
             rows.append({"Method": label, "Metric": "Attack Drop %", "MetricKey": "atk_drop", "Value": atk_drop_pct})
+            rows.append({"Method": label, "Metric": "Benign Drop %", "MetricKey": "bng_drop", "Value": bng_drop_pct})
             rows.append({"Method": label, "Metric": "Reward", "MetricKey": "reward", "Value": m["reward"]})
             rows.append({"Method": label, "Metric": "Num Episodes", "MetricKey": "n_episodes", "Value": m["n_episodes"]})
+            for k, v in m.items():
+                if k.startswith("ratio_"):
+                    rows.append({"Method": label, "Metric": f"Ratio ({k[6:]})", "MetricKey": k, "Value": v})
 
         import csv
         with open(csv_path, "w", newline="") as f:
